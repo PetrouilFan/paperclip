@@ -1,6 +1,6 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -109,7 +109,29 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    let sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    if (!sourceIssueId) {
+      // A run can drive an issue its context snapshot never named: the harness
+      // or agent checks the issue out onto the run (checkoutRunId /
+      // executionRunId) after the run starts. Retries of task-less timer runs are
+      // the common case, and before this lookup every write from such a run
+      // failed closed with run_context_required even when the target was the
+      // issue the run itself held. Resolve the run's own locked issue as its
+      // source issue; a run that holds no issue still fails closed below.
+      const boundIssue = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, input.companyId),
+          or(
+            eq(issues.checkoutRunId, input.runId),
+            eq(issues.executionRunId, input.runId),
+          ),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (boundIssue) sourceIssueId = boundIssue.id;
+    }
     if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
     if (
       sourceIssueId === input.targetIssueId ||
