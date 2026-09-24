@@ -8,6 +8,19 @@ import { logger } from "../middleware/logger.js";
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
 
+/**
+ * A terminal run's checkout/execution stamp can linger on an issue row until
+ * cleanup runs. Such a binding must not exempt a later write from the
+ * cross-issue cap, so the run-bound fallback only trusts an active run.
+ */
+const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+  "interrupted",
+]);
+
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
 const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap_rejected";
 
@@ -92,6 +105,7 @@ export async function observeCrossIssueInfluence(
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        status: heartbeatRuns.status,
       })
       .from(heartbeatRuns)
       .where(and(
@@ -109,19 +123,38 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
-    let sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) {
-      // A run can drive an issue its context snapshot never named: the harness
-      // or agent checks the issue out onto the run (checkoutRunId /
-      // executionRunId) after the run starts. Retries of task-less timer runs are
-      // the common case, and before this lookup every write from such a run
-      // failed closed with run_context_required even when the target was the
-      // issue the run itself held. Resolve the run's own locked issue as its
-      // source issue; a run that holds no issue still fails closed below.
-      const boundIssue = await tx
+    const contextSourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    if (
+      contextSourceIssueId &&
+      (contextSourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier &&
+          contextSourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
+    ) {
+      return null;
+    }
+
+    // A run can drive an issue its context snapshot never named: the harness or
+    // agent stamps the run onto the issue (checkoutRunId / executionRunId) after
+    // the run starts. Retries of task-less timer runs are the common case, and
+    // before this lookup every write from such a run failed closed with
+    // run_context_required even when the target was the issue the run itself
+    // held.
+    //
+    // Test the TARGET issue's own binding instead of selecting an arbitrary
+    // bound issue. A run can legitimately hold more than one issue (the legacy
+    // execution-lock fallback stamps a sibling issue too), so picking one row
+    // would cap writes to the others. Testing the target also keeps this to a
+    // primary-key lookup, so no (company_id, checkout_run_id /
+    // execution_run_id) index is required.
+    //
+    // Only an active run's binding counts: a stale binding left behind by a
+    // terminal run must not exempt a later write from the cross-issue cap.
+    if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+      const targetIsBound = await tx
         .select({ id: issues.id })
         .from(issues)
         .where(and(
+          eq(issues.id, input.targetIssueId),
           eq(issues.companyId, input.companyId),
           or(
             eq(issues.checkoutRunId, input.runId),
@@ -129,16 +162,14 @@ export async function observeCrossIssueInfluence(
           ),
         ))
         .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (boundIssue) sourceIssueId = boundIssue.id;
+        .then((rows) => rows.some((row) => row.id === input.targetIssueId));
+      if (targetIsBound) return null;
     }
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
-    if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
-    ) {
-      return null;
-    }
+
+    // With no context source and no binding on the target there is nothing to
+    // attribute the write to, so fail closed.
+    if (!contextSourceIssueId) throw crossIssueInfluenceRunContextError();
+    const sourceIssueId = contextSourceIssueId;
 
     const priorCount = await tx
       .select({ count: count() })

@@ -116,13 +116,13 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_cap_rejected")).toHaveLength(1);
   });
 
-  it("resolves a run's own checked-out issue when its context snapshot is empty", async () => {
+  async function seedRunAndCompany(input: {
+    runStatus?: string;
+    contextSnapshot?: Record<string, unknown>;
+  } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
-    const boundIssueId = randomUUID();
-    const otherIssueId = randomUUID();
-
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
@@ -140,31 +140,45 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       permissions: {},
     });
     // A timer/retry run can start with no issue in its context snapshot, then
-    // check an issue out onto the run (checkout_run_id / execution_run_id).
+    // have an issue stamped onto the run (checkout_run_id / execution_run_id).
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
       agentId,
-      status: "running",
+      status: input.runStatus ?? "running",
       responsibleUserId: "board-user",
-      contextSnapshot: { wakeReason: "heartbeat_timer" },
+      contextSnapshot: input.contextSnapshot ?? { wakeReason: "heartbeat_timer" },
     });
+    return { companyId, agentId, runId };
+  }
+
+  async function seedIssue(input: {
+    companyId: string;
+    identifier: string;
+    checkoutRunId?: string | null;
+    executionRunId?: string | null;
+  }) {
+    const issueId = randomUUID();
     await db.insert(issues).values({
-      id: boundIssueId,
+      id: issueId,
+      companyId: input.companyId,
+      title: `Issue ${input.identifier}`,
+      identifier: input.identifier,
+      checkoutRunId: input.checkoutRunId ?? null,
+      executionRunId: input.executionRunId ?? null,
+    });
+    return issueId;
+  }
+
+  it("resolves a context-less run's checkout-only binding", async () => {
+    const { companyId, agentId, runId } = await seedRunAndCompany();
+    const boundIssueId = await seedIssue({
       companyId,
-      title: "Bound issue",
       identifier: "BND-1",
       checkoutRunId: runId,
-      executionRunId: runId,
     });
-    await db.insert(issues).values({
-      id: otherIssueId,
-      companyId,
-      title: "Other issue",
-      identifier: "BND-2",
-    });
+    const otherIssueId = await seedIssue({ companyId, identifier: "BND-2" });
 
-    // The run's own locked issue is its source issue: no cross-issue influence.
     await expect(observeCrossIssueInfluence(db, {
       companyId,
       runId,
@@ -175,7 +189,8 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
     })).resolves.toBeNull();
 
-    // Any other issue is still counted against the run.
+    // A context-less run still has no source for an issue it does not hold, so
+    // the cap's fail-closed backstop applies instead of an unattributed count.
     await expect(observeCrossIssueInfluence(db, {
       companyId,
       runId,
@@ -184,6 +199,90 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       targetIssueIdentifier: "BND-2",
       kind: "comment",
       now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
-    })).resolves.toMatchObject({ count: 1, allowed: true });
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_run_context_required" },
+    });
+  });
+
+  it("resolves a context-less run's execution-only binding", async () => {
+    const { companyId, agentId, runId } = await seedRunAndCompany();
+    const boundIssueId = await seedIssue({
+      companyId,
+      identifier: "EXE-1",
+      executionRunId: runId,
+    });
+
+    await expect(observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: boundIssueId,
+      targetIssueIdentifier: "EXE-1",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toBeNull();
+  });
+
+  it("allows writes to any of several issues a context-less run holds", async () => {
+    const { companyId, agentId, runId } = await seedRunAndCompany();
+    const firstIssueId = await seedIssue({
+      companyId,
+      identifier: "MUL-1",
+      checkoutRunId: runId,
+    });
+    const secondIssueId = await seedIssue({
+      companyId,
+      identifier: "MUL-2",
+      executionRunId: runId,
+    });
+
+    // The legacy execution-lock fallback can stamp one run onto a sibling issue.
+    // Selecting a single bound issue would cap the other; each target must be
+    // recognized through its own binding.
+    await expect(observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: firstIssueId,
+      targetIssueIdentifier: "MUL-1",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toBeNull();
+
+    await expect(observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: secondIssueId,
+      targetIssueIdentifier: "MUL-2",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toBeNull();
+  });
+
+  it("fails closed for a terminal run with a stale binding", async () => {
+    const { companyId, agentId, runId } = await seedRunAndCompany({
+      runStatus: "succeeded",
+    });
+    const staleIssueId = await seedIssue({
+      companyId,
+      identifier: "STL-1",
+      checkoutRunId: runId,
+      executionRunId: runId,
+    });
+
+    await expect(observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: staleIssueId,
+      targetIssueIdentifier: "STL-1",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_run_context_required" },
+    });
   });
 });
