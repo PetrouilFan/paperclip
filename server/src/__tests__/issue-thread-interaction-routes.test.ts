@@ -96,6 +96,7 @@ const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })))
 // persisted context snapshot names the source issue) and the observation count.
 const mockCrossIssueInfluence = vi.hoisted(() => ({
   sourceIssueId: null as string | null,
+  boundIssueIds: [] as string[],
   priorCount: 0,
   inserted: [] as Array<Record<string, unknown>>,
 }));
@@ -103,13 +104,23 @@ const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) 
   select: (selection: Record<string, unknown>) => ({
     from: () => ({
       where: () => {
-        if (Object.keys(selection).includes("count")) {
+        const keys = Object.keys(selection);
+        if (keys.includes("count")) {
           return {
             then: (resolve: (rows: unknown[]) => unknown) =>
               resolve([{ count: mockCrossIssueInfluence.priorCount }]),
           };
         }
         const run = mockRunAttribution.value;
+        if (keys.length === 1 && keys[0] === "id") {
+          // Target-issue binding lookup: issues.checkout_run_id / execution_run_id.
+          return {
+            limit: () => ({
+              then: (resolve: (rows: unknown[]) => unknown) =>
+                resolve((mockCrossIssueInfluence.boundIssueIds ?? []).map((id) => ({ id }))),
+            }),
+          };
+        }
         return {
           for: () => ({
             then: (resolve: (rows: unknown[]) => unknown) => resolve(run
@@ -119,6 +130,7 @@ const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) 
                   agentId: run.agentId ?? null,
                   responsibleUserId: run.responsibleUserId ?? null,
                   contextSnapshot: { issueId: mockCrossIssueInfluence.sourceIssueId },
+                  status: run.status ?? "running",
                 }]
               : []),
           }),
