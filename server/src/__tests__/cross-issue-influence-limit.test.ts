@@ -282,6 +282,39 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
+  it("still counts a context-bound run's write to an issue it checked out", async () => {
+    const checkedOutIssueId = "55555555-5555-4555-8555-555555555555";
+    // The run's context names 44444444-… (the default override); it has also
+    // checked out the target without restamping that context. The binding
+    // fallback must not turn this into an uncounted write.
+    const fake = counterDb(0, {}, { boundIssueIds: [checkedOutIssueId] });
+
+    const decision = await observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: checkedOutIssueId,
+      kind: "comment",
+    });
+    expect(decision).toMatchObject({ allowed: true, count: 1 });
+    expect(fake.inserted).toHaveLength(1);
+  });
+
+  it("rejects a context-bound run's write to an issue it checked out once the cap is reached", async () => {
+    const checkedOutIssueId = "55555555-5555-4555-8555-555555555555";
+    const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, {}, {
+      boundIssueIds: [checkedOutIssueId],
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: checkedOutIssueId,
+      kind: "comment",
+    })).resolves.toMatchObject({ allowed: false, count: CROSS_ISSUE_INFLUENCE_LIMIT + 1 });
+  });
+
   it("fails closed for a context-less terminal run even when a stale binding matches", async () => {
     const staleIssueId = "55555555-5555-4555-8555-555555555555";
     const fake = counterDb(0, { contextSnapshot: {}, status: "succeeded" }, {

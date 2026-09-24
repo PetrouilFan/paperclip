@@ -261,6 +261,31 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     })).resolves.toBeNull();
   });
 
+  it("counts a context-bound run's write to an issue it checked out", async () => {
+    const { companyId, agentId, runId } = await seedRunAndCompany({
+      contextSnapshot: { issueId: randomUUID() },
+    });
+    const checkedOutIssueId = await seedIssue({
+      companyId,
+      identifier: "CHK-1",
+      checkoutRunId: runId,
+      executionRunId: runId,
+    });
+
+    // The run's context names a different issue, so checking this one out must
+    // not exempt the write from the cross-issue cap: master semantics for a
+    // context-bound run are unchanged by the fallback.
+    await expect(observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: checkedOutIssueId,
+      targetIssueIdentifier: "CHK-1",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
+  });
+
   it("fails closed for a terminal run with a stale binding", async () => {
     const { companyId, agentId, runId } = await seedRunAndCompany({
       runStatus: "succeeded",

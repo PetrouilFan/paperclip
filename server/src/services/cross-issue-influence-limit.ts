@@ -140,6 +140,13 @@ export async function observeCrossIssueInfluence(
     // run_context_required even when the target was the issue the run itself
     // held.
     //
+    // This fallback is deliberately scoped to runs whose context names NO
+    // source issue. A run that already has a source keeps master semantics: its
+    // own issue is exempt above, and every other issue — including one it
+    // checked out mid-run without restamping its context — is counted against
+    // the cap. Letting the binding short-circuit a context-ful run would let it
+    // check out its way past the 20-write limit.
+    //
     // Test the TARGET issue's own binding instead of selecting an arbitrary
     // bound issue. A run can legitimately hold more than one issue (the legacy
     // execution-lock fallback stamps a sibling issue too), so picking one row
@@ -149,7 +156,10 @@ export async function observeCrossIssueInfluence(
     //
     // Only an active run's binding counts: a stale binding left behind by a
     // terminal run must not exempt a later write from the cross-issue cap.
-    if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+    if (
+      !contextSourceIssueId &&
+      !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)
+    ) {
       const targetIsBound = await tx
         .select({ id: issues.id })
         .from(issues)
