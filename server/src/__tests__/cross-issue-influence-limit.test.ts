@@ -10,6 +10,7 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  options: { boundIssueId?: string | null } = {},
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -17,9 +18,19 @@ function counterDb(
     select: (selection: Record<string, unknown>) => ({
       from: () => ({
         where: () => {
-          if (Object.keys(selection).includes("count")) {
+          const keys = Object.keys(selection);
+          if (keys.includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
+            };
+          }
+          if (keys.length === 1 && keys[0] === "id") {
+            // Bound-issue fallback lookup: issues.checkout_run_id / execution_run_id.
+            return {
+              limit: () => ({
+                then: (resolve: (rows: unknown[]) => unknown) =>
+                  resolve(options.boundIssueId ? [{ id: options.boundIssueId }] : []),
+              }),
             };
           }
           return {
@@ -212,5 +223,35 @@ describe("cross-issue influence limit rollout", () => {
       details: { code: "cross_issue_influence_run_context_required" },
     });
     expect(fake.inserted).toEqual([]);
+  });
+
+  it("allows writes to the issue a context-less run has locked instead of failing closed", async () => {
+    const boundIssueId = "55555555-5555-4555-8555-555555555555";
+    const fake = counterDb(0, { contextSnapshot: {} }, { boundIssueId });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: boundIssueId,
+      kind: "comment",
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("still counts a context-less run's write to an issue it does not hold", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} }, {
+      boundIssueId: "66666666-6666-4666-8666-666666666666",
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      now: new Date(CROSS_ISSUE_INFLUENCE_ENFORCE_AT.getTime() - 1),
+      kind: "comment",
+    })).resolves.toMatchObject({ count: 1, allowed: true });
+    expect(fake.inserted).toHaveLength(1);
   });
 });
