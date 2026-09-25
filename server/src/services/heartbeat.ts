@@ -443,9 +443,11 @@ import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
   cleanupHeartbeatRunScratch,
+  resolveHeartbeatRunScratch,
   prepareHeartbeatRunScratch,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
+import { reapLostRunProcessTree } from "./run-process-reaper.js";
 import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
@@ -8890,6 +8892,116 @@ async function terminateHeartbeatRunProcess(input: {
   );
 }
 
+/**
+ * Terminate everything a run left behind and remove its scratch directory.
+ *
+ * `terminateHeartbeatRunProcess` only knows the run's direct child and its
+ * recorded process group. A child can spawn a grandchild that escapes the group
+ * (no group recorded, or the leader gone and the member reparented to init),
+ * and that grandchild survives, still holding memory and a listening port. The
+ * run's scratch directory is the remaining ownership anchor: it is a unique
+ * per-run `mkdtemp` name that every descendant inherits through
+ * `PAPERCLIP_RUN_SCRATCH_DIR` and argv, so matching on it identifies exactly
+ * this run's processes and nothing else.
+ *
+ * Safe to call on a path that already reaped: the sweep is bounded, skips
+ * anything in this server's own process group, and is a no-op once nothing
+ * references the directory.
+ */
+async function reapAndCleanRunResources(input: {
+  db: Db;
+  run: {
+    id: string;
+    companyId: string;
+    agentId: string;
+    contextSnapshot?: Record<string, unknown> | null;
+    processGroupId?: number | null;
+  };
+  processGroupId: number | null;
+  graceMs?: number;
+}) {
+  const { db, run } = input;
+  const runContext = parseObject(run.contextSnapshot);
+  const persistedScratchDir = readNonEmptyString(
+    parseObject(runContext.paperclipScratch).dir,
+  );
+  // Resolve from the marker rather than trusting the snapshot: the snapshot
+  // records the scratch policy, not the metadata the cleanup owner check
+  // verifies, so only the marker proves this directory belongs to this run.
+  const scratch = await resolveHeartbeatRunScratch(run.id).catch(
+    () => null,
+  );
+  const scratchDir = scratch?.dir ?? persistedScratchDir;
+
+  let reaped: Awaited<ReturnType<typeof reapLostRunProcessTree>> | null = null;
+  try {
+    reaped = await reapLostRunProcessTree({
+      processGroupId: input.processGroupId,
+      scratchDir,
+      graceMs: input.graceMs,
+    });
+  } catch (error) {
+    logger.warn(
+      { err: error, runId: run.id },
+      "failed to reap lost run process tree",
+    );
+  }
+
+  const append = (event: {
+    eventType: string;
+    level: string;
+    message: string;
+    payload: Record<string, unknown>;
+  }) =>
+    appendHeartbeatRunEvent(db as unknown as Db, {
+      companyId: run.companyId,
+      runId: run.id,
+      agentId: run.agentId,
+      stream: "system",
+      ...event,
+    }).catch(() => undefined);
+
+  if (reaped && (reaped.matchedPids.length > 0 || reaped.groupWasAlive)) {
+    await append({
+      eventType: "lifecycle",
+      level: "warn",
+      message: `Reaped lost run process tree: ${reaped.matchedPids.length} descendant(s) matched, ${reaped.signalledPids.length} signalled, ${reaped.killedPids.length} killed`,
+      payload: {
+        ...(reaped.processGroupId
+          ? { processGroupId: reaped.processGroupId }
+          : {}),
+        ...(scratchDir ? { scratchDir } : {}),
+        matchedPids: reaped.matchedPids,
+        signalledPids: reaped.signalledPids,
+        killedPids: reaped.killedPids,
+        errors: reaped.errors,
+      },
+    });
+  }
+
+  if (!scratch) return;
+  try {
+    const cleaned = await cleanupHeartbeatRunScratch({
+      scratch,
+      processGroupId: input.processGroupId,
+      isProcessGroupAlive,
+    });
+    if (cleaned.removed) {
+      await append({
+        eventType: "lifecycle",
+        level: "info",
+        message: "Removed run scratch directory after run teardown",
+        payload: { scratchDir: cleaned.dir },
+      });
+    }
+  } catch (error) {
+    logger.warn(
+      { err: error, runId: run.id, scratchDir: scratch.dir },
+      "failed to clean run scratch during teardown",
+    );
+  }
+}
+
 function buildProcessLossMessage(
   run: {
     processPid: number | null;
@@ -15089,6 +15201,14 @@ export function heartbeatService(
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
         }
+        // Terminating the direct child and its group does not reach a
+        // grandchild that escaped the group, and the clean-finish scratch
+        // removal does not run on an interrupted run. Both leak, so reap them.
+        await reapAndCleanRunResources({
+          db,
+          run,
+          processGroupId: running?.processGroupId ?? run.processGroupId,
+        });
       } finally {
         runningProcesses.delete(run.id);
       }
@@ -19171,6 +19291,16 @@ export function heartbeatService(
         },
       );
       if (!failureWrite.updated || !failureWrite.run) continue;
+
+      // A lost process leaves its descendants reparented to init and still
+      // holding memory and listening ports. Reap the tree before the run is
+      // treated as finished, and before any retry is queued, so a retry never
+      // overlaps a server the lost run spawned.
+      await reapAndCleanRunResources({
+        db,
+        run,
+        processGroupId: run.processGroupId,
+      });
       let finalizedRun: typeof heartbeatRuns.$inferSelect | null =
         failureWrite.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
