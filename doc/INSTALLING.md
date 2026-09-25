@@ -291,6 +291,66 @@ the downloaded `install.sh` workflow under **Recommended Install**. Do not use
 the piped form for this repair because it requires a supported Node.js runtime
 before it starts.
 
+## Recover A Broken Service Unit
+
+`paperclipai service install`, `start`, and `restart` re-render
+`~/.config/systemd/user/paperclipai.service` *before* they talk to systemd. The
+renderer derives `ExecStart` from the current environment, so a host whose
+service was installed under a different prefix — an `npm install -g` binary, a
+hand-edited unit, a `PAPERCLIP_SHIM_PATH` that was never exported in the shell
+that ran the restart — can be rewritten onto a path that does not exist.
+systemd then answers `status=203/EXEC` on every start attempt, reaches the
+start limit after five tries, and parks the unit in `failed`.
+
+The API and the embedded PostgreSQL live in that unit's cgroup, so the whole
+instance goes down for as long as the unit is broken. Every in-flight agent
+write is dropped with it. There is no CLI command that repairs the unit, so the
+recovery below is manual.
+
+Recognise it:
+
+```sh
+systemctl --user status paperclipai --no-pager
+journalctl --user -u paperclipai -n 20 --no-pager
+grep -n '^ExecStart=' "$HOME/.config/systemd/user/paperclipai.service"
+```
+
+`status` reports `failed` with `start-limit-hit`, the journal shows
+`Unable to locate executable ...` five times in a row, and `ExecStart` points
+at a file that is not there.
+
+Repair it in place:
+
+```sh
+unit="$HOME/.config/systemd/user/paperclipai.service"
+binary="$(command -v paperclipai)"        # the CLI that is actually installed
+test -x "$binary" || echo "no runnable CLI on PATH"
+
+cp -a "$unit" "$unit.bak"
+sed -i 's|^ExecStart=.*|ExecStart="'"$binary"'" run --instance "default"|' "$unit"
+
+systemctl --user daemon-reload
+systemctl --user reset-failed paperclipai
+systemctl --user start paperclipai
+```
+
+Use `systemctl --user edit --full paperclipai` instead of `sed` when you prefer
+a real editor, and drop `--instance "default"` if the unit runs another
+instance id.
+
+While you are in the unit, check the `Environment=` lines. The renderer only
+owns `PAPERCLIP_SERVICE_MANAGED`, `PAPERCLIP_INSTANCE_ID`, and
+`PAPERCLIP_HOME`; a rewrite performed by an older CLI also drops
+operator-supplied lines such as `PATH` and `PAPERCLIP_OPENCODE_PROVIDERS`. The
+service starts without them, but adapter dispatch and provider selection are
+wrong, which looks like a healthy process serving broken runs. Restore those
+lines from `$unit.bak`.
+
+`paperclipai doctor` and `paperclipai service status` report unit-file drift
+but do not repair it. Until the CLI validates its `ExecStart` target before
+writing, copy the unit aside (`cp -a "$unit" "$unit.bak"`) before every
+`paperclipai service restart` on a host with a hand-patched unit.
+
 ## Uninstall
 
 Remove the background service and managed CLI payloads:
