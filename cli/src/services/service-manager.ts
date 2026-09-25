@@ -27,6 +27,14 @@ export interface ServiceManager {
   readonly serviceName: string;
   readonly definitionPath: string;
   renderDefinition(): string;
+  /**
+   * The exact bytes this manager would write to `definitionPath`: the
+   * canonical rendering, re-pointed at a usable executable and carrying the
+   * operator-supplied settings the renderer does not own. Writing anything
+   * else silently deletes operator configuration, so install/start/restart
+   * and the doctor's drift check all go through this.
+   */
+  desiredDefinition(): Promise<string>;
   install(options: ServiceInstallOptions): Promise<{ changed: boolean }>;
   uninstall(): Promise<void>;
   start(): Promise<void>;
@@ -116,6 +124,36 @@ export async function isExecutableFile(filePath: string): Promise<boolean> {
   }
 }
 
+/**
+ * Resolve the executable a service definition may point at.
+ *
+ * `PAPERCLIP_SHIM_PATH` and the `~/.local/bin` default describe the current
+ * environment, not the machine's history: an instance installed under a
+ * different prefix (npm-global, a managed git store) keeps working through
+ * every environment change. Rewriting the definition around a path that does
+ * not exist produces `status=203/EXEC` and a `start-limit-hit` crash loop, so
+ * the preferred candidate wins only when it is a usable executable and the
+ * installed target is the fallback. When neither is usable the caller must
+ * refuse to write rather than install a corpse.
+ */
+export async function resolveExecutableShimPath(input: {
+  preferredPath: string;
+  installedPath?: string | null;
+  definitionPath?: string;
+}): Promise<string> {
+  if (await isExecutableFile(input.preferredPath)) return input.preferredPath;
+  const installedPath = input.installedPath?.trim() || null;
+  if (installedPath && await isExecutableFile(installedPath)) return installedPath;
+  throw new Error(
+    `Refusing to write ${input.definitionPath ?? "the service definition"}: `
+    + `its ExecStart target ${input.preferredPath} does not exist or is not executable`
+    + (installedPath && installedPath !== input.preferredPath
+      ? `, and the installed target ${installedPath} is unusable too`
+      : "")
+    + ". Restore the executable (run `paperclipai install` to rebuild the managed shim) and retry.",
+  );
+}
+
 export function systemdServiceName(instanceId: string): string {
   return instanceId === "default" ? "paperclipai.service" : `paperclipai-${instanceId}.service`;
 }
@@ -142,10 +180,99 @@ WorkingDirectory=%h
 Restart=always
 RestartSec=5
 TimeoutStopSec=300
+# Only the server itself is signalled: the default KillMode=control-group
+# would SIGTERM detached local-agent runs and embedded PostgreSQL in the same
+# cgroup concurrently with the coordinated shutdown, which defeats hot-restart
+# run adoption and puts the database out from under the snapshot.
+KillMode=process
 
 [Install]
 WantedBy=default.target
 `;
+}
+
+// Only these Environment keys belong to the renderer. Everything else in the
+// installed definition (PATH, PAPERCLIP_OPENCODE_PROVIDERS, operator
+// credentials) is operator configuration that a rewrite must carry forward
+// instead of silently deleting.
+const MANAGED_ENVIRONMENT_KEYS = new Set([
+  "PAPERCLIP_SERVICE_MANAGED",
+  "PAPERCLIP_INSTANCE_ID",
+  "PAPERCLIP_HOME",
+]);
+
+type EnvironmentAssignment = { key: string; raw: string };
+
+function parseEnvironmentAssignments(line: string): EnvironmentAssignment[] {
+  const body = line.match(/^\s*Environment\s*=\s*(.*)$/)?.[1];
+  if (body === undefined) return [];
+  const assignments: EnvironmentAssignment[] = [];
+  const segment = /"((?:\\.|[^"\\])*)"|'([^']*)'|(\S+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = segment.exec(body)) !== null) {
+    const content = match[1] ?? match[2] ?? match[3] ?? "";
+    const separator = content.indexOf("=");
+    if (separator < 1) continue;
+    assignments.push({ key: content.slice(0, separator), raw: match[0] });
+  }
+  return assignments;
+}
+
+function environmentLinesOfServiceSection(definition: string): string[] {
+  const lines: string[] = [];
+  let inServiceSection = false;
+  for (const line of definition.split("\n")) {
+    const section = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (section) {
+      inServiceSection = section[1] === "Service";
+      continue;
+    }
+    if (inServiceSection && /^\s*Environment\s*=/.test(line)) lines.push(line.trim());
+  }
+  return lines;
+}
+
+/**
+ * Carry the operator's own `Environment=` settings from the installed
+ * definition into the rendered one. The renderer owns only its three
+ * PAPERCLIP_* keys; dropping the rest rewrites a working unit into one that
+ * no longer resolves executables or reaches the configured providers.
+ */
+export function preserveEnvironmentLines(installedDefinition: string | null, renderedDefinition: string): string {
+  if (!installedDefinition) return renderedDefinition;
+  const renderedLines = renderedDefinition.split("\n");
+  const seen = new Set(renderedLines.map((line) => line.trim()));
+  const preserved: string[] = [];
+  for (const line of environmentLinesOfServiceSection(installedDefinition)) {
+    const kept = parseEnvironmentAssignments(line).filter((assignment) => !MANAGED_ENVIRONMENT_KEYS.has(assignment.key));
+    if (kept.length === 0) continue;
+    const rendered = `Environment=${kept.map((assignment) => assignment.raw).join(" ")}`;
+    if (seen.has(rendered)) continue;
+    seen.add(rendered);
+    preserved.push(rendered);
+  }
+  if (preserved.length === 0) return renderedDefinition;
+
+  let anchor = -1;
+  let inServiceSection = false;
+  for (let index = 0; index < renderedLines.length; index += 1) {
+    const section = renderedLines[index].match(/^\s*\[([^\]]+)\]\s*$/);
+    if (section) {
+      inServiceSection = section[1] === "Service";
+      continue;
+    }
+    if (inServiceSection && /^\s*Environment\s*=/.test(renderedLines[index])) anchor = index;
+  }
+  if (anchor < 0) {
+    for (let index = 0; index < renderedLines.length; index += 1) {
+      if (/^\s*\[Service\]\s*$/.test(renderedLines[index])) {
+        anchor = index;
+        break;
+      }
+    }
+  }
+  if (anchor < 0) return renderedDefinition;
+  return [...renderedLines.slice(0, anchor + 1), ...preserved, ...renderedLines.slice(anchor + 1)].join("\n");
 }
 
 export function renderLaunchdPlist(input: { instanceId: string; shimPath: string; homeDir: string; stdoutPath: string; stderrPath: string }): string {
@@ -201,6 +328,24 @@ async function writeIfChanged(filePath: string, contents: string): Promise<boole
   return true;
 }
 
+// Re-rendering a definition must never downgrade an installed unit that already
+// points at a runnable binary. The rendered path comes from the current
+// environment: PAPERCLIP_SHIM_PATH may have been changed, unset, or inherited
+// from a shell that never had it set, and the common install is a hand-patched
+// ExecStart (the npm-global bin is not the default ~/.local/bin shim). Writing
+// a path that does not exist makes systemd answer 203/EXEC, hit the start limit
+// and take the API down with it.
+//
+// Returns the executable target the definition should reference: the freshly
+// resolved one when it is runnable, otherwise the installed one when that is,
+// otherwise the rendered one so behaviour stays unchanged for a fresh install.
+async function runnableExecutableTarget(renderedTarget: string | null, installedTarget: string | null): Promise<string | null> {
+  if (renderedTarget === null) return null;
+  if (await isExecutableFile(renderedTarget)) return renderedTarget;
+  if (installedTarget && installedTarget !== renderedTarget && await isExecutableFile(installedTarget)) return installedTarget;
+  return renderedTarget;
+}
+
 export class SystemdServiceManager implements ServiceManager {
   readonly platform = "systemd" as const;
   readonly serviceName: string;
@@ -223,8 +368,16 @@ export class SystemdServiceManager implements ServiceManager {
     }
   }
 
+  private async runnableDefinition(): Promise<string> {
+    const rendered = this.renderDefinition();
+    const renderedTarget = extractExecutableFromSystemdUnit(rendered);
+    const target = await runnableExecutableTarget(renderedTarget, await this.installedExecutablePath());
+    if (target === null || target === renderedTarget) return rendered;
+    return rendered.replace(/^ExecStart="(?:\\.|[^"\\])*"/m, `ExecStart="${escapeSystemd(target)}"`);
+  }
+
   private async ensureCurrent(): Promise<boolean> {
-    const changed = await writeIfChanged(this.definitionPath, this.renderDefinition());
+    const changed = await writeIfChanged(this.definitionPath, await this.runnableDefinition());
     if (changed) await this.runner("systemctl", ["--user", "daemon-reload"]);
     return changed;
   }
@@ -299,9 +452,17 @@ export class LaunchdServiceManager implements ServiceManager {
     }
   }
 
+  private async runnableDefinition(): Promise<string> {
+    const rendered = this.renderDefinition();
+    const renderedTarget = extractExecutableFromLaunchdPlist(rendered);
+    const target = await runnableExecutableTarget(renderedTarget, await this.installedExecutablePath());
+    if (target === null || target === renderedTarget) return rendered;
+    return rendered.replace(/(<string>)([^<]*)(<\/string><string>run<\/string>)/, `$1${escapeXml(target)}$3`);
+  }
+
   async install(options: ServiceInstallOptions): Promise<{ changed: boolean }> {
     await fs.mkdir(path.dirname(this.stdoutPath), { recursive: true });
-    const changed = await writeIfChanged(this.definitionPath, this.renderDefinition());
+    const changed = await writeIfChanged(this.definitionPath, await this.runnableDefinition());
     if (changed) await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]).catch(() => undefined);
     await this.runner("launchctl", [options.startOnLogin ? "enable" : "disable", `${this.domain}/${this.serviceName}`]);
     if (options.startOnLogin || options.startNow) {
@@ -318,7 +479,7 @@ export class LaunchdServiceManager implements ServiceManager {
   }
   async start(): Promise<void> { await this.install({ startNow: true, startOnLogin: await this.isEnabled() }); }
   async stop(): Promise<void> { await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]); }
-  async restart(): Promise<void> { await writeIfChanged(this.definitionPath, this.renderDefinition()); await this.runner("launchctl", ["kickstart", "-k", `${this.domain}/${this.serviceName}`]); }
+  async restart(): Promise<void> { await writeIfChanged(this.definitionPath, await this.runnableDefinition()); await this.runner("launchctl", ["kickstart", "-k", `${this.domain}/${this.serviceName}`]); }
 
   async status(): Promise<ServiceStatus> {
     try {
