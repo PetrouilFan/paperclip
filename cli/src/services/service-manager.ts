@@ -328,24 +328,6 @@ async function writeIfChanged(filePath: string, contents: string): Promise<boole
   return true;
 }
 
-// Re-rendering a definition must never downgrade an installed unit that already
-// points at a runnable binary. The rendered path comes from the current
-// environment: PAPERCLIP_SHIM_PATH may have been changed, unset, or inherited
-// from a shell that never had it set, and the common install is a hand-patched
-// ExecStart (the npm-global bin is not the default ~/.local/bin shim). Writing
-// a path that does not exist makes systemd answer 203/EXEC, hit the start limit
-// and take the API down with it.
-//
-// Returns the executable target the definition should reference: the freshly
-// resolved one when it is runnable, otherwise the installed one when that is,
-// otherwise the rendered one so behaviour stays unchanged for a fresh install.
-async function runnableExecutableTarget(renderedTarget: string | null, installedTarget: string | null): Promise<string | null> {
-  if (renderedTarget === null) return null;
-  if (await isExecutableFile(renderedTarget)) return renderedTarget;
-  if (installedTarget && installedTarget !== renderedTarget && await isExecutableFile(installedTarget)) return installedTarget;
-  return renderedTarget;
-}
-
 export class SystemdServiceManager implements ServiceManager {
   readonly platform = "systemd" as const;
   readonly serviceName: string;
@@ -368,16 +350,33 @@ export class SystemdServiceManager implements ServiceManager {
     }
   }
 
-  private async runnableDefinition(): Promise<string> {
+  private async installedDefinition(): Promise<string | null> {
+    try {
+      return await fs.readFile(this.definitionPath, "utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  async desiredDefinition(): Promise<string> {
     const rendered = this.renderDefinition();
     const renderedTarget = extractExecutableFromSystemdUnit(rendered);
-    const target = await runnableExecutableTarget(renderedTarget, await this.installedExecutablePath());
-    if (target === null || target === renderedTarget) return rendered;
-    return rendered.replace(/^ExecStart="(?:\\.|[^"\\])*"/m, `ExecStart="${escapeSystemd(target)}"`);
+    // Preferred candidate first, then the target the installed unit already
+    // uses; if neither is a runnable executable this throws instead of
+    // writing a unit systemd cannot exec (status=203/EXEC → start-limit-hit).
+    const target = await resolveExecutableShimPath({
+      preferredPath: renderedTarget ?? this.shimPath,
+      installedPath: await this.installedExecutablePath(),
+      definitionPath: this.definitionPath,
+    });
+    const withTarget = target === renderedTarget
+      ? rendered
+      : rendered.replace(/^ExecStart="(?:\\.|[^"\\])*"/m, `ExecStart="${escapeSystemd(target)}"`);
+    return preserveEnvironmentLines(await this.installedDefinition(), withTarget);
   }
 
   private async ensureCurrent(): Promise<boolean> {
-    const changed = await writeIfChanged(this.definitionPath, await this.runnableDefinition());
+    const changed = await writeIfChanged(this.definitionPath, await this.desiredDefinition());
     if (changed) await this.runner("systemctl", ["--user", "daemon-reload"]);
     return changed;
   }
@@ -452,17 +451,27 @@ export class LaunchdServiceManager implements ServiceManager {
     }
   }
 
-  private async runnableDefinition(): Promise<string> {
+  async desiredDefinition(): Promise<string> {
     const rendered = this.renderDefinition();
     const renderedTarget = extractExecutableFromLaunchdPlist(rendered);
-    const target = await runnableExecutableTarget(renderedTarget, await this.installedExecutablePath());
-    if (target === null || target === renderedTarget) return rendered;
-    return rendered.replace(/(<string>)([^<]*)(<\/string><string>run<\/string>)/, `$1${escapeXml(target)}$3`);
+    // Same contract as the systemd manager: preferred shim, else the target
+    // the installed plist already uses, else refuse to write (launchd would
+    // otherwise respawn a missing binary forever).
+    const target = await resolveExecutableShimPath({
+      preferredPath: renderedTarget ?? this.shimPath,
+      installedPath: await this.installedExecutablePath(),
+      definitionPath: this.definitionPath,
+    });
+    if (target === renderedTarget) return rendered;
+    return rendered.replace(
+      /(<string>)([^<]*)(<\/string><string>run<\/string>)/,
+      (_match, prefix, _current, suffix: string) => `${prefix}${escapeXml(target)}${suffix}`,
+    );
   }
 
   async install(options: ServiceInstallOptions): Promise<{ changed: boolean }> {
     await fs.mkdir(path.dirname(this.stdoutPath), { recursive: true });
-    const changed = await writeIfChanged(this.definitionPath, await this.runnableDefinition());
+    const changed = await writeIfChanged(this.definitionPath, await this.desiredDefinition());
     if (changed) await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]).catch(() => undefined);
     await this.runner("launchctl", [options.startOnLogin ? "enable" : "disable", `${this.domain}/${this.serviceName}`]);
     if (options.startOnLogin || options.startNow) {
@@ -479,7 +488,7 @@ export class LaunchdServiceManager implements ServiceManager {
   }
   async start(): Promise<void> { await this.install({ startNow: true, startOnLogin: await this.isEnabled() }); }
   async stop(): Promise<void> { await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]); }
-  async restart(): Promise<void> { await writeIfChanged(this.definitionPath, await this.runnableDefinition()); await this.runner("launchctl", ["kickstart", "-k", `${this.domain}/${this.serviceName}`]); }
+  async restart(): Promise<void> { await writeIfChanged(this.definitionPath, await this.desiredDefinition()); await this.runner("launchctl", ["kickstart", "-k", `${this.domain}/${this.serviceName}`]); }
 
   async status(): Promise<ServiceStatus> {
     try {

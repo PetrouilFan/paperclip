@@ -60,6 +60,7 @@ function managerFixture(active = true) {
     })),
     logs: vi.fn(async () => undefined),
     installedExecutablePath: vi.fn(async () => null),
+    desiredDefinition: vi.fn(async () => "unit"),
   };
 }
 
@@ -189,6 +190,7 @@ describe("service runtime shim awareness", () => {
       })),
       logs: vi.fn(async () => undefined),
       installedExecutablePath: vi.fn(async (): Promise<string | null> => null),
+      desiredDefinition: vi.fn(async (): Promise<string> => "plist"),
     };
   }
 
