@@ -18,9 +18,16 @@ PAPERCLIPAI_VERSION="${PAPERCLIPAI_VERSION:-latest}"
 DATA_DIR="${DATA_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/paperclip-service-smoke.XXXXXX")}"
 ONBOARD_TIMEOUT_SECONDS="${ONBOARD_TIMEOUT_SECONDS:-600}"
 SMOKE_READY_TIMEOUT_SECONDS="${SMOKE_READY_TIMEOUT_SECONDS:-420}"
-HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:3100/api/health}"
+HEALTH_URL="http://127.0.0.1:3100/api/health"
+
+# PET-52: e2e scripts must not address the real service in the real $HOME.
+# Run entirely against an isolated home so the smoke can never uninstall a
+# production paperclipai.service.
+SMOKE_ISOHOME="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-smoke-iso.XXXXXX")"
+export HOME="$SMOKE_ISOHOME"
+export XDG_CONFIG_HOME="$SMOKE_ISOHOME/.config"
 SERVICE_NAME="paperclipai.service"
-SHIM_PATH="${PAPERCLIP_SHIM_PATH:-$HOME/.local/bin/paperclipai}"
+SHIM_PATH="${PAPERCLIP_SHIM_PATH:-$SMOKE_ISOHOME/.local/bin/paperclipai}"
 # Cleanup defaults to on so a local run does not leave a service behind; CI
 # disables it so the diagnostics step can still inspect the unit.
 SMOKE_CLEANUP="${SMOKE_CLEANUP:-true}"
@@ -28,6 +35,9 @@ SMOKE_FORCE="${SMOKE_FORCE:-false}"
 
 fail() {
   echo "Service smoke failed: $*" >&2
+  # Restore HOME before exit so the caller's environment is not poisoned.
+  unset HOME XDG_CONFIG_HOME
+  rm -rf "$SMOKE_ISOHOME"
   exit 1
 }
 

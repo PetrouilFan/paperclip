@@ -178,8 +178,40 @@ else
     skip_ "8 service lifecycle" "no systemd user bus at /run/user/$(id -u)/bus"
   else
     note "8. service lifecycle ($(uname -s): systemd/launchd)"
+
+    # ISOHOME override: run the service lifecycle against an isolated home so
+    # the e2e scripts can never uninstall the host's live paperclipai.service.
+    # PET-52: e2e scripts must not address the real service in the real $HOME.
+    # NOTE: the mktemp template must not be quote-escaped. `\"` inside the
+    # substitution makes mktemp receive literal quote characters, it fails,
+    # SERVICE_ISOHOME ends up empty, and `export HOME=""` below would then
+    # defeat this very guard while the script kept going with exit 0.
+    SERVICE_ISOHOME="$(mktemp -d "${TMPDIR:-/tmp}/e2e-service-iso.XXXXXX")" || {
+      fail_ "8 service lifecycle" "could not create isolated HOME"
+      skip_ "8 service lifecycle" "mktemp failed"
+    }
+    if [ -z "$SERVICE_ISOHOME" ] || [ ! -d "$SERVICE_ISOHOME" ]; then
+      fail_ "8 service lifecycle" "isolated HOME was not created (got '${SERVICE_ISOHOME}')"
+      skip_ "8 service lifecycle" "isolated HOME missing"
+    fi
+    export HOME="$SERVICE_ISOHOME"
+    export XDG_CONFIG_HOME="$SERVICE_ISOHOME/.config"
+    SERVICE_SHIM="$SERVICE_ISOHOME/.local/bin/paperclipai"
+    SERVICE_NAME="paperclipai-e2e.service"
+
+    # Preflight: refuse if the default production service is active on this host.
+    # Even with the HOME override, a naive script could still reach the real unit.
+    if systemctl --user cat paperclipai.service >/dev/null 2>&1 && \
+       systemctl --user is-active paperclipai.service 2>/dev/null | grep -q active; then
+      fail_ "8 service lifecycle skipped: default paperclipai.service is active on this host (PET-52 guard)"
+      unset HOME XDG_CONFIG_HOME
+      rm -rf "$SERVICE_ISOHOME"
+      skip_ "8 service lifecycle" "production service active"
+    fi
+
     # Real quickstart path: onboard with defaults, then install + start the service.
-    if shim onboard --yes --install-service; then
+    # Use SERVICE_SHIM and SERVICE_NAME from the ISO home context.
+    if "$SERVICE_SHIM" onboard --yes --install-service; then
       pass "8a onboard --yes --install-service exits 0"
     else
       fail_ "8a onboard --yes --install-service exits 0"
@@ -187,7 +219,7 @@ else
     DEADLINE=$(( $(date +%s) + E2E_SERVICE_TIMEOUT_SECS ))
     ACTIVE=0
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-      STATUS_JSON="$(shim service status --json 2>/dev/null || true)"
+      STATUS_JSON="$(SERVICE_SHIM service status --json 2>/dev/null || true)"
       if echo "$STATUS_JSON" | grep -q '"active"[[:space:]]*:[[:space:]]*true'; then ACTIVE=1; break; fi
       sleep 5
     done
@@ -195,12 +227,16 @@ else
       pass "8b service reached active within ${E2E_SERVICE_TIMEOUT_SECS}s"
     else
       echo "last status: ${STATUS_JSON:-<none>}"
-      shim service logs -n 60 || true
+      SERVICE_SHIM service logs -n 60 || true
       fail_ "8b service reached active"
     fi
-    shim service logs -n 20 >/dev/null 2>&1 && pass "8c service logs readable" || fail_ "8c service logs readable"
-    if shim service stop; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
-    if shim service uninstall; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
+    SERVICE_SHIM service logs -n 20 >/dev/null 2>&1 && pass "8c service logs readable" || fail_ "8c service logs readable"
+    if SERVICE_SHIM service stop; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
+    if SERVICE_SHIM service uninstall; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
+
+    # Restore the real HOME for subsequent steps.
+    unset HOME XDG_CONFIG_HOME
+    rm -rf "$SERVICE_ISOHOME"
   fi
 fi
 
