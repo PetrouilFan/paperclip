@@ -3,12 +3,12 @@ export type EmbeddedPostgresExitListener = (code: number | null, signal: NodeJS.
 /**
  * Why a managed PostgreSQL child exited without being an incident.
  *
- * - `shutdown_requested`: this process already decided to shut down, so the
- *   exit is the tail of our own teardown.
- * - `requested_stop`: we asked this specific instance to stop and it exited
- *   cleanly, so the exit is the documented result of that request.
+ * `shutdown_requested`: this process already decided to shut down, so the exit
+ * is the tail of our own teardown. This is also the reason used for an exit
+ * that follows a stop this supervisor issued, because every stop path marks the
+ * shutdown intent before it stops anything — see `markShutdownIntent`.
  */
-export type EmbeddedPostgresControlledExitReason = "shutdown_requested" | "requested_stop";
+export type EmbeddedPostgresControlledExitReason = "shutdown_requested";
 
 export interface SupervisedEmbeddedPostgres {
   start(): Promise<void>;
@@ -52,11 +52,6 @@ type Options = {
 
 const defaultDelay = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 
-/** A process that ran to completion and was not killed reports `code=0` with no
- * signal. PostgreSQL uses exactly that shape for a requested fast/smart
- * shutdown, so this pair means "it stopped" rather than "it broke". */
-const exitedCleanly = (code: number | null, signal: NodeJS.Signals | null) => code === 0 && signal === null;
-
 export function createEmbeddedPostgresSupervisor(options: Options): EmbeddedPostgresSupervisor {
   const restartDelaysMs = options.restartDelaysMs ?? [0, 250, 1_000];
   const wait = options.delay ?? defaultDelay;
@@ -67,14 +62,6 @@ export function createEmbeddedPostgresSupervisor(options: Options): EmbeddedPost
   let shutdownIntent = false;
   let shutdownStarted = false;
   let recoveryPromise: Promise<void> | null = null;
-  // Instances this supervisor asked to stop, so a clean exit that arrives after
-  // a local `stop()` is recognised even when no global shutdown is under way.
-  const instancesRequestedToStop = new Set<SupervisedEmbeddedPostgres>();
-
-  const stopInstance = async (instance: SupervisedEmbeddedPostgres) => {
-    instancesRequestedToStop.add(instance);
-    await instance.stop();
-  };
 
   const recover = async () => {
     let lastError: unknown = new Error("Embedded PostgreSQL exited unexpectedly");
@@ -89,7 +76,7 @@ export function createEmbeddedPostgresSupervisor(options: Options): EmbeddedPost
         const replacement = options.createInstance();
         await replacement.start();
         if (shutdownIntent) {
-          await stopInstance(replacement);
+          await replacement.stop();
           return;
         }
         activeInstance = replacement;
@@ -114,15 +101,17 @@ export function createEmbeddedPostgresSupervisor(options: Options): EmbeddedPost
     child.once("exit", (code, signal) => {
       if (activeInstance !== instance) return;
       activeInstanceExited = true;
-      // An exit we asked for is not an incident, so it never reaches recovery.
-      // A shutdown we initiated outranks the instance-level check because a
-      // cgroup kill arrives before any local `stop()` call can be made.
+      // Once this process has recorded shutdown intent, every later exit is the
+      // tail of our own teardown — including the cgroup SIGTERM, which can land
+      // before any local `stop()` call is made. Reporting it as an incident
+      // would log "exited unexpectedly" at ERROR and relaunch the database this
+      // process is stopping, so it is reported as a controlled exit instead.
+      //
+      // This is also why there is no separate "we asked this instance to stop"
+      // check: `shutdown()` marks the intent before it stops anything, so every
+      // stop this supervisor performs is already covered by the branch above.
       if (shutdownIntent) {
         options.onControlledExit?.("shutdown_requested", code, signal);
-        return;
-      }
-      if (instancesRequestedToStop.has(instance) && exitedCleanly(code, signal)) {
-        options.onControlledExit?.("requested_stop", code, signal);
         return;
       }
       options.onUnexpectedExit?.(code, signal);
@@ -140,7 +129,7 @@ export function createEmbeddedPostgresSupervisor(options: Options): EmbeddedPost
       shutdownStarted = true;
       shutdownIntent = true;
       await recoveryPromise;
-      if (!activeInstanceExited) await stopInstance(activeInstance);
+      if (!activeInstanceExited) await activeInstance.stop();
     },
   };
 }
