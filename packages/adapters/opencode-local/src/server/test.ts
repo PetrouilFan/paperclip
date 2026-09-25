@@ -341,6 +341,10 @@ export async function testEnvironment(
       const args = ["run", "--format", "json"];
       args.push("--model", probeModel);
       if (variant) args.push("--variant", variant);
+      // Probe with the same permission mode real runs use (see execute.ts
+      // buildArgs): otherwise the connection test can report healthy while every
+      // run auto-rejects its own tool calls under a shared OpenCode service.
+      if (asBoolean(config.dangerouslySkipPermissions, true) && !extraArgs.includes("--auto")) args.push("--auto");
       if (extraArgs.length > 0) args.push(...extraArgs);
 
       // Sandbox bridges still add cold-start and transport overhead, but the
