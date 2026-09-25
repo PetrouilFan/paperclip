@@ -123,21 +123,25 @@ export async function withHotRestartLock<T>(
   }
 }
 
-function resolveDatabaseUrl(): string {
-  const envUrl = process.env.DATABASE_URL?.trim();
-  if (envUrl) return envUrl;
-  const config = readConfig(resolveConfigPath());
-  if (config?.database.mode === "postgres" && config.database.connectionString?.trim()) {
-    return config.database.connectionString.trim();
-  }
-  const port = config?.database.embeddedPostgresPort ?? 54329;
-  return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+/**
+ * The preflight set only means something when it is read from the database
+ * the running server opened. `resolveDatabaseTarget()` is the resolution the
+ * server itself uses (`DATABASE_URL`, the paperclip env file, the configured
+ * connection string, then the embedded port); rebuilding the URL from
+ * `config.json` alone can probe a database the server never touched and file
+ * another instance's runs under this restart.
+ */
+async function resolveDatabaseUrl(): Promise<string> {
+  const { resolveDatabaseTarget } = await import("@paperclipai/db");
+  const target = resolveDatabaseTarget();
+  if (target.mode === "postgres") return target.connectionString;
+  return `postgres://paperclip:paperclip@127.0.0.1:${target.port}/paperclip`;
 }
 
 async function queryPreflightActiveRunIds(): Promise<string[]> {
   const { createDb, heartbeatRuns } = await import("@paperclipai/db");
   const { eq } = await import("drizzle-orm");
-  const db = createDb(resolveDatabaseUrl());
+  const db = createDb(await resolveDatabaseUrl());
   try {
     const rows = await db.select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
@@ -195,6 +199,45 @@ export async function writeHotRestartIntent(
   return { requestedAt, preflightActiveRunIds };
 }
 
+/**
+ * Undo the intent when the restart never reached systemd.
+ *
+ * The intent is written before `manager.restart()` runs, and that call refuses
+ * to write a unit whose ExecStart target is missing. When it throws, no
+ * shutdown happened: the intent describes a restart that is not happening, and
+ * a later `service start` or server boot would consume it as a real restart
+ * with no shutdown snapshot and report the preflight runs as lost. The claim is
+ * rolled back only when the supervisor still reports the pid the intent names —
+ * an unchanged pid proves the server never went away. If the shutdown did occur
+ * and only the follow-up failed, the pid differs and the intent stays so the
+ * recovery start can still produce a report.
+ */
+export async function rollbackStaleRestartIntent(
+  instanceId: string,
+  previousServerPid: number,
+  readStatus: () => Promise<Pick<ServiceStatus, "pid">>,
+): Promise<boolean> {
+  const instanceRoot = resolvePaperclipInstanceRoot(instanceId);
+  const intentPath = path.join(instanceRoot, "hot-restart-intent.json");
+  let onDisk: { previousServerPid?: unknown } | null = null;
+  try {
+    onDisk = JSON.parse(await fs.readFile(intentPath, "utf8")) as { previousServerPid?: unknown };
+  } catch {
+    return false;
+  }
+  if (onDisk?.previousServerPid !== previousServerPid) return false;
+  let current: Pick<ServiceStatus, "pid">;
+  try {
+    current = await readStatus();
+  } catch {
+    return false;
+  }
+  if (!current.pid || current.pid !== previousServerPid) return false;
+  await fs.rm(intentPath, { force: true });
+  await fs.rm(path.join(instanceRoot, "hot-restart-report.json"), { force: true });
+  return true;
+}
+
 async function waitForRestartReport(instanceId: string, requestedAt: string, timeoutMs = 10_000): Promise<unknown | null> {
   const reportPath = path.join(resolvePaperclipInstanceRoot(instanceId), "hot-restart-report.json");
   const deadline = Date.now() + timeoutMs;
@@ -217,7 +260,12 @@ export async function restartManagedService(input: { instanceId?: string; expect
     if (!detection.supported) throw new Error(detection.reason);
     const before = await detection.manager.status();
     const intent = await writeHotRestartIntent(before, instanceId, input.waitForDrain ?? false);
-    await detection.manager.restart();
+    try {
+      await detection.manager.restart();
+    } catch (error) {
+      if (before.pid) await rollbackStaleRestartIntent(instanceId, before.pid, () => detection.manager.status());
+      throw error;
+    }
     const health = await waitForHealth(instanceId, resolveRestartExpectedVersion(input.expectedVersion));
     return { status: await detection.manager.status(), health, report: await waitForRestartReport(instanceId, intent.requestedAt) };
   });

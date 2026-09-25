@@ -5,7 +5,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   assertForegroundRunAllowed,
   detectServiceManager,
+  extractExecutableFromSystemdUnit,
   LaunchdServiceManager,
+  preserveEnvironmentLines,
+  preserveLaunchdEnvironmentVariables,
   renderLaunchdPlist,
   renderSystemdUnit,
   SystemdServiceManager,
@@ -395,4 +398,127 @@ describe("single-writer guard", () => {
     expect(await fs.readFile(target, "utf8")).toBe("preserve\n");
   });
 
+});
+
+describe("installed unit parsing", () => {
+  it("reads quoted and unquoted ExecStart targets", () => {
+    expect(
+      extractExecutableFromSystemdUnit('[Service]\nExecStart="/opt/mine/paperclipai" run --instance "default"\n'),
+    ).toBe("/opt/mine/paperclipai");
+    expect(
+      extractExecutableFromSystemdUnit('[Service]\nExecStart=/home/alice/.npm-global/bin/paperclipai run --instance "alice"\n'),
+    ).toBe("/home/alice/.npm-global/bin/paperclipai");
+    expect(extractExecutableFromSystemdUnit("[Service]\nExecStart=\n")).toBe(null);
+    expect(extractExecutableFromSystemdUnit("[Unit]\nAfter=network.target\n")).toBe(null);
+  });
+
+  it("keeps an unquoted installed target when the preferred shim is missing", async () => {
+    const userHome = await temporaryDirectory();
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      return { stdout: "", stderr: "" };
+    };
+    const installedTarget = await writeExecutable(path.join(userHome, ".npm-global/bin/paperclipai"));
+    const manager = new SystemdServiceManager(
+      "default",
+      runner,
+      path.join(userHome, ".paperclip"),
+      path.join(userHome, ".local/bin/paperclipai"),
+      userHome,
+    );
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    await fs.writeFile(manager.definitionPath, `[Service]\nExecStart=${installedTarget} run --instance "default"\n`, "utf8");
+
+    await manager.restart();
+
+    const written = await fs.readFile(manager.definitionPath, "utf8");
+    expect(written).toContain(`ExecStart="${installedTarget}"`);
+    expect(calls).toContain("systemctl --user daemon-reload");
+  });
+
+  it("keeps an operator Environment value that contains an escaped space", () => {
+    const rendered = renderSystemdUnit({ instanceId: "default", shimPath: "/s/paperclipai", homeDir: "/h" });
+    const installed = rendered.replace(
+      "WorkingDirectory=%h",
+      "Environment=PATH=/opt/My\\ Apps/bin:/usr/bin\nWorkingDirectory=%h",
+    );
+
+    const written = preserveEnvironmentLines(installed, rendered);
+
+    expect(written).toContain("Environment=PATH=/opt/My\\ Apps/bin:/usr/bin");
+    // Re-rendering an already-preserved unit must not drift.
+    expect(preserveEnvironmentLines(installed, written)).toBe(written);
+  });
+
+  it("keeps an Environment reset directive that carries no assignment", () => {
+    const rendered = renderSystemdUnit({ instanceId: "default", shimPath: "/s/paperclipai", homeDir: "/h" });
+    const installed = rendered.replace("WorkingDirectory=%h", "Environment=\nWorkingDirectory=%h");
+
+    const written = preserveEnvironmentLines(installed, rendered);
+
+    expect(written).toMatch(/^Environment=$/m);
+    expect(preserveEnvironmentLines(installed, written)).toBe(written);
+  });
+});
+
+describe("installed launch agent parsing", () => {
+  const launchdInput = {
+    instanceId: "default",
+    shimPath: "/s/paperclipai",
+    homeDir: "/h",
+    stdoutPath: "/h/instances/default/logs/service.log",
+    stderrPath: "/h/instances/default/logs/service.err.log",
+  };
+
+  it("carries operator EnvironmentVariables through a rewrite", () => {
+    const rendered = renderLaunchdPlist(launchdInput);
+    const installed = rendered.replace(
+      "<key>PAPERCLIP_SERVICE_MANAGED</key><string>1</string>",
+      "<key>PATH</key><string>/opt/My Apps/bin</string><key>PAPERCLIP_SERVICE_MANAGED</key><string>1</string>",
+    );
+
+    const written = preserveLaunchdEnvironmentVariables(installed, rendered);
+
+    expect(written).toContain("<key>PATH</key><string>/opt/My Apps/bin</string>");
+    expect(written.match(/<key>PATH<\/key>/g)).toHaveLength(1);
+    // Re-rendering an already-preserved agent must not drift or duplicate.
+    expect(preserveLaunchdEnvironmentVariables(installed, written)).toBe(written);
+  });
+
+  it("does not let an operator entry override a renderer-owned key", () => {
+    const rendered = renderLaunchdPlist(launchdInput);
+    const installed = rendered.replace(
+      "<key>PAPERCLIP_HOME</key><string>/h</string>",
+      "<key>OPERATOR_TOKEN</key><string>abc</string><key>PAPERCLIP_HOME</key><string>/stale/home</string>",
+    );
+
+    const written = preserveLaunchdEnvironmentVariables(installed, rendered);
+
+    expect(written).toContain("<key>OPERATOR_TOKEN</key><string>abc</string>");
+    expect(written).not.toContain("/stale/home");
+    expect(written.match(/<key>PAPERCLIP_HOME<\/key>/g)).toHaveLength(1);
+  });
+
+  it("preserves the installed agent's operator entries through install", async () => {
+    const userHome = await temporaryDirectory();
+    const shimPath = await writeExecutable(path.join(userHome, ".local/bin/paperclipai"));
+    const homeDir = path.join(userHome, ".paperclip");
+    const manager = new LaunchdServiceManager("default", async () => ({ stdout: "", stderr: "" }), homeDir, shimPath, userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    await fs.writeFile(
+      manager.definitionPath,
+      renderLaunchdPlist(launchdInput).replace(
+        "<key>PAPERCLIP_SERVICE_MANAGED</key><string>1</string>",
+        "<key>PAPERCLIP_OPENCODE_PROVIDERS</key><string>openai anthropic</string><key>PAPERCLIP_SERVICE_MANAGED</key><string>1</string>",
+      ),
+      "utf8",
+    );
+
+    await manager.install({ startNow: false, startOnLogin: false });
+
+    const written = await fs.readFile(manager.definitionPath, "utf8");
+    expect(written).toContain("<key>PAPERCLIP_OPENCODE_PROVIDERS</key><string>openai anthropic</string>");
+    expect(await manager.desiredDefinition()).toBe(written);
+  });
 });

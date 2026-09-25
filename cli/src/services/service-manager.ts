@@ -101,8 +101,14 @@ function unescapeXml(value: string): string {
 }
 
 export function extractExecutableFromSystemdUnit(content: string): string | null {
-  const match = content.match(/^ExecStart="((?:\\.|[^"\\])*)"/m);
-  return match ? unescapeSystemd(match[1]) : null;
+  // systemd accepts both `ExecStart="/path/with space"` and `ExecStart=/path`.
+  // Only the first word counts in the bare form; a unit written by hand or by
+  // another packager is usually unquoted, and missing it makes the installed
+  // target look absent, which turns a safe rewrite into a refusal.
+  const quoted = content.match(/^ExecStart="((?:\\.|[^"\\])*)"/m);
+  if (quoted) return unescapeSystemd(quoted[1]);
+  const bare = content.match(/^ExecStart=(\S+)/m);
+  return bare ? unescapeSystemd(bare[1]) : null;
 }
 
 export function extractExecutableFromLaunchdPlist(content: string): string | null {
@@ -207,7 +213,10 @@ function parseEnvironmentAssignments(line: string): EnvironmentAssignment[] {
   const body = line.match(/^\s*Environment\s*=\s*(.*)$/)?.[1];
   if (body === undefined) return [];
   const assignments: EnvironmentAssignment[] = [];
-  const segment = /"((?:\\.|[^"\\])*)"|'([^']*)'|(\S+)/g;
+  // The bare branch keeps `KEY=/opt/My\ Apps/bin` whole: systemd unescapes
+  // backslashes in unquoted values, so splitting on whitespace would write a
+  // truncated PATH back into the unit.
+  const segment = /"((?:\\.|[^"\\])*)"|'([^']*)'|((?:\\.|[^\s"'])+)/g;
   let match: RegExpExecArray | null;
   while ((match = segment.exec(body)) !== null) {
     const content = match[1] ?? match[2] ?? match[3] ?? "";
@@ -244,7 +253,18 @@ export function preserveEnvironmentLines(installedDefinition: string | null, ren
   const seen = new Set(renderedLines.map((line) => line.trim()));
   const preserved: string[] = [];
   for (const line of environmentLinesOfServiceSection(installedDefinition)) {
-    const kept = parseEnvironmentAssignments(line).filter((assignment) => !MANAGED_ENVIRONMENT_KEYS.has(assignment.key));
+    const assignments = parseEnvironmentAssignments(line);
+    const kept = assignments.filter((assignment) => !MANAGED_ENVIRONMENT_KEYS.has(assignment.key));
+    if (assignments.length === 0) {
+      // `Environment=` is a directive, not an assignment: systemd clears the
+      // environment assembled so far. It has no KEY=VALUE to re-render, so the
+      // line itself has to survive the rewrite or the operator's reset is
+      // silently cancelled.
+      if (seen.has(line)) continue;
+      seen.add(line);
+      preserved.push(line);
+      continue;
+    }
     if (kept.length === 0) continue;
     const rendered = `Environment=${kept.map((assignment) => assignment.raw).join(" ")}`;
     if (seen.has(rendered)) continue;
@@ -273,6 +293,40 @@ export function preserveEnvironmentLines(installedDefinition: string | null, ren
   }
   if (anchor < 0) return renderedDefinition;
   return [...renderedLines.slice(0, anchor + 1), ...preserved, ...renderedLines.slice(anchor + 1)].join("\n");
+}
+
+type LaunchdEnvironmentEntry = { key: string; value: string };
+
+function extractLaunchdEnvironmentVariables(plist: string): LaunchdEnvironmentEntry[] {
+  const block = plist.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/);
+  if (!block) return [];
+  const entries: LaunchdEnvironmentEntry[] = [];
+  const pair = /<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/g;
+  let match: RegExpExecArray | null;
+  while ((match = pair.exec(block[1])) !== null) {
+    entries.push({ key: unescapeXml(match[1]), value: unescapeXml(match[2]) });
+  }
+  return entries;
+}
+
+/**
+ * Carry the operator's own `EnvironmentVariables` from the installed launch
+ * agent into the rendered one. The renderer owns only its three PAPERCLIP_*
+ * keys; without this a hand-edited agent loses PATH and credentials on every
+ * install or restart, which is exactly the contract the systemd path honours.
+ */
+export function preserveLaunchdEnvironmentVariables(installedPlist: string | null, renderedPlist: string): string {
+  if (!installedPlist) return renderedPlist;
+  const renderedKeys = new Set(extractLaunchdEnvironmentVariables(renderedPlist).map((entry) => entry.key));
+  const additions = extractLaunchdEnvironmentVariables(installedPlist)
+    .filter((entry) => !MANAGED_ENVIRONMENT_KEYS.has(entry.key) && !renderedKeys.has(entry.key));
+  if (additions.length === 0) return renderedPlist;
+  const serialized = additions.map((entry) => `    <key>${escapeXml(entry.key)}</key><string>${escapeXml(entry.value)}</string>`).join("\n");
+  const replaced = renderedPlist.replace(
+    /(<key>EnvironmentVariables<\/key>\s*<dict>[\s\S]*?)(\s*)(<\/dict>)/,
+    (_match, body: string, indent: string, close: string) => `${body}\n${serialized}${indent}${close}`,
+  );
+  return replaced === renderedPlist ? renderedPlist : replaced;
 }
 
 export function renderLaunchdPlist(input: { instanceId: string; shimPath: string; homeDir: string; stdoutPath: string; stderrPath: string }): string {
@@ -462,11 +516,22 @@ export class LaunchdServiceManager implements ServiceManager {
       installedPath: await this.installedExecutablePath(),
       definitionPath: this.definitionPath,
     });
-    if (target === renderedTarget) return rendered;
-    return rendered.replace(
-      /(<string>)([^<]*)(<\/string><string>run<\/string>)/,
-      (_match, prefix, _current, suffix: string) => `${prefix}${escapeXml(target)}${suffix}`,
-    );
+    const installed = await this.installedDefinition();
+    const withTarget = target === renderedTarget
+      ? rendered
+      : rendered.replace(
+        /(<string>)([^<]*)(<\/string><string>run<\/string>)/,
+        (_match, prefix, _current, suffix: string) => `${prefix}${escapeXml(target)}${suffix}`,
+      );
+    return preserveLaunchdEnvironmentVariables(installed, withTarget);
+  }
+
+  private async installedDefinition(): Promise<string | null> {
+    try {
+      return await fs.readFile(this.definitionPath, "utf8");
+    } catch {
+      return null;
+    }
   }
 
   async install(options: ServiceInstallOptions): Promise<{ changed: boolean }> {

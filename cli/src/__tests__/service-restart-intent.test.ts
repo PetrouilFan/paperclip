@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readPreflightActiveRunIds, writeHotRestartIntent } from "../commands/service.js";
+import { readPreflightActiveRunIds, rollbackStaleRestartIntent, writeHotRestartIntent } from "../commands/service.js";
 import type { ServiceStatus } from "../services/service-manager.js";
 
 let previousPaperclipHome: string | undefined;
@@ -97,5 +97,54 @@ describe("hot-restart intent written by the CLI restart path", () => {
         },
       }),
     ).rejects.toThrow(/could not record the preflight active-run set for the hot-restart intent \(database is down\)/);
+  });
+});
+
+describe("hot-restart intent rollback when the restart never reaches systemd", () => {
+  const intentPath = () => path.join(instanceRoot, "hot-restart-intent.json");
+  const reportPath = () => path.join(instanceRoot, "hot-restart-report.json");
+
+  async function writeIntent() {
+    await writeHotRestartIntent(activeStatus, "default", false, { query: async () => ["run-1"], probe: healthyProbe });
+    fs.writeFileSync(reportPath(), '{"requestedAt":"earlier"}\n', "utf8");
+  }
+
+  it("discards the intent and its report while the original server is still up", async () => {
+    await writeIntent();
+
+    await expect(rollbackStaleRestartIntent("default", 4242, async () => ({ pid: 4242 }))).resolves.toBe(true);
+
+    expect(fs.existsSync(intentPath())).toBe(false);
+    expect(fs.existsSync(reportPath())).toBe(false);
+  });
+
+  it("keeps the intent once the shutdown has already happened", async () => {
+    await writeIntent();
+
+    await expect(rollbackStaleRestartIntent("default", 4242, async () => ({ pid: 9999 }))).resolves.toBe(false);
+    await expect(rollbackStaleRestartIntent("default", 4242, async () => ({ pid: null }))).resolves.toBe(false);
+
+    expect(fs.existsSync(intentPath())).toBe(true);
+  });
+
+  it("keeps an intent that belongs to an earlier restart", async () => {
+    await writeIntent();
+
+    await expect(rollbackStaleRestartIntent("default", 1111, async () => ({ pid: 1111 }))).resolves.toBe(false);
+
+    expect(fs.existsSync(intentPath())).toBe(true);
+  });
+
+  it("keeps the intent when there is nothing to read or the status read fails", async () => {
+    await expect(rollbackStaleRestartIntent("default", 4242, async () => ({ pid: 4242 }))).resolves.toBe(false);
+
+    await writeIntent();
+    await expect(
+      rollbackStaleRestartIntent("default", 4242, async () => {
+        throw new Error("supervisor unreachable");
+      }),
+    ).resolves.toBe(false);
+
+    expect(fs.existsSync(intentPath())).toBe(true);
   });
 });

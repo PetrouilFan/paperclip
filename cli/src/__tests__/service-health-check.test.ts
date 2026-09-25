@@ -133,6 +133,28 @@ describe("service health doctor checks", () => {
     expect(results.every((result) => result.status === "pass")).toBe(true);
   });
 
+  it("surfaces an ExecStart resolver refusal verbatim instead of generic drift", async () => {
+    const manager = managerFixture();
+    const refusal =
+      "Refusing to write /home/op/.config/systemd/user/paperclipai.service: no runnable ExecStart target";
+    manager.desiredDefinition = vi.fn(async (): Promise<string> => {
+      throw new Error(refusal);
+    });
+    const results = await serviceHealthChecks(config, {
+      detect: vi.fn(async () => ({ supported: true as const, manager })),
+      probe: vi.fn(async () => ({ ok: true, version: "1.2.3" })),
+    });
+
+    expect(results).toContainEqual(
+      expect.objectContaining({
+        name: "Service definition",
+        status: "fail",
+        message: refusal,
+        repairHint: expect.stringContaining("paperclipai install"),
+      }),
+    );
+  });
+
   it("detects a foreground process on the configured port while the service is inactive", async () => {
     const manager = managerFixture(false);
     const results = await serviceHealthChecks(config, {

@@ -304,8 +304,12 @@ start limit after five tries, and parks the unit in `failed`.
 
 The API and the embedded PostgreSQL live in that unit's cgroup, so the whole
 instance goes down for as long as the unit is broken. Every in-flight agent
-write is dropped with it. There is no CLI command that repairs the unit, so the
-recovery below is manual.
+write is dropped with it. Before this fix there was no CLI command that
+repairs the unit, so the recovery below is manual; with the current CLI,
+`paperclipai service install` rewrites a broken unit once `paperclipai install`
+has restored a runnable shim, and the doctor prints that refusal with the same
+hint. The steps below still apply when you want the unit back without running
+the installer.
 
 Recognise it:
 
@@ -335,8 +339,15 @@ systemctl --user start paperclipai
 ```
 
 Use `systemctl --user edit --full paperclipai` instead of `sed` when you prefer
-a real editor, and drop `--instance "default"` if the unit runs another
-instance id.
+a real editor.
+
+For an instance other than `default`, change every name below, not only the
+`--instance` argument: the unit file is
+`~/.config/systemd/user/paperclipai-<id>.service`, each `systemctl --user`
+command targets `paperclipai-<id>.service`, and `ExecStart` keeps
+`--instance "<id>"`. Editing only `--instance` repairs `ExecStart` while the
+`reset-failed` and `start` commands keep hitting the default unit and leave the
+failed instance down.
 
 While you are in the unit, check the `Environment=` lines. The renderer only
 owns `PAPERCLIP_SERVICE_MANAGED`, `PAPERCLIP_INSTANCE_ID`, and
@@ -347,9 +358,12 @@ wrong, which looks like a healthy process serving broken runs. Restore those
 lines from `$unit.bak`.
 
 `paperclipai doctor` and `paperclipai service status` report unit-file drift
-but do not repair it. Until the CLI validates its `ExecStart` target before
-writing, copy the unit aside (`cp -a "$unit" "$unit.bak"`) before every
-`paperclipai service restart` on a host with a hand-patched unit.
+but do not repair it. On a CLI older than this fix, no `ExecStart` validation
+runs before a write, so copy the unit aside (`cp -a "$unit" "$unit.bak"`) before
+every `paperclipai service restart` on a host with a hand-patched unit. The
+current CLI keeps an installed executable that still works and refuses a rewrite
+that would land on a missing one, so the backup is a precaution for older
+installs rather than a step on the current upgrade path.
 
 ## Uninstall
 
