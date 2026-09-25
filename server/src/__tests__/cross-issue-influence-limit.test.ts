@@ -303,6 +303,39 @@ describe("cross-issue run-context refusal copy", () => {
     expect(details.targetOwnedByAnotherAgent).toBe(false);
   });
 
+  it("names a step that actually clears the refusal, and the test performs it", async () => {
+    // The acceptance criterion for this refusal is that the sanctioned path
+    // reaches a 200, so assert on the effect rather than on the prose: refuse,
+    // then do exactly what the message says, then write.
+    const target = unboundTarget.targetIssueId;
+    const details = await refusalDetails(
+      { contextSnapshot: {} },
+      {
+        identifier: "TASK-482",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeName: "Athena",
+      },
+    );
+    expect(details.reason).toBe("no_context_source_and_target_unbound");
+
+    // `POST /api/agents/{id}/wakeup` with `payload.issueId` folds `issueId` into
+    // the new run's `contextSnapshot`, and that is the input this gate reads.
+    // A checkout with your own run does not: it writes the issue row, and the
+    // wake it might otherwise trigger is suppressed for a self-checkout. So the
+    // run-side binding is the step that clears the refusal here.
+    const bound = counterDb(0, { contextSnapshot: { issueId: target, taskId: target } });
+    await expect(observeCrossIssueInfluence(bound.db as never, {
+      ...unboundTarget,
+      targetIssueIdentifier: "TASK-482",
+    })).resolves.toBeNull();
+    expect(bound.inserted).toEqual([]);
+
+    // The tie: the message has to name that step, or the copy is free to drift
+    // away from the gate again. The header advice failed exactly this way.
+    expect(details.sanctionedPath).toContain("POST /api/agents/{agentId}/wakeup");
+    expect(details.sanctionedPath).toContain("payload");
+  });
+
   it("answers another agent's task in one message, naming both real routes", async () => {
     const { error, details } = await refusal(
       { contextSnapshot: {} },

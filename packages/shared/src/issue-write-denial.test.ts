@@ -265,7 +265,7 @@ describe("cross-issue run-context denial copy, per reason", () => {
     expect(before.sanctionedPath).toContain(HEADER_REMEDY);
   });
 
-  it("tells an owned task to check out rather than to resend the header", () => {
+  it("tells an owned task to bind the run, not to resend a header it already sent", () => {
     const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required", {
       reason: "no_context_source_and_target_unbound",
       issueIdentifier: "TASK-482",
@@ -275,6 +275,28 @@ describe("cross-issue run-context denial copy, per reason", () => {
     expect(body.details.sanctionedPath).toContain("POST /api/issues/{issueId}/checkout");
     expect(body.details.whoCanAct).toContain("TASK-482");
     expect(body.error).toContain(HEADER_REMEDY);
+  });
+
+  it("names the run-side binding as well, because checkout alone cannot clear this reason", () => {
+    // The gate attributes the write to the run's own task. `checkout` writes the
+    // issue row and starts no replacement run, so a copy that stopped at
+    // checkout would walk the caller round the same loop the header advice used
+    // to — the second half of this defect, and the one a reviewer cannot see
+    // from the prose alone.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      reason: "no_context_source_and_target_unbound",
+      issueIdentifier: "TASK-482",
+    });
+
+    expect(copy.sanctionedPath).toContain("POST /api/issues/{issueId}/checkout");
+    expect(copy.sanctionedPath).toContain("POST /api/agents/{agentId}/wakeup");
+    // The payload key is the whole mechanism: the wake folds `issueId` into the
+    // new run's context, which is the one input the gate cannot do without.
+    expect(copy.sanctionedPath).toContain("payload");
+    expect(copy.sanctionedPath).toMatch(/no replacement run/);
+    // Neither binding is claimed to be sufficient on its own.
+    expect(copy.sanctionedPath).toMatch(/either .* or,/s);
+    expect(copy.description).toMatch(/run's own task/);
   });
 
   it("routes another agent's task to a child issue or a reassignment, and names the 409", () => {
@@ -295,6 +317,11 @@ describe("cross-issue run-context denial copy, per reason", () => {
     // A target that is not the caller's is not reachable by checkout, so the
     // sanctioned path must not send the operator down that door.
     expect(body.details.sanctionedPath).not.toContain("POST /api/issues/{issueId}/checkout");
+    // Nor by waking this agent onto it. The gate reads the run's task, so a
+    // self-wake on someone else's task *would* clear the refusal — and that is
+    // exactly the reach the cap exists to contain, so the copy must not offer it
+    // as the way to write to another agent's work.
+    expect(body.details.sanctionedPath).not.toContain("POST /api/agents/{agentId}/wakeup");
   });
 
   it("falls back to nouns rather than printing raw uids", () => {

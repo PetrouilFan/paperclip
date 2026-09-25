@@ -154,14 +154,31 @@ const CHILD_ISSUE_PATH =
   "separate, open write path) and let its assignee act";
 
 /**
- * The only binding the gate honours, and the only one it should: `checkout`
- * writes the run onto the issue row, so the binding is auditable from the task
- * itself. A header that silently bound would move the gate's strength without
- * moving the gate.
+ * Two calls can put a run and a task in a binding the gate recognises, and the
+ * gate does not read the same row for both.
+ *
+ * `POST /api/issues/{id}/checkout` writes the run onto the **issue** row, which
+ * is the auditable binding and stays the one we want: a header that silently
+ * bound would move the gate's strength without moving the gate. But the gate
+ * attributes a write to the **run's** own task — `contextSnapshot` on the run
+ * row — and checkout never writes there, and a checkout with your own run
+ * deliberately starts no replacement run to inherit the task.
+ *
+ * `POST /api/agents/{id}/wakeup` with `payload.issueId` does write there: the
+ * wake folds `issueId` into the new run's `contextSnapshot`, which is the one
+ * input this gate cannot be satisfied without. Both are named below so no
+ * version of the gate can turn this message into a dead end, and neither is
+ * claimed to be sufficient on its own.
  */
-const CHECKOUT_PATH =
-  "check out the task with your own run (`POST /api/issues/{issueId}/checkout`) " +
-  "so the run owns it, then retry";
+const CHECKOUT_BINDING =
+  "bind the task to this run with `POST /api/issues/{issueId}/checkout` and retry";
+
+const WAKE_BINDING =
+  "or, if this run holds no task at all — checkout records the run on the task " +
+  "but does not give the run a task, and checking out with your own run starts " +
+  "no replacement run — start a run for the task with " +
+  "`POST /api/agents/{agentId}/wakeup` and `{\"payload\":{\"issueId\":\"<issueId>\"}}`, " +
+  "and make the write from the run it returns";
 
 /**
  * Refusal for a run the gate could not identify at all. The run id genuinely
@@ -197,8 +214,13 @@ function unidentifiedRunContextCopy(
  * This is the reason that used to ship the header advice above, and it made the
  * error path unsatisfiable: the gate resolves the run, company and agent before
  * it ever reaches this condition, so the caller is provably already carrying a
- * valid run id and retrying the header returns a byte-identical 403 forever. The
- * missing half is the target binding, and the binding has exactly one door.
+ * valid run id and retrying the header returns a byte-identical 403 forever.
+ *
+ * The missing half is the target binding. Naming only `checkout` would have
+ * reproduced the same defect one step along — checkout records the run on the
+ * issue, while this gate reads the run's own task, so a task-less run that
+ * checks out the target and retries is refused with the same body it already
+ * had. So the copy names both bindings and says which one each writes.
  */
 function unboundTargetRunContextCopy(
   code: IssueWriteDenialCode,
@@ -218,9 +240,9 @@ function unboundTargetRunContextCopy(
         `Cross-issue writes are attributed to a heartbeat run and to the task that run ` +
         `owns. This run is valid and already identified itself on this request, but it ` +
         `holds no task and ${issue} is not bound to it — and ${issue} is assigned to ` +
-        `${assignee}, so this run cannot take that binding: checkout and run ownership ` +
-        `stay assignee-scoped. A direct checkout attempt returns 409 \`Issue checkout ` +
-        `conflict\`, which is the same wall one step later with no guidance attached.`,
+        `${assignee}, so the direct route is not this run's to take: a checkout on a ` +
+        `task another run holds returns 409 \`Issue checkout conflict\`, which is the ` +
+        `same wall one step later with no guidance attached.`,
       whoCanAct:
         `${assignee} on ${issue}, or the board if ${issue} should be reassigned to ${actor}.`,
       sanctionedPath:
@@ -238,15 +260,17 @@ function unboundTargetRunContextCopy(
     description:
       `Cross-issue writes are attributed to a heartbeat run and to the task that run owns. ` +
       `This run is valid and already identified itself on this request, so the run id is ` +
-      `not the problem — what is missing is a binding between the run and ${issue}. The ` +
-      `run holds no task, and ${issue} does not record the run as its owner, so the write ` +
-      `had nothing to count against the cross-issue cap or name in the audit trail.`,
-    whoCanAct: `${actor}, once it holds ${issue}.`,
+      `not the problem — what is missing is a binding between this run and ${issue}. The ` +
+      `gate attributes the write to the run's own task, so the binding has to be a run ` +
+      `started for ${issue}, or a task bound to this run; ${issue} records neither for ` +
+      `this run, so the write had nothing to count against the cross-issue cap or name in ` +
+      `the audit trail.`,
+    whoCanAct: `${actor}, from a run bound to ${issue}.`,
     sanctionedPath:
-      `To act on ${issue} directly, ${CHECKOUT_PATH}. Re-sending ` +
-      `\`X-Paperclip-Run-Id\` cannot help — this request already carries it, which is how ` +
-      `the server knew the write came from ${actor}. If ${issue} is not ${actor}'s to ` +
-      `take, ${CHILD_ISSUE_PATH} instead.`,
+      `This write has to come from a run bound to ${issue}: either ${CHECKOUT_BINDING}, ` +
+      `${WAKE_BINDING}. Re-sending \`X-Paperclip-Run-Id\` cannot help — this request ` +
+      `already carries it, which is how the server knew the write came from ${actor}. If ` +
+      `${issue} is not ${actor}'s to take, ${CHILD_ISSUE_PATH} instead.`,
   };
 }
 
