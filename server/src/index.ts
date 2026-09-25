@@ -594,6 +594,10 @@ async function startServerWithDatabaseTeardown(
             { code, signal, recentLogs: logBuffer.getRecentLogs() },
             "Embedded PostgreSQL exited unexpectedly; attempting recovery",
           ),
+          onControlledExit: (reason, code, signal) => logger.info(
+            { reason, code, signal },
+            "Embedded PostgreSQL exited during a requested shutdown; recovery skipped",
+          ),
           onRestartAttemptFailed: (err, attempt) => logger.error(
             { err, attempt, recentLogs: logBuffer.getRecentLogs() },
             "Embedded PostgreSQL recovery attempt failed",
@@ -1914,6 +1918,13 @@ async function startServerWithDatabaseTeardown(
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
+    // Record the shutdown before the first await. A unit with
+    // `KillMode=control-group` SIGTERMs PostgreSQL in the same cgroup at the
+    // same moment, and its clean `code=0` exit can be delivered while the
+    // teardown below is still draining runs and connections. Without this the
+    // supervisor reads our own stop as a crash, logs "exited unexpectedly" at
+    // ERROR, and relaunches the database this process is shutting down.
+    embeddedPostgresSupervisor?.markShutdownIntent();
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     clearInterval(executionControlInterval);
