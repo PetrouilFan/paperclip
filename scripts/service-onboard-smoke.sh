@@ -105,7 +105,11 @@ if [[ "$SMOKE_FORCE" != "true" ]]; then
   if systemctl --user cat "$SERVICE_NAME" >/dev/null 2>&1; then
     fail "$SERVICE_NAME is already installed; set SMOKE_FORCE=true to smoke over it"
   fi
-  if systemctl --user is-active paperclipai.service 2>/dev/null | grep -q active; then
+  # `grep -qx`, not `grep -q`: `systemctl is-active` prints `inactive` for a
+  # stopped unit and that word contains the substring `active`, so a plain
+  # `grep -q active` fails this smoke on every host where production is merely
+  # stopped, and names a service that is not running.
+  if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
     fail "production paperclipai.service is active on this host; set SMOKE_FORCE=true to smoke anyway"
   fi
 fi

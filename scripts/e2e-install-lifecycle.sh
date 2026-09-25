@@ -38,6 +38,16 @@ pass()  { RESULTS+=("PASS  $1"); printf '\033[1;32mPASS\033[0m %s\n' "$1"; }
 fail_() { RESULTS+=("FAIL  $1"); printf '\033[1;31mFAIL\033[0m %s\n' "$1"; FAILED=1; }
 skip_() { RESULTS+=("SKIP  $1${2:+ — $2}"); printf '\033[1;33mSKIP\033[0m %s%s\n' "$1" "${2:+ — $2}"; }
 
+summarize() {
+  note "RESULTS ($E2E_REPO@$E2E_REF on $(uname -sm))"
+  printf '%s\n' "${RESULTS[@]}"
+  if [ "$FAILED" = "1" ]; then echo; echo "OVERALL: FAIL"; exit 1; fi
+  echo; echo "OVERALL: PASS"
+}
+# fail_ and skip_ only record. A guard that needs to stop must say so, or the
+# script walks into the state the guard was written to prevent.
+abort_() { fail_ "$1" "${2:-}"; skip_ "$1" "${3:-aborted}"; summarize; }
+
 shim() { "$SHIM" "$@"; }
 current_target() { readlink "$STORE/current" 2>/dev/null || echo "<missing>"; }
 
@@ -185,22 +195,26 @@ else
     # NOTE: the mktemp template must not be quote-escaped. `\"` inside the
     # substitution makes mktemp receive literal quote characters, it fails,
     # SERVICE_ISOHOME ends up empty, and `export HOME=""` below would then
-    # defeat this very guard while the script kept going with exit 0.
-    SERVICE_ISOHOME="$(mktemp -d "${TMPDIR:-/tmp}/e2e-service-iso.XXXXXX")" || {
-      fail_ "8 service lifecycle" "could not create isolated HOME"
-      skip_ "8 service lifecycle" "mktemp failed"
-    }
+    # defeat this very guard while the script kept going. abort_ stops the
+    # script there; fail_ + skip_ on their own only record, and the leg used to
+    # run on with HOME="" and XDG_CONFIG_HOME="/.config".
+    SERVICE_ISOHOME="$(mktemp -d "${TMPDIR:-/tmp}/e2e-service-iso.XXXXXX")" \
+      || abort_ "8 service lifecycle" "could not create isolated HOME" "mktemp failed"
     if [ -z "$SERVICE_ISOHOME" ] || [ ! -d "$SERVICE_ISOHOME" ]; then
-      fail_ "8 service lifecycle" "isolated HOME was not created (got '${SERVICE_ISOHOME}')"
-      skip_ "8 service lifecycle" "isolated HOME missing"
+      abort_ "8 service lifecycle" "isolated HOME was not created (got '${SERVICE_ISOHOME}')" "isolated HOME missing"
     fi
 
     # Preflight, BEFORE the override, so "the production service" unambiguously
     # means the host's real one and not something the override just moved.
-    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -q active; then
-      fail_ "8 service lifecycle (PET-52 guard: host paperclipai.service is active)"
+    # This must skip the leg, not only record that it is skipping it: the
+    # override below reads SERVICE_ISOHOME, which this branch has just removed.
+    # `grep -qx`, not `grep -q`: `systemctl is-active` prints `inactive` for a
+    # stopped unit and that word contains the substring `active`, so a plain
+    # `grep -q active` calls every stopped host live and skips the leg always.
+    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
       rm -rf "$SERVICE_ISOHOME"
-      skip_ "8 service lifecycle" "production service active on this host"
+      abort_ "8 service lifecycle (PET-52 guard: host paperclipai.service is active)" \
+        "" "production service active on this host; service leg not run"
     fi
 
     # A distinct instance id is what actually makes the leg safe, and the HOME
@@ -256,7 +270,7 @@ else
     if SERVICE_SHIM service uninstall --instance "$SERVICE_INSTANCE"; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
     # The leg must not have touched the production unit: it is still addressable
     # by name and must still be stopped, because a name collision would be fatal.
-    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -q active; then
+    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
       fail_ "8f isolation held: host paperclipai.service never activated by this leg"
     else
       pass "8f isolation held: host paperclipai.service untouched"
@@ -291,7 +305,4 @@ fi
 [ ! -d "$STORE" ] && pass "10c managed store removed" || fail_ "10c managed store removed"
 [ -f "$HOME/.paperclip/e2e-user-data-marker" ] && pass "10d user data under ~/.paperclip preserved" || fail_ "10d user data preserved"
 
-note "RESULTS ($E2E_REPO@$E2E_REF on $(uname -sm))"
-printf '%s\n' "${RESULTS[@]}"
-if [ "$FAILED" = "1" ]; then echo; echo "OVERALL: FAIL"; exit 1; fi
-echo; echo "OVERALL: PASS"
+summarize
