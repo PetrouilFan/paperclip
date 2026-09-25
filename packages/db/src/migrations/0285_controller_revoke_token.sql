@@ -1,0 +1,18 @@
+-- `heartbeat_runs.controller_boot_id` is boot IDENTITY: the process singleton that
+-- claimed the run, and the value every ownership guard compares against
+-- (hasLiveLegacyController, renewLegacyControllerLease, and the recovery backstop).
+-- revokeExpiredLegacyController also used it as its compare-and-set latch, overwriting
+-- it with a fresh random UUID. One revocation therefore destroyed the identity, and the
+-- run stopped matching the boot that owned it.
+--
+-- The per-revocation latch moves here, so a revocation can CAS without rewriting
+-- identity. A revoker matches either a NULL token (first revoke of this lease) or the
+-- exact token it read, so two competitors holding the same snapshot still produce
+-- exactly one winner, while a reaper that re-reads an already-revoked row can revoke
+-- again once the lease expires a second time. A NULL default means every existing row
+-- is a not-yet-revoked row under the first revoke, which is the pre-change behaviour.
+--
+-- Nullable with no default, so this is a metadata-only change: PostgreSQL does not
+-- rewrite the table for an added nullable column with no default. That matches the
+-- shape accepted for controller_boot_id in 0273_aromatic_moondragon.sql.
+ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "controller_revoke_token" uuid;
