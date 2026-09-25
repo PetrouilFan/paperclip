@@ -6076,6 +6076,181 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
+  it("checkout refuses a terminal run and writes no binding, naming the run's real status", async () => {
+    // PET-178 regression. A checkout that names a run which has already
+    // finished used to answer 200 with that run id echoed back as
+    // `checkoutRunId`, while every subsequent write from the same run was
+    // refused 409 and `GET /issues/{id}` read `checkoutRunId: null` to a live
+    // observer. The 200 promised a capability the next call took back, and
+    // three agents filed "the binding is dropped" against the wrong layer as a
+    // result. The assertion is deliberately on the row as well as the status:
+    // a test that only checked the throw would pass vacuously if the write
+    // were reordered back ahead of the refusal.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const terminalStatuses = [
+      "succeeded",
+      "failed",
+      "cancelled",
+      "timed_out",
+      "interrupted",
+    ] as const;
+
+    for (const terminalStatus of terminalStatuses) {
+      const issueId = randomUUID();
+      const terminalRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: terminalRunId,
+        companyId,
+        agentId,
+        status: terminalStatus,
+        invocationSource: "manual",
+        startedAt: new Date("2026-06-10T10:00:00.000Z"),
+        finishedAt: new Date("2026-06-10T10:04:00.000Z"),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Dead run checkout (${terminalStatus})`,
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+      });
+
+      await expect(
+        svc.checkout(issueId, agentId, ["todo"], terminalRunId),
+      ).rejects.toMatchObject({
+        status: 409,
+        details: {
+          code: "run_not_active",
+          issueId,
+          runId: terminalRunId,
+          runStatus: terminalStatus,
+        },
+      });
+
+      // The whole point: no binding was written, so nothing is stranded on a
+      // run id no later call will honour.
+      const row = await db
+        .select({
+          status: issues.status,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toMatchObject({
+        status: "todo",
+        checkoutRunId: null,
+        executionRunId: null,
+      });
+    }
+  });
+
+  it("checkout still binds a run that has not finished, and still reclaims one whose run has since died", async () => {
+    // The other two legs of the PET-178 matrix, so the new refusal cannot be
+    // bought by simply breaking checkout: an active run binds and reports the
+    // binding, and once that same run turns terminal the reclaim path is what
+    // lets the next run take the issue.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const activeRunId = randomUUID();
+    const successorRunId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: activeRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date("2026-06-10T10:00:00.000Z"),
+      },
+      {
+        id: successorRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date("2026-06-10T10:09:00.000Z"),
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live run checkout",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const checkedOut = await svc.checkout(
+      issueId,
+      agentId,
+      ["todo"],
+      activeRunId,
+    );
+    expect(checkedOut).toMatchObject({
+      checkoutRunId: activeRunId,
+      executionRunId: activeRunId,
+    });
+
+    // The run dies. Its own retry is refused, and a fresh run reclaims the
+    // binding the dead one left behind.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date("2026-06-10T10:08:00.000Z") })
+      .where(eq(heartbeatRuns.id, activeRunId));
+
+    await expect(
+      svc.checkout(issueId, agentId, ["todo", "in_progress"], activeRunId),
+    ).rejects.toMatchObject({ status: 409, details: { code: "run_not_active" } });
+
+    const reclaimed = await svc.checkout(
+      issueId,
+      agentId,
+      ["todo", "in_progress"],
+      successorRunId,
+    );
+    expect(reclaimed).toMatchObject({ checkoutRunId: successorRunId });
+  });
+
   it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
     // Regression for PR #2482 checkout-adoption review finding: any adoption
     // helper that re-locks an existing in_progress issue (e.g. when the prior

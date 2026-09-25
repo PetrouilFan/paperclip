@@ -7053,6 +7053,57 @@ export function issueService(db: Db) {
     });
   }
 
+  /**
+   * Refuse a checkout that names a run which has already finished.
+   *
+   * The run-binding authorization fallback only trusts a binding whose run is
+   * still active, so `issues.checkoutRunId` pointing at a terminal run is
+   * inert: every subsequent write from that run is refused with `409`. Writing
+   * it anyway and answering `200` therefore asserts a binding in the response
+   * body that the very next call takes back, and strands the issue's checkout
+   * column on a dead run id until a cleanup pass runs. The server already knows
+   * the run's status here, so it is one check to refuse up front instead of
+   * after the caller has been told the capability is theirs.
+   */
+  async function assertCheckoutRunIsActive(
+    companyId: string,
+    issueId: string,
+    checkoutRunId: string | null,
+  ) {
+    if (!checkoutRunId) return;
+    const run = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, checkoutRunId),
+          eq(heartbeatRuns.companyId, companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    // A run row that does not exist is deliberately not refused here. The run
+    // id on a checkout comes from the actor's JWT or from an internal
+    // dispatcher, so an unknown value is the existing ownership checks'
+    // business, not this gate's; `clearCheckoutRunIfTerminal` below already
+    // reclaims the issue row.
+    if (!run || !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return;
+    throw conflict(
+      `Run ${run.id} is ${run.status} and cannot hold an issue binding`,
+      {
+        code: "run_not_active",
+        issueId,
+        runId: run.id,
+        runStatus: run.status,
+        remediation:
+          "Start a new run and check the issue out from it. A finished run never regains a binding.",
+        diagnoseCommand: `curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" "$PAPERCLIP_API_URL/api/heartbeat-runs/${run.id}" | grep -o '"status":"[a-z_]*"'`,
+      },
+    );
+  }
+
   async function isTreeHoldInteractionCheckoutAllowed(
     companyId: string,
     checkoutRunId: string | null,
@@ -11311,6 +11362,13 @@ export function issueService(db: Db) {
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
+      // Refuse before any write, and before the terminal-binding reclaim below
+      // runs, so a checkout never reports a binding the run cannot use.
+      await assertCheckoutRunIsActive(
+        issueCompany.companyId,
+        id,
+        checkoutRunId,
+      );
       await assertAssignableAgent(db, issueCompany.companyId, agentId, {
         kind: "work",
       });
