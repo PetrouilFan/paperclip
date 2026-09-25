@@ -6,7 +6,11 @@ import fs from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { prepareHeartbeatRunScratch } from "./run-scratch.js";
-import { reapLostRunProcessTree } from "./run-process-reaper.js";
+import { __testing, reapLostRunProcessTree } from "./run-process-reaper.js";
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * These tests reproduce the 2026-09-25 leak shape: a heartbeat run spawns a
@@ -55,6 +59,32 @@ const child = spawn(
 process.stdout.write(String(child.pid) + "\\n");
 child.unref();
 process.exit(0);
+`;
+
+/** Forks a replacement worker when it is first sent SIGTERM, then ignores every
+ *  later signal. This is the shape a single snapshot of the candidate set
+ *  cannot see: the worker does not exist until the reaper has already decided
+ *  what to signal, and it inherits `dir` from the process that forked it. */
+const FORKER_SOURCE = `
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const { serverScript, scratchDir, port, readyFile } = JSON.parse(process.argv[2]);
+let forked = false;
+process.on("SIGTERM", () => {
+  if (forked) return;
+  forked = true;
+  const child = spawn(process.execPath, [serverScript, JSON.stringify({ port })], {
+    stdio: "ignore",
+    detached: true,
+    env: { ...process.env, PAPERCLIP_RUN_SCRATCH_DIR: scratchDir },
+  });
+  child.unref();
+  fs.writeFileSync(readyFile, String(child.pid));
+  // Stay alive and deaf to every signal after forking, so the reaper has to
+  // escalate rather than get its way on the first SIGTERM.
+  process.on("SIGTERM", () => {});
+});
+setInterval(() => {}, 1000);
 `;
 
 async function makeTempDir(prefix: string) {
@@ -182,9 +212,51 @@ async function setup() {
   const helperDir = await makeTempDir("reaper-helper-");
   const serverScript = path.join(helperDir, "server.cjs");
   const spawnerScript = path.join(helperDir, "spawner.cjs");
+  const forkerScript = path.join(helperDir, "forker.cjs");
   await fs.writeFile(serverScript, SERVER_SOURCE);
   await fs.writeFile(spawnerScript, SPAWNER_SOURCE);
-  return { scratch, serverScript, spawnerScript };
+  await fs.writeFile(forkerScript, FORKER_SOURCE);
+  return { scratch, serverScript, spawnerScript, forkerScript };
+}
+
+/** A detached process holding a port that names the run's scratch dir, so it
+ *  both proves and is a member of its own process group. */
+async function spawnAnchoredGroupMember(input: {
+  serverScript: string;
+  scratchDir: string;
+  port: number;
+}) {
+  const child = track(
+    spawn(
+      process.execPath,
+      [input.serverScript, JSON.stringify({ port: input.port })],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+        env: { ...process.env, PAPERCLIP_RUN_SCRATCH_DIR: input.scratchDir },
+      },
+    ),
+  );
+  child.stdout?.resume();
+  const pid = child.pid as number;
+  child.unref();
+  return { child, pid };
+}
+
+/** Waits for a file the forker writes with the pid of the worker it spawned. */
+async function readPidFileWhenPresent(file: string, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const raw = (await fs.readFile(file, "utf8")).trim();
+      const pid = Number.parseInt(raw, 10);
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    } catch {
+      // not written yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`timed out waiting for the forker to record a worker pid in ${file}`);
 }
 
 /** Spawn a direct child that dies immediately after starting a port-holding
@@ -331,11 +403,70 @@ describe("reapLostRunProcessTree", () => {
   );
 
   it(
-    "reaps a recorded process group even when no scratch directory is known",
+    "reaps a recorded process group whose ownership the scratch dir still proves",
     async () => {
+      const { scratch, serverScript } = await setup();
+      const port = await reserveFreePort();
+      // A detached child in its own process group, holding the port itself and
+      // inheriting the run's scratch dir, so the group is provably this run's.
+      const member = await spawnAnchoredGroupMember({
+        serverScript,
+        scratchDir: scratch.dir,
+        port,
+      });
+      expect(await waitForPortBound(port)).toBe(true);
+
+      const result = await reapLostRunProcessTree({
+        processGroupId: member.pid,
+        scratchDir: scratch.dir,
+        graceMs: 1_000,
+      });
+
+      expect(result.groupWasAlive).toBe(true);
+      expect(result.refusedOwnGroup).toBe(false);
+      expect(result.refusedUnverifiedGroup).toBe(false);
+      expect(await isAlive(member.pid)).toBe(false);
+      expect(await waitForPortFree(port)).toBe(true);
+    },
+    40_000,
+  );
+
+  it(
+    "refuses to signal a recorded group that no scratch dir can prove it owns",
+    async () => {
+      // A recorded pgid is a bare number the kernel recycles, and the run's own
+      // group has already been observed dead by the time the process-loss path
+      // gets here. An unrelated group holding that number must survive: this is
+      // the only test that can tell "the number was recycled" from "the run's
+      // group is still up", and the answer has to be refusal, not a signal.
+      const { scratch, serverScript } = await setup();
+      const bystander = await spawnBystander(serverScript);
+      expect(await waitForPortBound(bystander.port)).toBe(true);
+
+      const result = await reapLostRunProcessTree({
+        processGroupId: bystander.pid,
+        scratchDir: scratch.dir,
+        graceMs: 1_000,
+      });
+
+      expect(result.groupWasAlive).toBe(true);
+      expect(result.refusedUnverifiedGroup).toBe(true);
+      expect(result.groupSignalled).toBe(false);
+      expect(await isAlive(bystander.pid)).toBe(true);
+      expect(await portIsBound(bystander.port)).toBe(true);
+    },
+    40_000,
+  );
+
+  it(
+    "refuses to signal a recorded process group when no scratch directory is known",
+    async () => {
+      // Without a scratch directory there is no ownership evidence at all, so
+      // the group fast path has nothing to stand on and is skipped. The caller
+      // already signalled pid and group itself on this path, so nothing that the
+      // group path would have reaped is lost.
       const { serverScript } = await setup();
       const port = await reserveFreePort();
-      // A detached child in its own process group, holding the port itself.
       const child = track(
         spawn(
           process.execPath,
@@ -356,8 +487,94 @@ describe("reapLostRunProcessTree", () => {
 
       expect(result.groupWasAlive).toBe(true);
       expect(result.refusedOwnGroup).toBe(false);
-      expect(await isAlive(childPid)).toBe(false);
+      expect(result.refusedUnverifiedGroup).toBe(true);
+      expect(await isAlive(childPid)).toBe(true);
+      expect(await portIsBound(port)).toBe(true);
+    },
+    40_000,
+  );
+
+  it(
+    "reaps a worker forked after the sweep started, instead of snapshotting once",
+    async () => {
+      // The leak this closes: a matched descendant that ignores SIGTERM forks a
+      // replacement worker, so the worker's pid did not exist when the candidate
+      // set was first taken. It inherits the scratch dir, so it is reapable by
+      // the same anchor — it just has to be looked for again.
+      const { scratch, serverScript, forkerScript } = await setup();
+      const port = await reserveFreePort();
+      const readyFile = path.join(scratch.dir, "forked-worker.pid");
+      const forker = track(
+        spawn(
+          process.execPath,
+          [forkerScript, JSON.stringify({ serverScript, scratchDir: scratch.dir, port, readyFile })],
+          {
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: true,
+            env: { ...process.env, PAPERCLIP_RUN_SCRATCH_DIR: scratch.dir },
+          },
+        ),
+      );
+      forker.stdout?.resume();
+      const forkerPid = forker.pid as number;
+      forker.unref();
+      await delay(300);
+
+      const result = await reapLostRunProcessTree({
+        processGroupId: null,
+        scratchDir: scratch.dir,
+        graceMs: 2_000,
+      });
+
+      // The forker forks on its first SIGTERM, so the worker always exists by
+      // the time the reap returns; if it does not, this shape regressed.
+      const workerPid = await readPidFileWhenPresent(readyFile);
+      expect(result.matchedPids).toContain(forkerPid);
+      expect(result.matchedPids).toContain(workerPid);
+      expect(result.errors).toEqual([]);
+      expect(await isAlive(forkerPid)).toBe(false);
+      expect(await isAlive(workerPid)).toBe(false);
       expect(await waitForPortFree(port)).toBe(true);
+    },
+    40_000,
+  );
+
+  it(
+    "never claims a process whose uid is not the server's",
+    async () => {
+      // The sweep is documented as same-uid. Prove the gate rather than the
+      // comment: this process references the run's scratch dir for real, and a
+      // uid that belongs to nobody on this host must still exclude it.
+      const { scratch, serverScript, spawnerScript } = await setup();
+      const port = await reserveFreePort();
+      const { grandchildPid } = await spawnLostRunTree({
+        spawnerScript,
+        serverScript,
+        scratchDir: scratch.dir,
+        port,
+      });
+      expect(await waitForPortBound(port)).toBe(true);
+
+      const ourUid = process.getuid?.() ?? null;
+      expect(ourUid).not.toBeNull();
+      expect(__testing.readRealUid(grandchildPid)).toBe(ourUid);
+      // 2^22 - 2 is the last uid the kernel hands out and belongs to nothing.
+      expect(
+        __testing.collectDescendantCandidates({
+          dir: scratch.dir,
+          protect: new Set(),
+          uid: 4194302,
+        }),
+      ).toEqual([]);
+      // The same call with the server's own uid still finds it, so the empty
+      // result above is the uid gate and not a broken scan.
+      expect(
+        __testing.collectDescendantCandidates({
+          dir: scratch.dir,
+          protect: new Set(),
+          uid: ourUid,
+        }),
+      ).toContain(grandchildPid);
     },
     40_000,
   );
