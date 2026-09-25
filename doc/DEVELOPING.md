@@ -236,7 +236,7 @@ pnpm --filter @paperclipai/server exec tsx ../scripts/request-hot-restart.ts --s
 systemctl restart paperclip.service
 ```
 
-> **Pitfall — do not drive this restart through `paperclipai service restart`.**
+> **Pitfall — pre-fix `paperclipai service restart` bricks the unit.**
 > The CLI re-renders `~/.config/systemd/user/paperclipai.service` inside
 > `restart()`, *before* it asks systemd to restart, and the renderer resolves
 > `ExecStart` from the current environment rather than from the installed unit.
@@ -244,11 +244,16 @@ systemctl restart paperclip.service
 > `npm install -g` install, a hand-patched unit, an unexported
 > `PAPERCLIP_SHIM_PATH`) that writes a target systemd cannot exec: five
 > `status=203/EXEC` failures, `start-limit-hit`, and the API plus embedded
-> PostgreSQL down for the rest of the repair. The renderer also emits no
+> PostgreSQL down for the rest of the repair. The renderer also emitted no
 > `KillMode=`, so systemd's default `control-group` SIGTERMs detached local
 > agent runs and the database in the same cgroup as the server — the opposite
-> of the ordering this section says Paperclip owns. Write the marker and restart
-> with plain `systemctl` as above. If the unit is already broken, follow
+> of the ordering this section says Paperclip owns. On any CLI older than this
+> fix, write the marker and restart with plain `systemctl` as above. The current
+> CLI resolves the executable against the installed unit, refuses to write a
+> definition whose target is not runnable, preserves operator-supplied
+> `Environment=` lines, emits `KillMode=process`, and records the preflight set
+> itself, so `paperclipai service restart` is safe to use once this version is
+> installed. If the unit is already broken, follow
 > [Recover A Broken Service Unit](INSTALLING.md#recover-a-broken-service-unit).
 
 The staged command records the target server's boot identity and operating

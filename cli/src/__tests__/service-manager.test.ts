@@ -26,6 +26,12 @@ async function temporaryDirectory(): Promise<string> {
   return directory;
 }
 
+async function writeExecutable(executablePath: string): Promise<string> {
+  await fs.mkdir(path.dirname(executablePath), { recursive: true });
+  await fs.writeFile(executablePath, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+  return executablePath;
+}
+
 describe("service definition generation", () => {
   it("generates a stable systemd notify unit without secrets", () => {
     const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
@@ -35,6 +41,15 @@ describe("service definition generation", () => {
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("TimeoutStopSec=300");
     expect(unit).not.toContain("API_KEY");
+  });
+
+  it("signals only the server process so adoption and the embedded database survive a stop", () => {
+    const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
+    // KillMode=control-group (systemd's default) would SIGTERM every process in
+    // the cgroup — local agent runs and embedded PostgreSQL — concurrently with
+    // the coordinated shutdown, defeating hot-restart run adoption.
+    expect(unit).toContain("KillMode=process");
+    expect(unit).not.toMatch(/^KillMode=control-group$/m);
   });
 
   it("escapes systemd variable and specifier expansion in configured values", () => {
@@ -73,7 +88,9 @@ describe("systemd drift regeneration", () => {
       calls.push([command, ...args].join(" "));
       return { stdout: "", stderr: "" };
     };
-    const manager = new SystemdServiceManager("default", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    const shimPath = path.join(userHome, ".local/bin/paperclipai");
+    const manager = new SystemdServiceManager("default", runner, path.join(userHome, ".paperclip"), shimPath, userHome);
+    await writeExecutable(shimPath);
     await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
     await fs.writeFile(manager.definitionPath, "stale\n", "utf8");
 
@@ -132,6 +149,73 @@ describe("systemd drift regeneration", () => {
     expect(await manager.installedExecutablePath()).toBe(resolvedShim);
   });
 
+  it("preserves operator Environment= settings across a rewrite without duplicating managed keys", async () => {
+    const userHome = await temporaryDirectory();
+    const shimPath = path.join(userHome, ".local/bin/paperclipai");
+    await writeExecutable(shimPath);
+    const homeDir = path.join(userHome, ".paperclip");
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      return { stdout: "", stderr: "" };
+    };
+    const manager = new SystemdServiceManager("default", runner, homeDir, shimPath, userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    // Operator hand-patched unit: custom PATH, provider routing, and a stale
+    // managed key sharing a line with an operator setting.
+    const installedUnit = renderSystemdUnit({ instanceId: "default", shimPath, homeDir })
+      .replace("RestartSec=5", "RestartSec=99")
+      .replace(
+        "WorkingDirectory=%h",
+        [
+          'Environment="PATH=/opt/custom/bin:/usr/bin"',
+          'Environment="PAPERCLIP_OPENCODE_PROVIDERS=openai anthropic"',
+          'Environment="PAPERCLIP_HOME=/stale/home" "OPERATOR_TOKEN=abc"',
+          "WorkingDirectory=%h",
+        ].join("\n"),
+      );
+    await fs.writeFile(manager.definitionPath, installedUnit, "utf8");
+
+    await manager.restart();
+
+    const written = await fs.readFile(manager.definitionPath, "utf8");
+    expect(written).toContain('Environment="PATH=/opt/custom/bin:/usr/bin"');
+    expect(written).toContain('Environment="PAPERCLIP_OPENCODE_PROVIDERS=openai anthropic"');
+    expect(written).toContain('Environment="OPERATOR_TOKEN=abc"');
+    expect(written.match(/Environment="PAPERCLIP_HOME=/g)).toHaveLength(1);
+    expect(written.match(/Environment="PAPERCLIP_SERVICE_MANAGED=/g)).toHaveLength(1);
+    expect(written.match(/Environment="PATH=/g)).toHaveLength(1);
+    expect(written).toContain("RestartSec=5");
+    expect(calls).toContain("systemctl --user daemon-reload");
+    // The preserved settings must be stable: a second render is a no-op.
+    expect(await manager.desiredDefinition()).toBe(written);
+  });
+
+  it("refuses to rewrite a unit when neither the resolved nor the installed target is executable", async () => {
+    const userHome = await temporaryDirectory();
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      return { stdout: "", stderr: "" };
+    };
+    const shimPath = path.join(userHome, ".local/bin/paperclipai");
+    const homeDir = path.join(userHome, ".paperclip");
+    const manager = new SystemdServiceManager("default", runner, homeDir, shimPath, userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    // Installed unit points at a second path that is missing too.
+    await fs.writeFile(
+      manager.definitionPath,
+      renderSystemdUnit({ instanceId: "default", shimPath: path.join(userHome, "gone", "paperclipai"), homeDir }),
+      "utf8",
+    );
+
+    await expect(manager.restart()).rejects.toThrow(/Refusing to write/);
+
+    const written = await fs.readFile(manager.definitionPath, "utf8");
+    expect(written).toContain("gone/paperclipai");
+    expect(calls).toEqual([]);
+  });
+
   it("keeps the unit installed when stopping an active service fails", async () => {
     const userHome = await temporaryDirectory();
     const runner: CommandRunner = async (command, args) => {
@@ -179,6 +263,7 @@ describe("launchd lifecycle", () => {
       return { stdout: "", stderr: "" };
     };
     const manager = new LaunchdServiceManager("team-a", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await writeExecutable(path.join(userHome, ".local/bin/paperclipai"));
 
     await manager.start();
 
@@ -196,6 +281,7 @@ describe("launchd lifecycle", () => {
       return { stdout: "", stderr: "" };
     };
     const manager = new LaunchdServiceManager("team[qa]+", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await writeExecutable(path.join(userHome, ".local/bin/paperclipai"));
 
     await manager.start();
 
@@ -211,6 +297,7 @@ describe("launchd lifecycle", () => {
       return { stdout: "", stderr: "" };
     };
     const manager = new LaunchdServiceManager("team-a", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await writeExecutable(path.join(userHome, ".local/bin/paperclipai"));
 
     await manager.install({ startNow: false, startOnLogin: false });
     await manager.stop();
@@ -248,6 +335,23 @@ describe("launchd lifecycle", () => {
     expect(written).toContain("<integer>5</integer>");
   });
 
+  it("refuses to write a launch agent when no runnable target exists", async () => {
+    const userHome = await temporaryDirectory();
+    const missingShim = path.join(userHome, ".local", "bin", "paperclipai");
+    const homeDir = path.join(userHome, ".paperclip");
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      return { stdout: "", stderr: "" };
+    };
+    const manager = new LaunchdServiceManager("default", runner, homeDir, missingShim, userHome);
+
+    await expect(manager.install({ startNow: false, startOnLogin: false })).rejects.toThrow(/Refusing to write/);
+
+    expect(calls).toEqual([]);
+    await expect(fs.access(manager.definitionPath)).rejects.toThrow();
+  });
+
   it("disables login startup when uninstalled", async () => {
     const userHome = await temporaryDirectory();
     const calls: string[] = [];
@@ -282,7 +386,9 @@ describe("single-writer guard", () => {
 
   it("refuses to replace a symlinked service definition", async () => {
     const userHome = await temporaryDirectory();
-    const manager = new SystemdServiceManager("default", async () => ({ stdout: "", stderr: "" }), path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    const shimPath = path.join(userHome, ".local/bin/paperclipai");
+    const manager = new SystemdServiceManager("default", async () => ({ stdout: "", stderr: "" }), path.join(userHome, ".paperclip"), shimPath, userHome);
+    await writeExecutable(shimPath);
     await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
     const target = path.join(userHome, "target.service"); await fs.writeFile(target, "preserve\n"); await fs.symlink(target, manager.definitionPath);
     await expect(manager.install({ startNow: false, startOnLogin: false })).rejects.toThrow("unsafe service definition");

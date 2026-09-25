@@ -8,7 +8,7 @@ import { detectServiceManager, type ServiceManager, type ServiceStatus } from ".
 import { buildLocalHealthUrl } from "../utils/health-url.js";
 
 type CommonOptions = { instance?: string; json?: boolean };
-type HealthResult = { ok: boolean; serverVersion: string | null; error?: string };
+type HealthResult = { ok: boolean; serverVersion: string | null; serverStartedAt: string | null; error?: string };
 
 function output(value: unknown, json: boolean | undefined): void {
   if (json) console.log(JSON.stringify(value, null, 2));
@@ -32,16 +32,23 @@ function healthUrl(instanceId: string): string {
 async function probeHealth(instanceId: string): Promise<HealthResult> {
   try {
     const response = await fetch(healthUrl(instanceId), { signal: AbortSignal.timeout(2_000) });
-    const body = await response.json() as { status?: unknown; serverVersion?: unknown; version?: unknown };
-    return { ok: response.ok && body.status === "ok", serverVersion: typeof body.serverVersion === "string" ? body.serverVersion : typeof body.version === "string" ? body.version : null };
+    const body = await response.json() as { status?: unknown; serverVersion?: unknown; version?: unknown; serverInfo?: unknown };
+    const serverInfo = body.serverInfo && typeof body.serverInfo === "object" ? body.serverInfo as Record<string, unknown> : null;
+    return {
+      ok: response.ok && body.status === "ok",
+      serverVersion: typeof body.serverVersion === "string" ? body.serverVersion : typeof body.version === "string" ? body.version : null,
+      // Identity of the process we are about to replace; the server uses it to
+      // prove the intent belongs to the incarnation it is shutting down.
+      serverStartedAt: typeof serverInfo?.processStartedAt === "string" ? serverInfo.processStartedAt : null,
+    };
   } catch (error) {
-    return { ok: false, serverVersion: null, error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, serverVersion: null, serverStartedAt: null, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
 async function waitForHealth(instanceId: string, expectedVersion: string | null, timeoutMs = 60_000): Promise<HealthResult> {
   const deadline = Date.now() + timeoutMs;
-  let last: HealthResult = { ok: false, serverVersion: null };
+  let last: HealthResult = { ok: false, serverVersion: null, serverStartedAt: null };
   while (Date.now() < deadline) {
     last = await probeHealth(instanceId);
     if (last.ok && (!expectedVersion || last.serverVersion === expectedVersion)) return last;
@@ -116,9 +123,61 @@ export async function withHotRestartLock<T>(
   }
 }
 
-async function writeHotRestartIntent(status: ServiceStatus, instanceId: string, drainRequired: boolean): Promise<{ requestedAt: string }> {
+function resolveDatabaseUrl(): string {
+  const envUrl = process.env.DATABASE_URL?.trim();
+  if (envUrl) return envUrl;
+  const config = readConfig(resolveConfigPath());
+  if (config?.database.mode === "postgres" && config.database.connectionString?.trim()) {
+    return config.database.connectionString.trim();
+  }
+  const port = config?.database.embeddedPostgresPort ?? 54329;
+  return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+}
+
+async function queryPreflightActiveRunIds(): Promise<string[]> {
+  const { createDb, heartbeatRuns } = await import("@paperclipai/db");
+  const { eq } = await import("drizzle-orm");
+  const db = createDb(resolveDatabaseUrl());
+  try {
+    const rows = await db.select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+    return rows.map((row) => row.id);
+  } finally {
+    await db.$client.end({ timeout: 1 });
+  }
+}
+
+/**
+ * The set of runs that were in flight when the restart was requested. The
+ * server diffs this against its shutdown snapshot to classify every preflight
+ * run (adopted / lost); an intent without it lets a deploy report vacuously
+ * pass with empty arrays, so a failed query aborts the restart instead of
+ * silently recording `[]`.
+ */
+export async function readPreflightActiveRunIds(
+  options: { query?: () => Promise<string[]> } = {},
+): Promise<string[]> {
+  try {
+    return await (options.query ?? queryPreflightActiveRunIds)();
+  } catch (error) {
+    throw new Error(
+      "Refusing to restart: could not record the preflight active-run set for the hot-restart intent "
+      + `(${error instanceof Error ? error.message : String(error)}). `
+      + "Fix database connectivity (or rerun with --wait to drain) so run adoption cannot be skipped silently.",
+    );
+  }
+}
+
+export async function writeHotRestartIntent(
+  status: ServiceStatus,
+  instanceId: string,
+  drainRequired: boolean,
+  options: { query?: () => Promise<string[]>; probe?: (id: string) => Promise<HealthResult> } = {},
+): Promise<{ requestedAt: string; preflightActiveRunIds: string[] }> {
   if (!status.pid) throw new Error(`Cannot restart ${status.serviceName}: supervisor did not report a server pid.`);
-  const health = await probeHealth(instanceId);
+  const health = await (options.probe ?? probeHealth)(instanceId);
+  const preflightActiveRunIds = drainRequired ? [] : await readPreflightActiveRunIds(options);
   const instanceRoot = resolvePaperclipInstanceRoot(instanceId);
   const requestedAt = new Date().toISOString();
   await fs.mkdir(instanceRoot, { recursive: true });
@@ -127,11 +186,13 @@ async function writeHotRestartIntent(status: ServiceStatus, instanceId: string, 
     version: 1,
     requestedAt,
     previousServerPid: status.pid,
+    previousServerIdentity: health.serverStartedAt,
     previousServerVersion: health.serverVersion,
     drainRequired,
     requestedByRunId: process.env.PAPERCLIP_RUN_ID?.trim() || null,
+    preflightActiveRunIds,
   }, null, 2)}\n`, "utf8");
-  return { requestedAt };
+  return { requestedAt, preflightActiveRunIds };
 }
 
 async function waitForRestartReport(instanceId: string, requestedAt: string, timeoutMs = 10_000): Promise<unknown | null> {
