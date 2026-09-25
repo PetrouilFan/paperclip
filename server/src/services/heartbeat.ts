@@ -8918,6 +8918,7 @@ async function reapAndCleanRunResources(input: {
     processGroupId?: number | null;
   };
   processGroupId: number | null;
+  databaseDataDir?: string | null;
   graceMs?: number;
 }) {
   const { db, run } = input;
@@ -8938,6 +8939,7 @@ async function reapAndCleanRunResources(input: {
     reaped = await reapLostRunProcessTree({
       processGroupId: input.processGroupId,
       scratchDir,
+      databaseDataDir: input.databaseDataDir,
       graceMs: input.graceMs,
     });
   } catch (error) {
@@ -8961,11 +8963,22 @@ async function reapAndCleanRunResources(input: {
       ...event,
     }).catch(() => undefined);
 
-  if (reaped && (reaped.matchedPids.length > 0 || reaped.groupWasAlive)) {
+  // A refusal is reported even when nothing matched: it means a candidate tree
+  // was left running because it holds the instance's database, which is the
+  // operator-visible difference between "nothing to reap" and "reaping
+  // declined".
+  if (
+    reaped &&
+    (reaped.matchedPids.length > 0 ||
+      reaped.groupWasAlive ||
+      reaped.refusedProtectedGroup)
+  ) {
     await append({
       eventType: "lifecycle",
-      level: "warn",
-      message: `Reaped lost run process tree: ${reaped.matchedPids.length} descendant(s) matched, ${reaped.signalledPids.length} signalled, ${reaped.killedPids.length} killed`,
+      level: reaped.refusedProtectedGroup ? "error" : "warn",
+      message: reaped.refusedProtectedGroup
+        ? `Refused to reap a lost run process tree: it holds this instance's embedded PostgreSQL (pid ${reaped.protectedPids[0] ?? "unknown"}) or supervises it`
+        : `Reaped lost run process tree: ${reaped.matchedPids.length} descendant(s) matched, ${reaped.signalledPids.length} signalled, ${reaped.killedPids.length} killed`,
       payload: {
         ...(reaped.processGroupId
           ? { processGroupId: reaped.processGroupId }
@@ -8974,6 +8987,9 @@ async function reapAndCleanRunResources(input: {
         matchedPids: reaped.matchedPids,
         signalledPids: reaped.signalledPids,
         killedPids: reaped.killedPids,
+        refusedOwnGroup: reaped.refusedOwnGroup,
+        refusedProtectedGroup: reaped.refusedProtectedGroup,
+        protectedPids: reaped.protectedPids,
         errors: reaped.errors,
       },
     });
@@ -9347,6 +9363,15 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  /**
+   * This instance's embedded PostgreSQL data directory. The run reaper refuses
+   * to signal the live postmaster, anything supervising it, and any recorded
+   * process group that contains them -- a leaked-tree heuristic otherwise
+   * cannot distinguish a healthy database owner from an orphan, and killing
+   * the wrong one takes the whole instance's database down. See
+   * `instance-database-guard.ts`.
+   */
+  instanceDatabaseDataDir?: string;
   /**
    * Provider-boundary seam for persisted native-run recovery tests. Keeping
    * the seam here exercises the production reaper, claim, execution, package
@@ -15208,6 +15233,7 @@ export function heartbeatService(
           db,
           run,
           processGroupId: running?.processGroupId ?? run.processGroupId,
+          databaseDataDir: options.instanceDatabaseDataDir,
         });
       } finally {
         runningProcesses.delete(run.id);
@@ -19300,6 +19326,7 @@ export function heartbeatService(
         db,
         run,
         processGroupId: run.processGroupId,
+        databaseDataDir: options.instanceDatabaseDataDir,
       });
       let finalizedRun: typeof heartbeatRuns.$inferSelect | null =
         failureWrite.run;
