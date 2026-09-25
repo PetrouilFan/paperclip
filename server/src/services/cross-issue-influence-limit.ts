@@ -40,11 +40,18 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
-export function crossIssueInfluenceRunContextError() {
+export type CrossIssueInfluenceRunContextReason =
+  | "malformed_run_id"
+  | "run_not_found"
+  | "terminal_status"
+  | "no_context_source_and_target_unbound";
+
+export function crossIssueInfluenceRunContextError(reason: CrossIssueInfluenceRunContextReason = "run_not_found") {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal.
+  // The `reason` pinpoints which gate failed so the next report is decisive.
   const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
-  return forbidden(body.error, body.details);
+  return forbidden(body.error, { ...body.details, reason });
 }
 
 function readRunSourceIssueId(contextSnapshot: unknown) {
@@ -95,7 +102,7 @@ export async function observeCrossIssueInfluence(
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
-  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
+  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError("malformed_run_id");
 
   return db.transaction(async (tx) => {
     const run = await tx
@@ -120,7 +127,7 @@ export async function observeCrossIssueInfluence(
       run.companyId !== input.companyId ||
       run.agentId !== input.agentId
     ) {
-      throw crossIssueInfluenceRunContextError();
+      throw crossIssueInfluenceRunContextError("run_not_found");
     }
 
     const contextSourceIssueId = readRunSourceIssueId(run.contextSnapshot);
@@ -178,7 +185,7 @@ export async function observeCrossIssueInfluence(
 
     // With no context source and no binding on the target there is nothing to
     // attribute the write to, so fail closed.
-    if (!contextSourceIssueId) throw crossIssueInfluenceRunContextError();
+    if (!contextSourceIssueId) throw crossIssueInfluenceRunContextError("no_context_source_and_target_unbound");
     const sourceIssueId = contextSourceIssueId;
 
     const priorCount = await tx
