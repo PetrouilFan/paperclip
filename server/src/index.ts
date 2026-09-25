@@ -1926,6 +1926,16 @@ async function startServerWithDatabaseTeardown(
     // teardown below is still draining runs and connections. Without this the
     // supervisor reads our own stop as a crash, logs "exited unexpectedly" at
     // ERROR, and relaunches the database this process is shutting down.
+    //
+    // This is the only place the shutdown intent may be marked. The rule that makes
+    // it safe is that the intent is marked only on a path that is going down:
+    // `shutdownIntent` is a one-way, process-wide latch with no reset, so once it is
+    // set every later exit of the managed PostgreSQL is reported as a controlled exit
+    // and never recovers. Marking it from a path that keeps serving — a database
+    // restart, a reconfigure, a "pause the supervisor" — silently disables crash
+    // recovery for the rest of the process lifetime, and no behavioural test notices,
+    // because those tests drive the supervisor directly and never load this file.
+    // Guarded by __tests__/embedded-postgres-shutdown-intent-call-site.test.ts.
     embeddedPostgresSupervisor?.markShutdownIntent();
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
