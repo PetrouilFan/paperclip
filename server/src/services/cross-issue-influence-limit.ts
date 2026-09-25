@@ -109,11 +109,29 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
+    // A run whose context snapshot carries no source issue is a legitimate
+    // task-less run: a plain `heartbeat_timer` wake is created with no issue in
+    // its context (see the `contextSnapshot.issueId` backfill in
+    // `services/heartbeat.ts`, which only fires when the run was dispatched
+    // with an issue). Such a run is still fully attributable and still fully
+    // contained — the row above is locked with `for update` and validated
+    // against the caller's company and agent, and the per-run counter below
+    // still applies, so a task-less run gets exactly the same
+    // CROSS_ISSUE_INFLUENCE_LIMIT budget as a task-scoped one.
+    //
+    // The only thing a missing source issue removes is the same-issue
+    // exemption, because there is no source issue to exempt. Denying the write
+    // outright instead does not add containment: it makes every task-less run
+    // permanently unable to write to any issue, which is a liveness failure
+    // dressed as a safety control. The fail-closed cases that genuinely matter
+    // — unknown run, wrong agent, wrong company, malformed run id — are all
+    // rejected above and are unchanged.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId !== null &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier &&
+          sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }

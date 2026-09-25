@@ -198,7 +198,61 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  it("counts a task-less run against the cap instead of denying it", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} });
+
+    // A `heartbeat_timer` run has no issue in its context snapshot. It is still
+    // attributable (the locked run row above matched company + agent) and still
+    // bounded (the counter below still runs), so the write proceeds and is
+    // charged to the per-run budget.
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({
+      allowed: true,
+      mode: "enforce",
+      count: 1,
+    });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.cross_issue_influence_observed",
+        details: expect.objectContaining({
+          sourceIssueId: null,
+          targetIssueId: "55555555-5555-4555-8555-555555555555",
+        }),
+      }),
+    ]);
+  });
+
+  it("still enforces the cap for a task-less run", async () => {
+    const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, { contextSnapshot: {} });
+
+    // The task-less exemption is only for the same-issue shortcut. The cap
+    // itself must still bite, otherwise this change would be unbounded.
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({
+      allowed: false,
+      mode: "enforce",
+      count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+    });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
+    ]);
+  });
+
+  it("gives a task-less run no same-issue exemption", async () => {
+    // There is no source issue to match against, so nothing is exempt: even a
+    // repeated write to one target is charged to the per-run budget.
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -206,11 +260,8 @@ describe("cross-issue influence limit rollout", () => {
       runId: "11111111-1111-4111-8111-111111111111",
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
-      kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
-    });
-    expect(fake.inserted).toEqual([]);
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
   });
 });
