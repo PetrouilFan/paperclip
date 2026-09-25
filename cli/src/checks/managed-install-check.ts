@@ -72,12 +72,31 @@ export function managedInstallChecks(
   }
 
   if (!manifest) {
+    // Artifacts present but the manifest is gone is the one state this check
+    // cannot classify. `hasManagedArtifacts` is a heuristic. Any one of four
+    // paths existing is enough to trip it. A store that is caught mid-update,
+    // mid-cleanup, or mid-render then looks the same as a store that lost its
+    // manifest.
+    //
+    // Reporting `fail` for an unclassifiable state made the ambiguity reachable
+    // from the start-up gate in `commands/run.ts`. That gate exits the process
+    // when the doctor reports any `fail`, and it does so before the server
+    // binds its port. So one heuristic check could make the whole instance
+    // unreachable on restart.
+    //
+    // The two error costs are not equal, so the ambiguous state warns and the
+    // provable states still fail. A manifest that exists but cannot be parsed
+    // is a corrupt store and stays `fail` above. A missing payload and a
+    // `current` link that does not resolve stay `fail` below. A missing install
+    // manifest does not stop this process from serving. It must not be able to
+    // stop it either.
     return [
       {
         name: "Managed install manifest",
-        status: "fail",
+        status: "warn",
         message: `Managed install artifacts exist but ${paths.manifestPath} is missing`,
-        repairHint: "Re-run `paperclipai install`",
+        repairHint:
+          "Re-run `paperclipai install` to rebuild the managed install metadata. This does not block startup; the server starts without it.",
       },
     ];
   }

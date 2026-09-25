@@ -45,7 +45,7 @@ describe("managed install doctor checks", () => {
     expect(managedInstallChecks(paths).every((result) => result.status === "pass")).toBe(true);
   });
 
-  it("fails when managed artifacts exist without a manifest", () => {
+  it("warns, and never fails, when managed artifacts exist without a manifest", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-doctor-"));
     const paths = resolveInstallStorePaths({
       paperclipHome: path.join(root, ".paperclip"),
@@ -53,6 +53,51 @@ describe("managed install doctor checks", () => {
     });
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(paths.markerPath, MANAGED_STORE_MARKER);
+
+    expect(managedInstallChecks(paths)).toEqual([
+      expect.objectContaining({ name: "Managed install manifest", status: "warn" }),
+    ]);
+  });
+
+  it("does not contribute a startup-blocking failure for any artifact-without-manifest shape", () => {
+    // `commands/run.ts` refuses to bind the server port when the doctor reports
+    // any `fail`. So every way of reaching the "artifacts exist but the manifest
+    // is gone" branch must resolve to a non-blocking status. A transient deploy
+    // or cleanup can trip `hasManagedArtifacts` and then retreat. That must not
+    // be able to make the instance unreachable on restart.
+    const shapes: Array<(paths: ReturnType<typeof resolveInstallStorePaths>) => void> = [
+      (paths) => fs.writeFileSync(paths.markerPath, MANAGED_STORE_MARKER),
+      (paths) => fs.mkdirSync(paths.currentPath, { recursive: true }),
+      (paths) => fs.mkdirSync(paths.shimPath, { recursive: true }),
+      (paths) => fs.mkdirSync(path.join(paths.installsRoot, "npm", "1.2.3"), { recursive: true }),
+    ];
+
+    for (const seed of shapes) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-doctor-"));
+      const paths = resolveInstallStorePaths({
+        paperclipHome: path.join(root, ".paperclip"),
+        homeDir: root,
+      });
+      fs.mkdirSync(paths.cliRoot, { recursive: true });
+      seed(paths);
+
+      const results = managedInstallChecks(paths);
+      expect(results.filter((result) => result.status === "fail")).toEqual([]);
+      expect(results.filter((result) => result.status === "warn")).toHaveLength(1);
+    }
+  });
+
+  it("still fails when the manifest exists but cannot be read", () => {
+    // The ambiguous half-state warns. A store that is provably corrupt still
+    // fails, so `paperclipai doctor` keeps its signal for real breakage.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-doctor-"));
+    const paths = resolveInstallStorePaths({
+      paperclipHome: path.join(root, ".paperclip"),
+      homeDir: root,
+    });
+    fs.mkdirSync(paths.cliRoot, { recursive: true });
+    fs.writeFileSync(paths.markerPath, MANAGED_STORE_MARKER);
+    fs.writeFileSync(paths.manifestPath, "{ this is not json");
 
     expect(managedInstallChecks(paths)).toEqual([
       expect.objectContaining({ name: "Managed install manifest", status: "fail" }),
