@@ -122,6 +122,43 @@ export function buildHeartbeatRunScratchEnv(
   return { env, tempKeysApplied };
 }
 
+const SCRATCH_DIR_PREFIX = "paperclip-run-";
+
+/**
+ * Recover a run's scratch directory when the in-memory handle and the persisted
+ * `contextSnapshot.paperclipScratch` are both gone.
+ *
+ * The directory name embeds the run id (`paperclip-run-<issue>-<run12>-<rand>`),
+ * and the marker file inside it records the full run id, so a candidate is only
+ * accepted when the marker agrees. A name match alone is not enough: the issue
+ * segment is sanitized and could in principle collide, so the marker is what
+ * makes this exact.
+ */
+export async function resolveHeartbeatRunScratch(
+  runId: string,
+): Promise<HeartbeatRunScratch | null> {
+  const runSegment = sanitizePathSegment(runId.slice(0, 12), "run");
+  if (runSegment === "run") return null;
+  const tmpRoot = path.resolve(os.tmpdir());
+  let entries: string[];
+  try {
+    entries = await fs.readdir(tmpRoot);
+  } catch {
+    return null;
+  }
+
+  for (const name of entries) {
+    if (!name.startsWith(SCRATCH_DIR_PREFIX)) continue;
+    if (!name.includes(`-${runSegment}-`)) continue;
+    const dir = path.resolve(tmpRoot, name);
+    if (!isPathInside(tmpRoot, dir)) continue;
+    const metadata = await readMarker(path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER));
+    if (!metadata || metadata.runId !== runId) continue;
+    return { dir, markerPath: path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER), metadata };
+  }
+  return null;
+}
+
 export async function cleanupHeartbeatRunScratch(input: {
   scratch: HeartbeatRunScratch;
   processGroupId?: number | null;
