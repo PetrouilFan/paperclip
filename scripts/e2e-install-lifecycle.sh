@@ -22,6 +22,23 @@ E2E_REPO="${E2E_REPO:-paperclipai/paperclip}"
 E2E_REF="${E2E_REF:-master}"
 E2E_SERVICE_TIMEOUT_SECS="${E2E_SERVICE_TIMEOUT_SECS:-300}"
 
+# Refuse to touch a host that already has the production service.
+#
+# Step 8a runs `onboard --install-service` and step 8e runs `service uninstall`
+# against whatever unit the *user manager* resolves, and the user manager keeps
+# its own HOME from login time. Pointing this script at a throwaway $HOME does
+# not hide the real unit: `systemctl --user cat paperclipai.service` still
+# resolves to /home/<user>/.config/systemd/user/paperclipai.service, and
+# `systemctl --user stop` still stops the live service. So the guard is the
+# isolation: if the default unit exists, do not run at all.
+if command -v systemctl >/dev/null 2>&1 \
+  && systemctl --user cat paperclipai.service >/dev/null 2>&1; then
+  echo "Refusing to run: this host already has paperclipai.service installed." >&2
+  echo "The lifecycle steps would stop and uninstall it. Uninstall it first," >&2
+  echo "or run this script in a container/CI job that has no Paperclip service." >&2
+  exit 2
+fi
+
 # A clean environment: no inherited Paperclip or build-mode state.
 for var in $(env | grep -o '^PAPERCLIP_[A-Z_]*' || true); do unset "$var"; done
 unset NODE_ENV npm_config_prefix 2>/dev/null || true

@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prove that `onboard --install-service` on a released artifact leaves a
-# working background service. The Docker onboard smoke can never cover this
-# leg: containers have no service manager, so a release whose service install
-# crash-loops on a missing shim (v2026.824.0) still passes every golden-path
-# check. This script runs the published npm artifact on a real systemd user
-# session and fails unless the installed service itself ends up serving
-# /api/health.
-#
-# Requirements: a Linux host with a user systemd session. In CI that means
-# `loginctl enable-linger` plus XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS
-# pointing at /run/user/<uid>; see the smoke_service job in
-# .github/workflows/release-smoke.yml.
-
 PAPERCLIPAI_VERSION="${PAPERCLIPAI_VERSION:-latest}"
 DATA_DIR="${DATA_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/paperclip-service-smoke.XXXXXX")}"
 ONBOARD_TIMEOUT_SECONDS="${ONBOARD_TIMEOUT_SECONDS:-600}"
@@ -25,6 +12,23 @@ SHIM_PATH="${PAPERCLIP_SHIM_PATH:-$HOME/.local/bin/paperclipai}"
 # disables it so the diagnostics step can still inspect the unit.
 SMOKE_CLEANUP="${SMOKE_CLEANUP:-true}"
 SMOKE_FORCE="${SMOKE_FORCE:-false}"
+
+# Refuse to smoke over an installed production service.
+#
+# The onboard step installs $SERVICE_NAME and `cleanup()` uninstalls it. The
+# user manager resolves units from its own HOME (set at login), so pointing
+# this script at a throwaway $HOME would not protect the real unit:
+# `systemctl --user cat paperclipai.service` still finds
+# /home/<user>/.config/systemd/user/paperclipai.service and
+# `systemctl --user stop` still stops the live service. This guard is the
+# isolation, and it runs before SMOKE_FORCE can override anything.
+if command -v systemctl >/dev/null 2>&1 \
+  && systemctl --user cat paperclipai.service >/dev/null 2>&1; then
+  echo "Refusing to smoke: this host already has paperclipai.service installed." >&2
+  echo "cleanup() would uninstall it. Uninstall it first, or run this smoke in" >&2
+  echo "a container/CI job that has no Paperclip service." >&2
+  exit 2
+fi
 
 fail() {
   echo "Service smoke failed: $*" >&2
