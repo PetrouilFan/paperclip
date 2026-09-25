@@ -1,6 +1,6 @@
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
-import { hasLiveLegacyController } from "../legacy-controller-lease.js";
+import { hasLiveLegacyController, legacyControllerBackstopMatch } from "../legacy-controller-lease.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
 import {
@@ -5700,17 +5700,8 @@ export function recoveryService(
           // Recheck ownership in the write: a controller can renew or claim
           // the run after the liveness read. An old snapshot cannot end a new
           // controller's run, even if that controller's lease later expires.
-          run.runtimeMode === "legacy"
-            ? and(
-                run.controllerBootId
-                  ? eq(heartbeatRuns.controllerBootId, run.controllerBootId)
-                  : isNull(heartbeatRuns.controllerBootId),
-                or(
-                  isNull(heartbeatRuns.controllerBootId),
-                  sql`${heartbeatRuns.controllerLeaseExpiresAt} <= clock_timestamp()`,
-                ),
-              )
-            : undefined,
+          // The predicate is shared with the lease test so the two cannot drift.
+          run.runtimeMode === "legacy" ? legacyControllerBackstopMatch(run) : undefined,
         ),
       )
       .returning()
