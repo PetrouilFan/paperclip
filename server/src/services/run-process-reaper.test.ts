@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { prepareHeartbeatRunScratch } from "./run-scratch.js";
 import { reapLostRunProcessTree } from "./run-process-reaper.js";
+import { resolveInstanceDatabaseGuard } from "./instance-database-guard.js";
 
 /**
  * These tests reproduce the 2026-09-25 leak shape: a heartbeat run spawns a
@@ -55,6 +56,33 @@ const child = spawn(
 process.stdout.write(String(child.pid) + "\\n");
 child.unref();
 process.exit(0);
+`;
+
+/** Stands in for the embedded postmaster: writes `<dataDir>/postmaster.pid` in
+ *  the real format, binds a port, and stays alive. This is the process a
+ *  leaked-tree heuristic must never take down, and the one whose supervisors
+ *  must never be taken down either. */
+const POSTMASTER_SOURCE = `
+const fs = require("node:fs");
+const net = require("node:net");
+const { dataDir, port } = JSON.parse(process.argv[2]);
+fs.writeFileSync(
+  dataDir + "/postmaster.pid",
+  [
+    String(process.pid),
+    dataDir,
+    String(Math.floor(Date.now() / 1000)),
+    String(port),
+    "/tmp",
+    "localhost",
+    "  0    0",
+    "ready",
+    "",
+  ].join("\\n"),
+);
+const server = net.createServer((socket) => socket.end());
+server.listen(port, "127.0.0.1");
+setInterval(() => {}, 1000);
 `;
 
 async function makeTempDir(prefix: string) {
@@ -229,6 +257,70 @@ async function spawnBystander(serverScript: string) {
   return { child, pid: child.pid as number, port };
 }
 
+/**
+ * A detached child in its own process group that stands in for a
+ * `paperclipai run` instance owning an embedded database: it writes a
+ * `postmaster.pid` naming itself and then holds a port.
+ *
+ * The returned `pid` is both the group's id and the postmaster's, which is
+ * exactly the production shape the guard has to refuse: the run's recorded
+ * group *is* the database owner's group.
+ */
+async function spawnDatabaseOwner() {
+  const helperDir = await makeTempDir("reaper-dbowner-");
+  const script = path.join(helperDir, "postmaster.cjs");
+  await fs.writeFile(script, POSTMASTER_SOURCE);
+  const dataDir = await makeTempDir("reaper-dbdata-");
+  const port = await reserveFreePort();
+  const child = track(
+    spawn(process.execPath, [script, JSON.stringify({ dataDir, port })], {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    }),
+  );
+  child.stdout?.resume();
+  const pid = child.pid as number;
+  child.unref();
+  return { dataDir, port, pid, processGroupId: pid };
+}
+
+/**
+ * Wait until the stand-in postmaster has published its pid file and the guard
+ * can resolve it. The child writes the file as its first action, but the
+ * spawn-to-write window is exactly where a fixed `expect(...).not.toBeNull()`
+ * becomes a flaky test.
+ */
+async function waitForPostmaster(dataDir: string, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const guard = resolveInstanceDatabaseGuard(dataDir);
+    if (guard) return guard;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return null;
+}
+
+/**
+ * Wait until a pid is gone from the process table entirely.
+ *
+ * `isAlive` treats a zombie as dead, because a zombie holds no resources. A
+ * pid file check is not in that position: `kill(pid, 0)` still succeeds for a
+ * zombie, so a test that waits on `isAlive` and then expects the guard to find
+ * nothing is waiting on the wrong condition.
+ */
+async function waitForPidGone(pid: number, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fs.access(`/proc/${pid}`);
+    } catch {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
 afterEach(async () => {
   for (const child of spawned) {
     try {
@@ -397,4 +489,137 @@ describe("reapLostRunProcessTree", () => {
     },
     20_000,
   );
+
+  it(
+    "refuses a recorded group that holds this instance's live database",
+    async () => {
+      // The 2026-09-25 outage, reduced to its minimum: the recorded group is
+      // the database owner's own group, so a group signal would SIGTERM then
+      // SIGKILL the postmaster and take the instance's database with it.
+      const owner = await spawnDatabaseOwner();
+      expect(await waitForPortBound(owner.port)).toBe(true);
+      expect((await waitForPostmaster(owner.dataDir))?.postmasterPid).toBe(
+        owner.pid,
+      );
+
+      const result = await reapLostRunProcessTree({
+        processGroupId: owner.processGroupId,
+        scratchDir: null,
+        databaseDataDir: owner.dataDir,
+        graceMs: 1_000,
+      });
+
+      expect(result.refusedProtectedGroup).toBe(true);
+      expect(result.groupSignalled).toBe(false);
+      expect(result.signalledPids).toEqual([]);
+      expect(result.killedPids).toEqual([]);
+      expect(result.protectedPids[0]).toBe(owner.pid);
+      expect(await isAlive(owner.pid)).toBe(true);
+      expect(await portIsBound(owner.port)).toBe(true);
+    },
+    40_000,
+  );
+
+  it(
+    "still reaps a real orphan while an unrelated database is live",
+    async () => {
+      // The guard must not become a blanket refusal. PET-109's five leaked
+      // servers are still orphans: nothing about them holds a database, so
+      // they remain reapable while this instance's own database is up.
+      const { scratch, serverScript, spawnerScript } = await setup();
+      const owner = await spawnDatabaseOwner();
+      expect(await waitForPortBound(owner.port)).toBe(true);
+      const port = await reserveFreePort();
+      const { grandchildPid } = await spawnLostRunTree({
+        spawnerScript,
+        serverScript,
+        scratchDir: scratch.dir,
+        port,
+      });
+      expect(await waitForPortBound(port)).toBe(true);
+
+      const result = await reapLostRunProcessTree({
+        processGroupId: null,
+        scratchDir: scratch.dir,
+        databaseDataDir: owner.dataDir,
+        graceMs: 1_000,
+      });
+
+      expect(result.refusedProtectedGroup).toBe(false);
+      expect(result.matchedPids).toContain(grandchildPid);
+      expect(await isAlive(grandchildPid)).toBe(false);
+      expect(await waitForPortFree(port)).toBe(true);
+      // The database is untouched by reaping an unrelated tree.
+      expect(await isAlive(owner.pid)).toBe(true);
+    },
+    40_000,
+  );
+
+  it(
+    "keeps reaping the owner's group when no database is reported",
+    async () => {
+      // Without a data dir there is nothing to protect, so the reaper behaves
+      // as it did before the guard. This pins the guard to being opt-in on
+      // real data rather than a change in default behaviour.
+      const owner = await spawnDatabaseOwner();
+      expect(await waitForPortBound(owner.port)).toBe(true);
+
+      const result = await reapLostRunProcessTree({
+        processGroupId: owner.processGroupId,
+        scratchDir: null,
+        graceMs: 1_000,
+      });
+
+      expect(result.protectedPids).toEqual([]);
+      expect(result.refusedProtectedGroup).toBe(false);
+      expect(result.groupSignalled).toBe(true);
+      expect(await isAlive(owner.pid)).toBe(false);
+    },
+    40_000,
+  );
+});
+
+describe("resolveInstanceDatabaseGuard", () => {
+  it("protects the postmaster and its ancestors", async () => {
+    const owner = await spawnDatabaseOwner();
+    const guard = await waitForPostmaster(owner.dataDir);
+    expect(guard).not.toBeNull();
+    expect(guard?.postmasterPid).toBe(owner.pid);
+    // Nearest parent first, and the walk must reach past the owner to init.
+    expect(guard?.protectedPids[0]).toBe(owner.pid);
+    expect(guard!.protectedPids.length).toBeGreaterThan(1);
+    expect(guard?.protectedPids).toContain(1);
+  });
+
+  it("returns null when the data directory has no pid file", async () => {
+    expect(resolveInstanceDatabaseGuard(await makeTempDir("reaper-nodb-"))).toBeNull();
+  });
+
+  it("returns null when no data directory is supplied", () => {
+    expect(resolveInstanceDatabaseGuard(null)).toBeNull();
+    expect(resolveInstanceDatabaseGuard(undefined)).toBeNull();
+    expect(resolveInstanceDatabaseGuard("   ")).toBeNull();
+  });
+
+  it("returns null for a pid file naming a different data directory", async () => {
+    const owner = await spawnDatabaseOwner();
+    expect(await waitForPostmaster(owner.dataDir)).not.toBeNull();
+    // Same live pid, but the pid file is read as if it belonged elsewhere: a
+    // foreign pid file must not be able to either protect or block anything.
+    const otherDir = await makeTempDir("reaper-otherdb-");
+    expect(resolveInstanceDatabaseGuard(otherDir)).toBeNull();
+  });
+
+  it("returns null once the postmaster pid is gone", async () => {
+    const owner = await spawnDatabaseOwner();
+    expect(await waitForPostmaster(owner.dataDir)).not.toBeNull();
+    try {
+      process.kill(-owner.pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+    expect(await waitForPidGone(owner.pid)).toBe(true);
+    // A stale pid file protects nothing, and must not make the guard throw.
+    expect(resolveInstanceDatabaseGuard(owner.dataDir)).toBeNull();
+  });
 });
