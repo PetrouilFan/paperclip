@@ -84,6 +84,54 @@ describe("systemd drift regeneration", () => {
     expect(calls).toContain("systemctl --user daemon-reload");
   });
 
+  it("keeps an installed executable ExecStart when the environment resolves a missing shim", async () => {
+    const userHome = await temporaryDirectory();
+    const host = await temporaryDirectory();
+    const installedShim = path.join(host, ".npm-global", "bin", "paperclipai");
+    await fs.mkdir(path.dirname(installedShim), { recursive: true });
+    await fs.writeFile(installedShim, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+
+    const missingShim = path.join(host, ".local", "bin", "paperclipai");
+    const homeDir = path.join(userHome, ".paperclip");
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      return { stdout: "", stderr: "" };
+    };
+    const manager = new SystemdServiceManager("default", runner, homeDir, missingShim, userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    // Hand-patched unit: the real CLI lives outside the default shim path, and
+    // an unrelated field has drifted so a rewrite really has to happen.
+    const installedUnit = renderSystemdUnit({ instanceId: "default", shimPath: installedShim, homeDir }).replace("RestartSec=5", "RestartSec=99");
+    await fs.writeFile(manager.definitionPath, installedUnit, "utf8");
+
+    await manager.restart();
+
+    const written = await fs.readFile(manager.definitionPath, "utf8");
+    expect(await manager.installedExecutablePath()).toBe(installedShim);
+    expect(written).toContain(`ExecStart="${installedShim}" run --instance "default"`);
+    expect(written).toContain("RestartSec=5");
+    expect(calls).toContain("systemctl --user daemon-reload");
+  });
+
+  it("adopts the resolved shim once it is executable", async () => {
+    const userHome = await temporaryDirectory();
+    const host = await temporaryDirectory();
+    const resolvedShim = path.join(host, ".local", "bin", "paperclipai");
+    await fs.mkdir(path.dirname(resolvedShim), { recursive: true });
+    await fs.writeFile(resolvedShim, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+    const staleShim = path.join(host, ".npm-global", "bin", "paperclipai");
+    const homeDir = path.join(userHome, ".paperclip");
+
+    const manager = new SystemdServiceManager("default", async () => ({ stdout: "", stderr: "" }), homeDir, resolvedShim, userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    await fs.writeFile(manager.definitionPath, renderSystemdUnit({ instanceId: "default", shimPath: staleShim, homeDir }), "utf8");
+
+    await manager.install({ startNow: false, startOnLogin: false });
+
+    expect(await manager.installedExecutablePath()).toBe(resolvedShim);
+  });
+
   it("keeps the unit installed when stopping an active service fails", async () => {
     const userHome = await temporaryDirectory();
     const runner: CommandRunner = async (command, args) => {
@@ -170,6 +218,34 @@ describe("launchd lifecycle", () => {
     expect(calls).toContain(`launchctl disable gui/${process.getuid?.() ?? 0}/ing.paperclip.paperclipai.team-a`);
     expect(calls).toContain(`launchctl bootout gui/${process.getuid?.() ?? 0}/ing.paperclip.paperclipai.team-a`);
     expect(calls.some((call) => call.includes("launchctl kill"))).toBe(false);
+  });
+
+  it("keeps an installed executable launch agent when the resolved shim is missing", async () => {
+    const userHome = await temporaryDirectory();
+    const host = await temporaryDirectory();
+    const installedShim = path.join(host, "npm-global", "bin", "paperclipai");
+    await fs.mkdir(path.dirname(installedShim), { recursive: true });
+    await fs.writeFile(installedShim, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+    const missingShim = path.join(host, ".local", "bin", "paperclipai");
+    const homeDir = path.join(userHome, ".paperclip");
+
+    const manager = new LaunchdServiceManager("default", async () => ({ stdout: "", stderr: "" }), homeDir, missingShim, userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    const installedAgent = renderLaunchdPlist({
+      instanceId: "default",
+      shimPath: installedShim,
+      homeDir,
+      stdoutPath: path.join(homeDir, "instances", "default", "logs", "service.log"),
+      stderrPath: path.join(homeDir, "instances", "default", "logs", "service.err.log"),
+    }).replace("<integer>5</integer>", "<integer>9</integer>");
+    await fs.writeFile(manager.definitionPath, installedAgent, "utf8");
+
+    await manager.install({ startNow: false, startOnLogin: false });
+
+    const written = await fs.readFile(manager.definitionPath, "utf8");
+    expect(await manager.installedExecutablePath()).toBe(installedShim);
+    expect(written).toContain(`<string>${installedShim}</string><string>run</string>`);
+    expect(written).toContain("<integer>5</integer>");
   });
 
   it("disables login startup when uninstalled", async () => {
