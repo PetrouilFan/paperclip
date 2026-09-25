@@ -3889,7 +3889,9 @@ export function issueRoutes(
   ) {
     if (req.actor.type !== "agent") return true;
     if (!req.actor.agentId || !req.actor.runId)
-      throw crossIssueInfluenceRunContextError();
+      // The genuinely-absent-run case: this run is not in the caller's token at
+      // all, so the run header is the real fix and the copy should say so.
+      throw crossIssueInfluenceRunContextError("run_not_found");
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
