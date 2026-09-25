@@ -26,6 +26,7 @@ import {
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
+  asBoolean,
   asString,
   asNumber,
   asStringArray,
@@ -610,12 +611,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const printLogs = isTruthyEnvFlag(
       env.PAPERCLIP_OPENCODE_PRINT_LOGS ?? process.env.PAPERCLIP_OPENCODE_PRINT_LOGS,
     );
+    // Unattended Paperclip runs must never stall on an approval prompt, and the
+    // injected runtime config alone is not enough to guarantee that: `opencode run`
+    // can attach to a pre-existing background OpenCode service that was started
+    // without Paperclip's XDG_CONFIG_HOME, in which case the injected
+    // `permission.external_directory = allow` is never read and writes into the
+    // run-owned scratch directory (`PAPERCLIP_SCRATCH_DIR`) are rejected as
+    // `external_directory`. Passing `--auto` sets the permission mode on the
+    // client invocation itself, so it applies regardless of which service the run
+    // attaches to. `--auto` only approves permissions that are not explicitly
+    // denied, so operator denials still win.
+    const autoApprovePermissions = asBoolean(config.dangerouslySkipPermissions, true);
     const buildArgs = (resumeSessionId: string | null) => {
       const args = ["run", "--format", "json"];
       if (printLogs) args.push("--print-logs");
       if (resumeSessionId) args.push("--session", resumeSessionId);
       if (model) args.push("--model", model);
       if (variant) args.push("--variant", variant);
+      // Pushed before `extraArgs` so an explicit `extraArgs` entry still wins.
+      if (autoApprovePermissions && !extraArgs.includes("--auto")) args.push("--auto");
       if (extraArgs.length > 0) args.push(...extraArgs);
       return args;
     };

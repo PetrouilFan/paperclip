@@ -221,6 +221,80 @@ describe("OpenCode local skill injection", () => {
   });
 });
 
+describe("OpenCode local headless permission args", () => {
+  it.each([
+    {
+      label: "defaults to --auto when dangerouslySkipPermissions is unset",
+      patch: {},
+      expectAuto: true,
+    },
+    {
+      label: "passes --auto when dangerouslySkipPermissions is true",
+      patch: { dangerouslySkipPermissions: true },
+      expectAuto: true,
+    },
+    {
+      label: "omits --auto when dangerouslySkipPermissions is false",
+      patch: { dangerouslySkipPermissions: false },
+      expectAuto: false,
+    },
+  ])("$label", async ({ patch, expectAuto }) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-auto-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValue(probeResult({
+      stdout: JSON.stringify({
+        type: "text",
+        sessionID: "session-auto",
+        part: { text: "done" },
+      }),
+    }));
+
+    try {
+      const result = await execute({
+        runId: "run-auto",
+        agent: {
+          id: "agent-auto",
+          companyId: "company-1",
+          name: "OpenCode",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          model: "openai/gpt-5",
+          env: { OPENCODE_ALLOW_ALL_MODELS: "1" },
+          ...patch,
+        },
+        context: {},
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(0);
+      const executionCall = runProcessMock.mock.calls.at(-1)!;
+      const args = executionCall[3] as string[];
+      expect(args[0]).toBe("run");
+      // PET-46: the injected runtime config is not read when `opencode run`
+      // attaches to a pre-existing background service, so headless runs must
+      // carry the approval mode on the invocation itself.
+      expect(args.includes("--auto")).toBe(expectAuto);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
