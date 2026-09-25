@@ -126,4 +126,72 @@ describe("resolveDatabaseTarget", () => {
       envPath: path.join(home, "instances", "default", ".env"),
     });
   });
+
+  it("ignores the ambient DATABASE_URL when resolving a named instance", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-db-home-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-db-cwd-"));
+    process.chdir(cwd);
+    process.env.PAPERCLIP_HOME = home;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    // The operator's shell, naming a database this instance never opened.
+    process.env.DATABASE_URL = "postgres://someone-else@other.example.com:5432/paperclip";
+
+    const target = resolveDatabaseTarget({ instanceId: "alice" });
+
+    expect(target).toMatchObject({
+      mode: "embedded-postgres",
+      dataDir: path.join(home, "instances", "alice", "db"),
+      source: "embedded-postgres@54329",
+      configPath: path.join(home, "instances", "alice", "config.json"),
+      envPath: path.join(home, "instances", "alice", ".env"),
+    });
+    expect(target.mode === "postgres" ? target.connectionString : "").not.toContain("other.example.com");
+  });
+
+  it("reads the named instance's own connection string and env file", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-db-home-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-db-cwd-"));
+    process.chdir(cwd);
+    process.env.PAPERCLIP_HOME = home;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.DATABASE_URL = "postgres://shell-user@shell.example.com:5432/paperclip";
+    const aliceRoot = path.join(home, "instances", "alice");
+    writeJson(path.join(aliceRoot, "config.json"), {
+      database: { mode: "postgres", connectionString: "postgres://alice@alice.example.com:5432/paperclip" },
+    });
+    writeText(path.join(aliceRoot, ".env"), "DATABASE_URL=postgres://alice-env@alice-env.example.com:5432/paperclip\n");
+
+    // The instance's env file outranks its config.json, and both outrank the
+    // shell.
+    expect(resolveDatabaseTarget({ instanceId: "alice" })).toMatchObject({
+      mode: "postgres",
+      connectionString: "postgres://alice-env@alice-env.example.com:5432/paperclip",
+      source: "paperclip-env",
+    });
+    // A different instance on the same home is unaffected by alice's files.
+    expect(resolveDatabaseTarget({ instanceId: "bob" })).toMatchObject({
+      mode: "embedded-postgres",
+      source: "embedded-postgres@54329",
+    });
+  });
+
+  it("keeps the server's own resolution unchanged when no instance is named", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-db-home-"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-db-cwd-"));
+    process.chdir(cwd);
+    process.env.PAPERCLIP_HOME = home;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.DATABASE_URL = "postgres://server-user@server.example.com:5432/paperclip";
+
+    // The server's environment is its own; the precedence the server relies on
+    // must not change because the CLI now asks for an instance-scoped answer.
+    expect(resolveDatabaseTarget()).toMatchObject({
+      mode: "postgres",
+      connectionString: "postgres://server-user@server.example.com:5432/paperclip",
+      source: "DATABASE_URL",
+    });
+  });
 });

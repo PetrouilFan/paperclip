@@ -437,6 +437,55 @@ describe("installed unit parsing", () => {
     expect(calls).toContain("systemctl --user daemon-reload");
   });
 
+  it("reads a bare ExecStart target whose path contains an escaped space", () => {
+    // systemd reads `\ ` as a space inside the word. Reading only up to the
+    // backslash reports `/tmp/My\`, which is not a runnable target, so the
+    // repair is refused for a unit that works.
+    expect(
+      extractExecutableFromSystemdUnit(
+        "[Service]\nExecStart=/tmp/My\\ Apps/bin/paperclipai run --instance default\n",
+      ),
+    ).toBe("/tmp/My Apps/bin/paperclipai");
+    // An escaped backslash is a literal backslash, and the space after it does
+    // end the word -- the same way systemd splits it.
+    expect(extractExecutableFromSystemdUnit("[Service]\nExecStart=/opt/od\\\\ d/paperclipai run\n")).toBe(
+      "/opt/od\\",
+    );
+  });
+
+  it("keeps an installed target with an escaped space when the preferred shim is missing", async () => {
+    const userHome = await temporaryDirectory();
+    const spacedDir = path.join(userHome, "My Apps", "bin");
+    await fs.mkdir(spacedDir, { recursive: true });
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      return { stdout: "", stderr: "" };
+    };
+    const installedTarget = path.join(spacedDir, "paperclipai");
+    await writeExecutable(installedTarget);
+    const manager = new SystemdServiceManager(
+      "default",
+      runner,
+      path.join(userHome, ".paperclip"),
+      path.join(userHome, ".local/bin/paperclipai"),
+      userHome,
+    );
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    // Hand-written, unquoted, with the space escaped the way systemd wants it.
+    await fs.writeFile(
+      manager.definitionPath,
+      `[Service]\nExecStart=${installedTarget.replace(/ /g, "\\ ")} run --instance "default"\n`,
+      "utf8",
+    );
+
+    await manager.restart();
+
+    const written = await fs.readFile(manager.definitionPath, "utf8");
+    expect(written).toContain(`ExecStart="${installedTarget}"`);
+    expect(calls).toContain("systemctl --user daemon-reload");
+  });
+
   it("keeps an operator Environment value that contains an escaped space", () => {
     const rendered = renderSystemdUnit({ instanceId: "default", shimPath: "/s/paperclipai", homeDir: "/h" });
     const installed = rendered.replace(
@@ -459,6 +508,43 @@ describe("installed unit parsing", () => {
 
     expect(written).toMatch(/^Environment=$/m);
     expect(preserveEnvironmentLines(installed, written)).toBe(written);
+  });
+
+  it("places an Environment reset above the renderer's managed keys", () => {
+    const rendered = renderSystemdUnit({ instanceId: "default", shimPath: "/s/paperclipai", homeDir: "/h" });
+    const installed = rendered.replace("WorkingDirectory=%h", "Environment=\nWorkingDirectory=%h");
+
+    const lines = preserveEnvironmentLines(installed, rendered).split("\n");
+
+    // `Environment=` clears everything set so far. Carried below the renderer's
+    // own keys it would clear PAPERCLIP_SERVICE_MANAGED, PAPERCLIP_INSTANCE_ID
+    // and PAPERCLIP_HOME, and the service would stop being a managed one.
+    const resetAt = lines.findIndex((line) => line.trim() === "Environment=");
+    const managedAt = lines.findIndex((line) => line.startsWith('Environment="PAPERCLIP_SERVICE_MANAGED'));
+    expect(resetAt).toBeGreaterThanOrEqual(0);
+    expect(managedAt).toBeGreaterThanOrEqual(0);
+    expect(resetAt).toBeLessThan(managedAt);
+    // And the managed keys survive intact and contiguous after it.
+    expect(lines.filter((line) => line.startsWith('Environment="PAPERCLIP_')).length).toBe(3);
+    expect(preserveEnvironmentLines(installed, lines.join("\n"))).toBe(lines.join("\n"));
+  });
+
+  it("puts the operator's reset above the managed keys and their assignments below", () => {
+    const rendered = renderSystemdUnit({ instanceId: "default", shimPath: "/s/paperclipai", homeDir: "/h" });
+    const installed = rendered
+      .replace("WorkingDirectory=%h", "Environment=\nWorkingDirectory=%h")
+      .replace("WorkingDirectory=%h", "Environment=PATH=/opt/bin:/usr/bin\nEnvironment=FOO=bar\nWorkingDirectory=%h");
+
+    const lines = preserveEnvironmentLines(installed, rendered).split("\n");
+
+    const resetAt = lines.findIndex((line) => line.trim() === "Environment=");
+    const managedAt = lines.findIndex((line) => line.startsWith('Environment="PAPERCLIP_SERVICE_MANAGED'));
+    const carriedAt = lines.findIndex((line) => line.startsWith("Environment=PATH="));
+    expect(resetAt).toBeGreaterThanOrEqual(0);
+    expect(resetAt).toBeLessThan(managedAt);
+    expect(carriedAt).toBeGreaterThan(managedAt);
+    // The operator's own relative order is kept on both sides.
+    expect(lines.indexOf("Environment=PATH=/opt/bin:/usr/bin")).toBeLessThan(lines.indexOf("Environment=FOO=bar"));
   });
 });
 

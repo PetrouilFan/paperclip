@@ -125,23 +125,29 @@ export async function withHotRestartLock<T>(
 
 /**
  * The preflight set only means something when it is read from the database
- * the running server opened. `resolveDatabaseTarget()` is the resolution the
- * server itself uses (`DATABASE_URL`, the paperclip env file, the configured
- * connection string, then the embedded port); rebuilding the URL from
- * `config.json` alone can probe a database the server never touched and file
- * another instance's runs under this restart.
+ * the running server opened. For the server, its own environment is the
+ * resolution (`DATABASE_URL`, the paperclip env file, the configured
+ * connection string, then the embedded port).
+ *
+ * The CLI has a different environment -- the operator's shell. An ambient
+ * `DATABASE_URL` there names whatever database the operator last exported, not
+ * necessarily the one the instance being restarted is using, and the intent it
+ * writes alongside the preflight set would then file another instance's runs
+ * under this restart, or report a set the server cannot reconcile. So resolve
+ * against the selected instance's own configuration and env file, and never
+ * the shell override.
  */
-async function resolveDatabaseUrl(): Promise<string> {
+async function resolveDatabaseUrl(instanceId: string): Promise<string> {
   const { resolveDatabaseTarget } = await import("@paperclipai/db");
-  const target = resolveDatabaseTarget();
+  const target = resolveDatabaseTarget({ instanceId });
   if (target.mode === "postgres") return target.connectionString;
   return `postgres://paperclip:paperclip@127.0.0.1:${target.port}/paperclip`;
 }
 
-async function queryPreflightActiveRunIds(): Promise<string[]> {
+async function queryPreflightActiveRunIds(instanceId: string): Promise<string[]> {
   const { createDb, heartbeatRuns } = await import("@paperclipai/db");
   const { eq } = await import("drizzle-orm");
-  const db = createDb(await resolveDatabaseUrl());
+  const db = createDb(await resolveDatabaseUrl(instanceId));
   try {
     const rows = await db.select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
@@ -160,10 +166,13 @@ async function queryPreflightActiveRunIds(): Promise<string[]> {
  * silently recording `[]`.
  */
 export async function readPreflightActiveRunIds(
-  options: { query?: () => Promise<string[]> } = {},
+  options: { instanceId?: string; query?: () => Promise<string[]> } = {},
 ): Promise<string[]> {
+  // Resolved here so the default query and the intent file always name the same
+  // instance, even when the caller only passed `--instance`.
+  const instanceId = resolvePaperclipInstanceId(options.instanceId);
   try {
-    return await (options.query ?? queryPreflightActiveRunIds)();
+    return await (options.query ?? (() => queryPreflightActiveRunIds(instanceId)))();
   } catch (error) {
     throw new Error(
       "Refusing to restart: could not record the preflight active-run set for the hot-restart intent "
@@ -181,7 +190,9 @@ export async function writeHotRestartIntent(
 ): Promise<{ requestedAt: string; preflightActiveRunIds: string[] }> {
   if (!status.pid) throw new Error(`Cannot restart ${status.serviceName}: supervisor did not report a server pid.`);
   const health = await (options.probe ?? probeHealth)(instanceId);
-  const preflightActiveRunIds = drainRequired ? [] : await readPreflightActiveRunIds(options);
+  const preflightActiveRunIds = drainRequired
+    ? []
+    : await readPreflightActiveRunIds({ ...options, instanceId });
   const instanceRoot = resolvePaperclipInstanceRoot(instanceId);
   const requestedAt = new Date().toISOString();
   await fs.mkdir(instanceRoot, { recursive: true });

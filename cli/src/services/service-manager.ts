@@ -87,10 +87,21 @@ export function resolveServiceShimPath(homeDir = os.homedir()): string {
 
 // The installed definition, not the current environment, is the truth
 // about what the service executes: PAPERCLIP_SHIM_PATH may have changed
-// or been unset since the definition was written.
+// or been unset since the definition was written. A backslash escape is
+// part of a systemd word, so `\ ` is a space inside the path and not the
+// end of it: an unescaped `\` that systemd would honour cannot be read as
+// a literal one, or the path is misreported and the repair is refused.
 function unescapeSystemd(value: string): string {
-  return value.replace(/\\\\|\\"|\$\$|%%/g, (m) =>
-    m === "\\\\" ? "\\" : m === '\\"' ? '"' : m === "$$" ? "$" : "%",
+  return value.replace(/\\\\|\\"|\\ |\$\$|%%/g, (m) =>
+    m === "\\\\"
+      ? "\\"
+      : m === '\\"'
+        ? '"'
+        : m === "\\ "
+          ? " "
+          : m === "$$"
+            ? "$"
+            : "%",
   );
 }
 
@@ -107,7 +118,12 @@ export function extractExecutableFromSystemdUnit(content: string): string | null
   // target look absent, which turns a safe rewrite into a refusal.
   const quoted = content.match(/^ExecStart="((?:\\.|[^"\\])*)"/m);
   if (quoted) return unescapeSystemd(quoted[1]);
-  const bare = content.match(/^ExecStart=(\S+)/m);
+  // The same escape-aware word shape systemd parses: a backslash escapes the
+  // next character, so `ExecStart=/tmp/My\ Apps/bin/paperclipai` is one word.
+  // `\S+` stops at the escaped space and reports `/tmp/My\`, which makes a
+  // runnable installed target look missing and turns a safe rewrite into a
+  // refusal.
+  const bare = content.match(/^ExecStart=((?:\\.|[^\s\\])+)/m);
   return bare ? unescapeSystemd(bare[1]) : null;
 }
 
@@ -251,29 +267,37 @@ export function preserveEnvironmentLines(installedDefinition: string | null, ren
   if (!installedDefinition) return renderedDefinition;
   const renderedLines = renderedDefinition.split("\n");
   const seen = new Set(renderedLines.map((line) => line.trim()));
-  const preserved: string[] = [];
+  // `Environment=` is a reset directive, not an assignment: systemd clears the
+  // environment assembled so far. It has no KEY=VALUE to re-render, so the line
+  // itself has to survive the rewrite or the operator's reset is silently
+  // cancelled. It also only keeps its meaning *before* the renderer's own keys
+  // — carried after them, it clears PAPERCLIP_SERVICE_MANAGED,
+  // PAPERCLIP_INSTANCE_ID and PAPERCLIP_HOME and the service stops being a
+  // managed one. The two groups are therefore placed either side of the
+  // rendered block, each keeping the operator's relative order.
+  const resets: string[] = [];
+  const carried: string[] = [];
   for (const line of environmentLinesOfServiceSection(installedDefinition)) {
     const assignments = parseEnvironmentAssignments(line);
     const kept = assignments.filter((assignment) => !MANAGED_ENVIRONMENT_KEYS.has(assignment.key));
     if (assignments.length === 0) {
-      // `Environment=` is a directive, not an assignment: systemd clears the
-      // environment assembled so far. It has no KEY=VALUE to re-render, so the
-      // line itself has to survive the rewrite or the operator's reset is
-      // silently cancelled.
       if (seen.has(line)) continue;
       seen.add(line);
-      preserved.push(line);
+      resets.push(line);
       continue;
     }
     if (kept.length === 0) continue;
     const rendered = `Environment=${kept.map((assignment) => assignment.raw).join(" ")}`;
     if (seen.has(rendered)) continue;
     seen.add(rendered);
-    preserved.push(rendered);
+    carried.push(rendered);
   }
-  if (preserved.length === 0) return renderedDefinition;
+  if (resets.length === 0 && carried.length === 0) return renderedDefinition;
 
-  let anchor = -1;
+  // First and last `Environment=` of the rendered [Service] section; the
+  // renderer's own managed block is what they bracket.
+  let firstAnchor = -1;
+  let lastAnchor = -1;
   let inServiceSection = false;
   for (let index = 0; index < renderedLines.length; index += 1) {
     const section = renderedLines[index].match(/^\s*\[([^\]]+)\]\s*$/);
@@ -281,18 +305,27 @@ export function preserveEnvironmentLines(installedDefinition: string | null, ren
       inServiceSection = section[1] === "Service";
       continue;
     }
-    if (inServiceSection && /^\s*Environment\s*=/.test(renderedLines[index])) anchor = index;
+    if (inServiceSection && /^\s*Environment\s*=/.test(renderedLines[index])) {
+      if (firstAnchor < 0) firstAnchor = index;
+      lastAnchor = index;
+    }
   }
-  if (anchor < 0) {
+  if (firstAnchor < 0) {
+    // No rendered environment block to bracket; the [Service] header is the
+    // earliest legal place for either group.
     for (let index = 0; index < renderedLines.length; index += 1) {
       if (/^\s*\[Service\]\s*$/.test(renderedLines[index])) {
-        anchor = index;
+        firstAnchor = index;
+        lastAnchor = index;
         break;
       }
     }
   }
-  if (anchor < 0) return renderedDefinition;
-  return [...renderedLines.slice(0, anchor + 1), ...preserved, ...renderedLines.slice(anchor + 1)].join("\n");
+  if (firstAnchor < 0) return renderedDefinition;
+  const head = firstAnchor === lastAnchor ? renderedLines.slice(0, firstAnchor + 1) : renderedLines.slice(0, firstAnchor);
+  const managedBlock = firstAnchor === lastAnchor ? [] : renderedLines.slice(firstAnchor, lastAnchor + 1);
+  const tail = renderedLines.slice(lastAnchor + 1);
+  return [...head, ...resets, ...managedBlock, ...carried, ...tail].join("\n");
 }
 
 type LaunchdEnvironmentEntry = { key: string; value: string };
