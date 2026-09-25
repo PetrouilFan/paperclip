@@ -38,6 +38,16 @@ pass()  { RESULTS+=("PASS  $1"); printf '\033[1;32mPASS\033[0m %s\n' "$1"; }
 fail_() { RESULTS+=("FAIL  $1"); printf '\033[1;31mFAIL\033[0m %s\n' "$1"; FAILED=1; }
 skip_() { RESULTS+=("SKIP  $1${2:+ — $2}"); printf '\033[1;33mSKIP\033[0m %s%s\n' "$1" "${2:+ — $2}"; }
 
+summarize() {
+  note "RESULTS ($E2E_REPO@$E2E_REF on $(uname -sm))"
+  printf '%s\n' "${RESULTS[@]}"
+  if [ "$FAILED" = "1" ]; then echo; echo "OVERALL: FAIL"; exit 1; fi
+  echo; echo "OVERALL: PASS"
+}
+# fail_ and skip_ only record. A guard that needs to stop must say so, or the
+# script walks into the state the guard was written to prevent.
+abort_() { fail_ "$1" "${2:-}"; skip_ "$1" "${3:-aborted}"; summarize; }
+
 shim() { "$SHIM" "$@"; }
 current_target() { readlink "$STORE/current" 2>/dev/null || echo "<missing>"; }
 
@@ -178,7 +188,63 @@ else
     skip_ "8 service lifecycle" "no systemd user bus at /run/user/$(id -u)/bus"
   else
     note "8. service lifecycle ($(uname -s): systemd/launchd)"
+
+    # ISOHOME override: run the service lifecycle against an isolated home so
+    # the e2e scripts can never uninstall the host's live paperclipai.service.
+    # PET-52: e2e scripts must not address the real service in the real $HOME.
+    # NOTE: the mktemp template must not be quote-escaped. `\"` inside the
+    # substitution makes mktemp receive literal quote characters, it fails,
+    # SERVICE_ISOHOME ends up empty, and `export HOME=""` below would then
+    # defeat this very guard while the script kept going. abort_ stops the
+    # script there; fail_ + skip_ on their own only record, and the leg used to
+    # run on with HOME="" and XDG_CONFIG_HOME="/.config".
+    SERVICE_ISOHOME="$(mktemp -d "${TMPDIR:-/tmp}/e2e-service-iso.XXXXXX")" \
+      || abort_ "8 service lifecycle" "could not create isolated HOME" "mktemp failed"
+    if [ -z "$SERVICE_ISOHOME" ] || [ ! -d "$SERVICE_ISOHOME" ]; then
+      abort_ "8 service lifecycle" "isolated HOME was not created (got '${SERVICE_ISOHOME}')" "isolated HOME missing"
+    fi
+
+    # Preflight, BEFORE the override, so "the production service" unambiguously
+    # means the host's real one and not something the override just moved.
+    # This must skip the leg, not only record that it is skipping it: the
+    # override below reads SERVICE_ISOHOME, which this branch has just removed.
+    # `grep -qx`, not `grep -q`: `systemctl is-active` prints `inactive` for a
+    # stopped unit and that word contains the substring `active`, so a plain
+    # `grep -q active` calls every stopped host live and skips the leg always.
+    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
+      rm -rf "$SERVICE_ISOHOME"
+      abort_ "8 service lifecycle (PET-52 guard: host paperclipai.service is active)" \
+        "" "production service active on this host; service leg not run"
+    fi
+
+    # A distinct instance id is what actually makes the leg safe, and the HOME
+    # override alone is not. `systemctl --user <verb> <name>` addresses units the
+    # manager has already loaded; XDG_CONFIG_HOME only decides where *new* unit
+    # files are searched. Measured on a host with a live paperclipai.service:
+    # with HOME and XDG_CONFIG_HOME both pointed at an empty temp dir,
+    # `systemctl --user cat/is-active/show -p FragmentPath` still resolved the
+    # real unit under the real $HOME. So the override protects the unit *file*
+    # (SystemdServiceManager.uninstall deletes by path) but NOT the by-name
+    # stop/disable/reset-failed in the same uninstall, nor the smoke script's
+    # `systemctl --user stop paperclipai.service`.
+    # Giving the leg its own instance renames the unit to paperclipai-e2e.service,
+    # a name the host cannot have, which closes every verb by name and by path.
+    SERVICE_INSTANCE="e2e"
+    SERVICE_NAME="paperclipai-${SERVICE_INSTANCE}.service"
+    export PAPERCLIP_INSTANCE_ID="$SERVICE_INSTANCE"   # what `onboard` reads
+    echo "8 isolation: instance=$SERVICE_INSTANCE unit=$SERVICE_NAME home=$SERVICE_ISOHOME"
+
+    # Save the caller's environment; steps 9-10 run after this block and use $HOME.
+    REAL_HOME="$HOME"
+    REAL_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}"
+    export HOME="$SERVICE_ISOHOME"
+    export XDG_CONFIG_HOME="$SERVICE_ISOHOME/.config"
+    SERVICE_SHIM="$SERVICE_ISOHOME/.local/bin/paperclipai"
+
     # Real quickstart path: onboard with defaults, then install + start the service.
+    # Onboard runs through the REAL shim ($SHIM, an absolute path in the original
+    # $HOME, captured before the override) because $SERVICE_SHIM does not exist yet
+    # -- it is what this very step creates. Calling "$SERVICE_SHIM" here exits 127.
     if shim onboard --yes --install-service; then
       pass "8a onboard --yes --install-service exits 0"
     else
@@ -187,7 +253,7 @@ else
     DEADLINE=$(( $(date +%s) + E2E_SERVICE_TIMEOUT_SECS ))
     ACTIVE=0
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-      STATUS_JSON="$(shim service status --json 2>/dev/null || true)"
+      STATUS_JSON="$(SERVICE_SHIM service status --json --instance "$SERVICE_INSTANCE" 2>/dev/null || true)"
       if echo "$STATUS_JSON" | grep -q '"active"[[:space:]]*:[[:space:]]*true'; then ACTIVE=1; break; fi
       sleep 5
     done
@@ -195,12 +261,26 @@ else
       pass "8b service reached active within ${E2E_SERVICE_TIMEOUT_SECS}s"
     else
       echo "last status: ${STATUS_JSON:-<none>}"
-      shim service logs -n 60 || true
+      SERVICE_SHIM service logs -n 60 --instance "$SERVICE_INSTANCE" || true
       fail_ "8b service reached active"
     fi
-    shim service logs -n 20 >/dev/null 2>&1 && pass "8c service logs readable" || fail_ "8c service logs readable"
-    if shim service stop; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
-    if shim service uninstall; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
+    SERVICE_SHIM service logs -n 20 --instance "$SERVICE_INSTANCE" >/dev/null 2>&1 \
+      && pass "8c service logs readable" || fail_ "8c service logs readable"
+    if SERVICE_SHIM service stop --instance "$SERVICE_INSTANCE"; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
+    if SERVICE_SHIM service uninstall --instance "$SERVICE_INSTANCE"; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
+    # The leg must not have touched the production unit: it is still addressable
+    # by name and must still be stopped, because a name collision would be fatal.
+    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
+      fail_ "8f isolation held: host paperclipai.service never activated by this leg"
+    else
+      pass "8f isolation held: host paperclipai.service untouched"
+    fi
+
+    # Restore the caller's environment (do not unset: steps 9-10 use $HOME).
+    if [ -n "$REAL_XDG_CONFIG_HOME" ]; then export XDG_CONFIG_HOME="$REAL_XDG_CONFIG_HOME"; else unset XDG_CONFIG_HOME; fi
+    export HOME="$REAL_HOME"
+    unset PAPERCLIP_INSTANCE_ID
+    rm -rf "$SERVICE_ISOHOME"
   fi
 fi
 
@@ -225,7 +305,4 @@ fi
 [ ! -d "$STORE" ] && pass "10c managed store removed" || fail_ "10c managed store removed"
 [ -f "$HOME/.paperclip/e2e-user-data-marker" ] && pass "10d user data under ~/.paperclip preserved" || fail_ "10d user data preserved"
 
-note "RESULTS ($E2E_REPO@$E2E_REF on $(uname -sm))"
-printf '%s\n' "${RESULTS[@]}"
-if [ "$FAILED" = "1" ]; then echo; echo "OVERALL: FAIL"; exit 1; fi
-echo; echo "OVERALL: PASS"
+summarize
