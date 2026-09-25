@@ -9520,6 +9520,11 @@ export function heartbeatService(
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
   const runtimeEnv = options.runtimeEnv ?? process.env;
+  // Captured once in service scope: the run reaper's database guard needs it
+  // from teardown paths whose own `options` parameter is a per-call shape
+  // rather than the service options, so `options.instanceDatabaseDataDir` is
+  // not reachable there.
+  const instanceDatabaseDataDir = options.instanceDatabaseDataDir;
   const inWorktreeRuntime = isTruthyRuntimeEnvValue(
     runtimeEnv.PAPERCLIP_IN_WORKTREE,
   );
@@ -28953,6 +28958,16 @@ export function heartbeatService(
                 ),
               });
             }
+            // A cancel is a clean terminal path, so it must not leave a
+            // descendant behind either: terminating the direct child and its
+            // group does not reach a grandchild that escaped the group, and the
+            // clean-finish scratch removal does not run for a cancelled run.
+            await reapAndCleanRunResources({
+              db,
+              run,
+              processGroupId: running?.processGroupId ?? run.processGroupId,
+              databaseDataDir: instanceDatabaseDataDir,
+            });
             terminationSettled = true;
           } finally {
             if (
@@ -29160,6 +29175,15 @@ export function heartbeatService(
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
         }
+        // Same reason as the single-run cancel: the direct child and its group
+        // are not the whole tree, and a cancelled run skips the clean-finish
+        // scratch removal.
+        await reapAndCleanRunResources({
+          db,
+          run,
+          processGroupId: running?.processGroupId ?? run.processGroupId,
+          databaseDataDir: instanceDatabaseDataDir,
+        });
         runningProcesses.delete(run.id);
         await releaseIssueExecutionAndPromote(run);
       } finally {
