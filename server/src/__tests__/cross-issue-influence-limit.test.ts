@@ -333,4 +333,24 @@ describe("cross-issue influence limit rollout", () => {
     });
     expect(fake.inserted).toEqual([]);
   });
+
+  it("names the gate that failed so the next report is decisive", async () => {
+    const malformed = counterDb();
+    await expect(observeCrossIssueInfluence(malformed.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "attacker-controlled-run-id",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).rejects.toMatchObject({ details: { reason: "malformed_run_id" } });
+
+    const unknown = counterDb(0, null);
+    await expect(observeCrossIssueInfluence(unknown.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).rejects.toMatchObject({ details: { reason: "run_not_found" } });
+  });
 });
