@@ -86,6 +86,36 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
   });
 
+  it("does not tell a bound-but-unsourced run to resend the run header it already sent", () => {
+    // PET-156. The run id is already in the bearer token and the server already
+    // resolved it; what is missing is a source issue. Telling the agent to send
+    // the header is unfollowable and turns one correct refusal into a
+    // budget-burning retry loop.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "no_context_source_and_target_unbound",
+    });
+    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id header with your current run");
+    expect(copy.sanctionedPath).toContain("checkout");
+    expect(copy.title).toContain("no task to attribute");
+  });
+
+  it("keeps the run-header fix for the reasons where the run really is absent", () => {
+    for (const runContextReason of ["malformed_run_id", "run_not_found"] as const) {
+      const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+        runContextReason,
+      });
+      expect(copy.sanctionedPath).toContain("X-Paperclip-Run-Id");
+    }
+  });
+
+  it("treats a terminal run's stale binding as a source problem, not a missing run", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "terminal_status",
+    });
+    expect(copy.sanctionedPath).toContain("checkout");
+    expect(copy.sanctionedPath).not.toContain("with your current run");
+  });
+
   it("tells a spoof attempt that the write itself was fine", () => {
     const copy = describeIssueWriteDenial("issue_write_attribution_spoof_rejected", {
       actorLabel: "Fable",

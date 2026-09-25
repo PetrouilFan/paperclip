@@ -37,6 +37,29 @@ export const ISSUE_WRITE_DENIAL_CODES = [
 export type IssueWriteDenialCode = (typeof ISSUE_WRITE_DENIAL_CODES)[number];
 
 /**
+ * Which run-context gate refused the write.
+ *
+ * `run_not_found` / `malformed_run_id` mean the run itself is absent or
+ * unusable, so a run header is the actual fix. `no_context_source_and_target_unbound`
+ * and `terminal_status` mean the run was resolved fine — the server even recorded
+ * it as `createdByRunId` on accepted writes — and what is missing is a *source
+ * issue* to attribute the write to. Telling that case to send the run header is
+ * unfollowable: the header is already in the bearer token, so the advice
+ * converts one correct refusal into a budget-burning retry loop.
+ */
+export const CROSS_ISSUE_RUN_CONTEXT_REASONS = [
+  "malformed_run_id",
+  "run_not_found",
+  "terminal_status",
+  "no_context_source_and_target_unbound",
+] as const;
+
+export type CrossIssueRunContextReason = (typeof CROSS_ISSUE_RUN_CONTEXT_REASONS)[number];
+
+/** Reasons where the run header is genuinely the missing piece. */
+const RUN_HEADER_FIX_REASONS = new Set<CrossIssueRunContextReason>(["malformed_run_id", "run_not_found"]);
+
+/**
  * Why the write stopped, which drives icon + colour. `boundary` is an
  * authorization wall, `lock` is run-lifecycle machinery that will clear on its
  * own, `cap` is a rate backstop, and `attribution` is a rejected spoof.
@@ -75,6 +98,8 @@ export interface IssueWriteDenialContext {
   count?: number | null;
   /** ISO timestamp at which log-only rollout becomes enforcement. */
   enforceAt?: string | null;
+  /** Which run-context gate refused the write, for reason-aware copy. */
+  runContextReason?: CrossIssueRunContextReason | null;
 }
 
 export function isIssueWriteDenialCode(
@@ -245,6 +270,29 @@ export function describeIssueWriteDenial(
     }
 
     case "cross_issue_influence_run_context_required":
+      // Branch the advice on what actually failed. "Send the run header" is
+      // correct when the run itself is missing, and unfollowable when the run
+      // is already resolved and only the *source issue* is absent — the header
+      // is in the bearer token and the server already read it.
+      if (context.runContextReason && !RUN_HEADER_FIX_REASONS.has(context.runContextReason)) {
+        return {
+          code,
+          status: 403,
+          tone: "boundary",
+          boundary: "Heartbeat run context",
+          title: "This run has no task to attribute the write to",
+          description:
+            `The run itself is valid and attributed — the *source* is what is missing. ` +
+            `A cross-issue write must be charged to a task, and this run is bound to ` +
+            `none, so ${issue} could not be counted against the per-run budget.`,
+          whoCanAct: `${actor}, once the run is working on a task.`,
+          sanctionedPath:
+            `Check out the task this run is working on (\`POST /api/issues/<id>/checkout\`) ` +
+            `and post the comment there; a cross-issue write then counts against the ` +
+            `per-run cap like any other. Do not resend \`X-Paperclip-Run-Id\` — this run ` +
+            `already carried it.`,
+        };
+      }
       return {
         code,
         status: 403,

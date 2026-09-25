@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -31,6 +32,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -38,6 +40,138 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("resolves a context-less run's source from the issue-side binding", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const unboundRunId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const targetIssueId = randomUUID();
+    const unboundIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Timer Wake Coder",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // A `heartbeat_timer` run: no issue in its context, bound only by checkout.
+    // `unboundRunId` is a second context-less run that holds nothing at all.
+    await db.insert(heartbeatRuns).values([
+      {
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        responsibleUserId: "board-user",
+        contextSnapshot: {},
+      },
+      {
+        id: unboundRunId,
+        companyId,
+        agentId,
+        status: "running",
+        responsibleUserId: "board-user",
+        contextSnapshot: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      { id: sourceIssueId, companyId, title: "Checked out", identifier: "RUN-1", status: "in_progress", checkoutRunId: runId },
+      { id: targetIssueId, companyId, title: "Elsewhere", identifier: "RUN-2", status: "todo" },
+      { id: unboundIssueId, companyId, title: "Unrelated", identifier: "RUN-3", status: "todo" },
+    ]);
+
+    const base = {
+      companyId,
+      agentId,
+      kind: "comment" as const,
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    };
+
+    // Row 1: the run's own bound issue is exempt, exactly like a context source.
+    await expect(observeCrossIssueInfluence(db, { ...base, runId, targetIssueId: sourceIssueId }))
+      .resolves.toBeNull();
+
+    // Row 2: a write elsewhere now resolves a source and is charged to the cap.
+    const decision = await observeCrossIssueInfluence(db, { ...base, runId, targetIssueId });
+    expect(decision).toMatchObject({ allowed: true, count: 1 });
+
+    // Row 3: a run bound to nothing at all still fails closed. The run that
+    // checked an issue out (row 2) can write elsewhere within budget; a run
+    // with no binding anywhere has nothing to attribute the write to.
+    await expect(observeCrossIssueInfluence(db, {
+      ...base,
+      runId: unboundRunId,
+      targetIssueId: unboundIssueId,
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { reason: "no_context_source_and_target_unbound" },
+    });
+  });
+
+  it("ignores a terminal run's stale issue-side binding", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const staleIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Finished Coder",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      responsibleUserId: "board-user",
+      contextSnapshot: {},
+    });
+    // The stamp lingers on the issue row after the run finished.
+    await db.insert(issues).values({
+      id: staleIssueId,
+      companyId,
+      title: "Stale",
+      identifier: "STALE-1",
+      status: "todo",
+      checkoutRunId: runId,
+    });
+
+    await expect(observeCrossIssueInfluence(db, {
+      companyId,
+      runId,
+      agentId,
+      targetIssueId: staleIssueId,
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { reason: "terminal_status" },
+    });
   });
 
   it("allows exactly one of concurrent attempts 20 and 21", async () => {

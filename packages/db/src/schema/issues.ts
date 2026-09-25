@@ -119,6 +119,13 @@ export const issues = pgTable(
     originIdx: index("issues_company_origin_idx").on(table.companyId, table.originKind, table.originId),
     projectWorkspaceIdx: index("issues_company_project_workspace_idx").on(table.companyId, table.projectWorkspaceId),
     executionWorkspaceIdx: index("issues_company_execution_workspace_idx").on(table.companyId, table.executionWorkspaceId),
+    // The run-bound cross-issue-influence fallback resolves a run's source issue
+    // by asking which issues this run holds, so it reads these two columns
+    // outside the issues primary key. Without an index that read degrades to a
+    // scan of the company while the caller still holds the `for update` lock on
+    // its heartbeat_runs row.
+    checkoutRunIdx: index("issues_company_checkout_run_idx").on(table.companyId, table.checkoutRunId),
+    executionRunIdx: index("issues_company_execution_run_idx").on(table.companyId, table.executionRunId),
     dueMonitorIdx: index("issues_company_monitor_due_idx").on(table.companyId, table.monitorNextCheckAt),
     companyUpdatedIdx: index("issues_company_updated_idx").on(table.companyId, table.updatedAt),
     companyCreatedIdx: index("issues_company_created_idx").on(table.companyId, table.createdAt),

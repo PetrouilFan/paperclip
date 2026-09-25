@@ -1,12 +1,26 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, asc, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
+import type { CrossIssueRunContextReason } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
+
+/**
+ * A finished run's checkout/execution stamp can linger on the issue row until
+ * cleanup runs. Such a binding must not buy a *later* write an exemption, so
+ * the run-side fallback only trusts a run that is still live.
+ */
+const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+  "interrupted",
+]);
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
 const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap_rejected";
@@ -27,11 +41,17 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
-export function crossIssueInfluenceRunContextError() {
+export function crossIssueInfluenceRunContextError(
+  reason: CrossIssueRunContextReason = "run_not_found",
+) {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
-  // so the agent reading this 403 is told the fix, not just the refusal.
-  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
-  return forbidden(body.error, body.details);
+  // so the agent reading this 403 is told the fix, not just the refusal. The
+  // `reason` picks the advice: "send the run header" is correct when the run is
+  // missing, and unfollowable when only the source issue is missing.
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required", {
+    runContextReason: reason,
+  });
+  return forbidden(body.error, { ...body.details, reason });
 }
 
 function readRunSourceIssueId(contextSnapshot: unknown) {
@@ -82,7 +102,7 @@ export async function observeCrossIssueInfluence(
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
-  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
+  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError("malformed_run_id");
 
   return db.transaction(async (tx) => {
     const run = await tx
@@ -92,6 +112,7 @@ export async function observeCrossIssueInfluence(
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        status: heartbeatRuns.status,
       })
       .from(heartbeatRuns)
       .where(and(
@@ -106,16 +127,70 @@ export async function observeCrossIssueInfluence(
       run.companyId !== input.companyId ||
       run.agentId !== input.agentId
     ) {
-      throw crossIssueInfluenceRunContextError();
+      throw crossIssueInfluenceRunContextError("run_not_found");
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    const contextSourceIssueId = readRunSourceIssueId(run.contextSnapshot);
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      contextSourceIssueId &&
+      (contextSourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier &&
+          contextSourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
+    }
+
+    // The run's own source issue normally comes from its context snapshot, but
+    // `POST /checkout` stamps the run onto the *issue* (`checkout_run_id`) and
+    // never stamps the issue back onto the *run*. The binding was therefore
+    // one-directional: a run that checked out an issue on an ordinary
+    // `heartbeat_timer` wake (which is created with no issue in its context)
+    // held a real claim to that issue and still had no source, so it was refused
+    // everywhere — the same asymmetry behind the fleet-wide 403 reports.
+    //
+    // This fallback is deliberately scoped to runs whose context names NO source.
+    // A run that already has a source keeps master semantics: its own issue is
+    // exempt above and every other issue counts against the cap. Letting a
+    // mutable checkout stamp short-circuit a context-ful run would let it check
+    // out its way past the 20-write limit.
+    //
+    // Only a live run's binding counts. A stamp left behind by a terminal run
+    // must not exempt a later write.
+    let boundSourceIssueId: string | null = null;
+    let targetIsBound = false;
+    if (!contextSourceIssueId) {
+      if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+        throw crossIssueInfluenceRunContextError("terminal_status");
+      }
+      const boundIssues = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, input.companyId),
+          or(
+            eq(issues.checkoutRunId, input.runId),
+            eq(issues.executionRunId, input.runId),
+          ),
+        ))
+        // Deterministic pick: a run can legitimately hold more than one issue
+        // (the legacy execution-lock fallback stamps a sibling too), and the
+        // audit row must name the same source every time for the same state.
+        .orderBy(asc(issues.id))
+        .limit(2);
+      boundSourceIssueId = boundIssues[0]?.id ?? null;
+      // A run may always write to an issue it actually holds, so the target's
+      // own binding is checked before the cap rather than after it.
+      targetIsBound = boundIssues.some((row) => row.id === input.targetIssueId);
+    }
+
+    if (targetIsBound) return null;
+
+    // No context source and no binding anywhere: there is nothing to attribute
+    // the write to, so fail closed. This is the guard the fleet-wide reports
+    // exercised and it must keep refusing a run that is bound to nothing.
+    const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;
+    if (!sourceIssueId) {
+      throw crossIssueInfluenceRunContextError("no_context_source_and_target_unbound");
     }
 
     const priorCount = await tx
