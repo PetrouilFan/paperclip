@@ -194,24 +194,44 @@ else
       fail_ "8 service lifecycle" "isolated HOME was not created (got '${SERVICE_ISOHOME}')"
       skip_ "8 service lifecycle" "isolated HOME missing"
     fi
+
+    # Preflight, BEFORE the override, so "the production service" unambiguously
+    # means the host's real one and not something the override just moved.
+    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -q active; then
+      fail_ "8 service lifecycle (PET-52 guard: host paperclipai.service is active)"
+      rm -rf "$SERVICE_ISOHOME"
+      skip_ "8 service lifecycle" "production service active on this host"
+    fi
+
+    # A distinct instance id is what actually makes the leg safe, and the HOME
+    # override alone is not. `systemctl --user <verb> <name>` addresses units the
+    # manager has already loaded; XDG_CONFIG_HOME only decides where *new* unit
+    # files are searched. Measured on a host with a live paperclipai.service:
+    # with HOME and XDG_CONFIG_HOME both pointed at an empty temp dir,
+    # `systemctl --user cat/is-active/show -p FragmentPath` still resolved the
+    # real unit under the real $HOME. So the override protects the unit *file*
+    # (SystemdServiceManager.uninstall deletes by path) but NOT the by-name
+    # stop/disable/reset-failed in the same uninstall, nor the smoke script's
+    # `systemctl --user stop paperclipai.service`.
+    # Giving the leg its own instance renames the unit to paperclipai-e2e.service,
+    # a name the host cannot have, which closes every verb by name and by path.
+    SERVICE_INSTANCE="e2e"
+    SERVICE_NAME="paperclipai-${SERVICE_INSTANCE}.service"
+    export PAPERCLIP_INSTANCE_ID="$SERVICE_INSTANCE"   # what `onboard` reads
+    echo "8 isolation: instance=$SERVICE_INSTANCE unit=$SERVICE_NAME home=$SERVICE_ISOHOME"
+
+    # Save the caller's environment; steps 9-10 run after this block and use $HOME.
+    REAL_HOME="$HOME"
+    REAL_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}"
     export HOME="$SERVICE_ISOHOME"
     export XDG_CONFIG_HOME="$SERVICE_ISOHOME/.config"
     SERVICE_SHIM="$SERVICE_ISOHOME/.local/bin/paperclipai"
-    SERVICE_NAME="paperclipai-e2e.service"
-
-    # Preflight: refuse if the default production service is active on this host.
-    # Even with the HOME override, a naive script could still reach the real unit.
-    if systemctl --user cat paperclipai.service >/dev/null 2>&1 && \
-       systemctl --user is-active paperclipai.service 2>/dev/null | grep -q active; then
-      fail_ "8 service lifecycle skipped: default paperclipai.service is active on this host (PET-52 guard)"
-      unset HOME XDG_CONFIG_HOME
-      rm -rf "$SERVICE_ISOHOME"
-      skip_ "8 service lifecycle" "production service active"
-    fi
 
     # Real quickstart path: onboard with defaults, then install + start the service.
-    # Use SERVICE_SHIM and SERVICE_NAME from the ISO home context.
-    if "$SERVICE_SHIM" onboard --yes --install-service; then
+    # Onboard runs through the REAL shim ($SHIM, an absolute path in the original
+    # $HOME, captured before the override) because $SERVICE_SHIM does not exist yet
+    # -- it is what this very step creates. Calling "$SERVICE_SHIM" here exits 127.
+    if shim onboard --yes --install-service; then
       pass "8a onboard --yes --install-service exits 0"
     else
       fail_ "8a onboard --yes --install-service exits 0"
@@ -219,7 +239,7 @@ else
     DEADLINE=$(( $(date +%s) + E2E_SERVICE_TIMEOUT_SECS ))
     ACTIVE=0
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-      STATUS_JSON="$(SERVICE_SHIM service status --json 2>/dev/null || true)"
+      STATUS_JSON="$(SERVICE_SHIM service status --json --instance "$SERVICE_INSTANCE" 2>/dev/null || true)"
       if echo "$STATUS_JSON" | grep -q '"active"[[:space:]]*:[[:space:]]*true'; then ACTIVE=1; break; fi
       sleep 5
     done
@@ -227,15 +247,25 @@ else
       pass "8b service reached active within ${E2E_SERVICE_TIMEOUT_SECS}s"
     else
       echo "last status: ${STATUS_JSON:-<none>}"
-      SERVICE_SHIM service logs -n 60 || true
+      SERVICE_SHIM service logs -n 60 --instance "$SERVICE_INSTANCE" || true
       fail_ "8b service reached active"
     fi
-    SERVICE_SHIM service logs -n 20 >/dev/null 2>&1 && pass "8c service logs readable" || fail_ "8c service logs readable"
-    if SERVICE_SHIM service stop; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
-    if SERVICE_SHIM service uninstall; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
+    SERVICE_SHIM service logs -n 20 --instance "$SERVICE_INSTANCE" >/dev/null 2>&1 \
+      && pass "8c service logs readable" || fail_ "8c service logs readable"
+    if SERVICE_SHIM service stop --instance "$SERVICE_INSTANCE"; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
+    if SERVICE_SHIM service uninstall --instance "$SERVICE_INSTANCE"; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
+    # The leg must not have touched the production unit: it is still addressable
+    # by name and must still be stopped, because a name collision would be fatal.
+    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -q active; then
+      fail_ "8f isolation held: host paperclipai.service never activated by this leg"
+    else
+      pass "8f isolation held: host paperclipai.service untouched"
+    fi
 
-    # Restore the real HOME for subsequent steps.
-    unset HOME XDG_CONFIG_HOME
+    # Restore the caller's environment (do not unset: steps 9-10 use $HOME).
+    if [ -n "$REAL_XDG_CONFIG_HOME" ]; then export XDG_CONFIG_HOME="$REAL_XDG_CONFIG_HOME"; else unset XDG_CONFIG_HOME; fi
+    export HOME="$REAL_HOME"
+    unset PAPERCLIP_INSTANCE_ID
     rm -rf "$SERVICE_ISOHOME"
   fi
 fi
