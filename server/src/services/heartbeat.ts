@@ -539,6 +539,13 @@ import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
+  beginFinalizationStep,
+  beginRunFinalization,
+  clearRunFinalizationTimeline,
+  renewExecutionControlDeadline,
+  type FinalizationStepName,
+} from "./execution-finalization-timeline.js";
+import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
   shouldCancelRunsForNonInvokableAgent,
@@ -20197,6 +20204,28 @@ export function heartbeatService(
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
 
+    /**
+     * Run one post-provider finalization step under the per-step control budget.
+     *
+     * The step's duration lands in the run's finalization timeline, and the
+     * deadline is re-armed afterwards, so `reconcileAbandonedExecutionControl`
+     * judges this bounded sub-step instead of the whole chain. A step that never
+     * returns is the step the timeline reports as in flight, which is what makes
+     * the overrunning await identifiable from data rather than by inference.
+     */
+    const withFinalizationStep = async <T,>(
+      step: FinalizationStepName,
+      operation: () => Promise<T>,
+    ): Promise<T> => {
+      const endStep = beginFinalizationStep(runId, step);
+      try {
+        return await operation();
+      } finally {
+        endStep();
+        await renewExecutionControlDeadline(db, runId);
+      }
+    };
+
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
@@ -24563,22 +24592,38 @@ export function heartbeatService(
           // rather than silently leaving dependents stranded behind a missing
           // finalize row.
           if (nativeWorkspaceSync) {
-            await nativeWorkspaceSync.restoreWorkspace();
+            const endRestoreStep = beginFinalizationStep(run.id, "workspace_restore");
+            try {
+              await nativeWorkspaceSync.restoreWorkspace();
+            } finally {
+              endRestoreStep();
+            }
           }
-          await db
-            .update(heartbeatRuns)
-            .set({ executionControlDeadlineAt: new Date(Date.now() + 60_000) })
-            .where(
-              and(
-                eq(heartbeatRuns.id, run.id),
-                eq(heartbeatRuns.status, "running"),
-              ),
-            );
+          // The provider has returned. Start the finalization timeline and arm
+          // the per-step control budget. Every step below re-arms it, so the
+          // reconciliation sweep fires on a stuck sub-step rather than on a
+          // chain that is merely working through a long sequence of them.
+          beginRunFinalization(run.id, {
+            companyId: agent.companyId,
+            providerThrew: false,
+          });
+          await renewExecutionControlDeadline(db, run.id);
           const workspaceFinalizeStatus = hasWorkspaceRestoreFailure(adapterResult.resultJson) ? "failed" : "succeeded";
-          await recordWorkspaceFinalize(workspaceFinalizeStatus);
+          const endWorkspaceFinalizeStep = beginFinalizationStep(run.id, "workspace_finalize_record");
+          let workspaceFinalizeRecorded = false;
+          try {
+            await recordWorkspaceFinalize(workspaceFinalizeStatus);
+            workspaceFinalizeRecorded = true;
+          } finally {
+            endWorkspaceFinalizeStep();
+            if (workspaceFinalizeRecorded) {
+              await renewExecutionControlDeadline(db, run.id);
+            }
+          }
           if (adapterResult.nativeFinalization) {
             adapterResult.nativeFinalization.workspaceFinalizeStatus =
               workspaceFinalizeStatus;
+            const endNativeFinalizeStep = beginFinalizationStep(run.id, "native_finalize");
             try {
               const finalized = await finalizeNativeRun({
                 db,
@@ -24597,6 +24642,8 @@ export function heartbeatService(
                 { err: finalizeErr, runId: run.id },
                 "native result persisted but finalization did not apply; the reconciliation loop will retry",
               );
+            } finally {
+              endNativeFinalizeStep();
             }
           }
         } catch (adapterErr) {
@@ -24610,15 +24657,14 @@ export function heartbeatService(
             nativeOwnershipHeld = true;
             throw adapterErr;
           }
-          await db
-            .update(heartbeatRuns)
-            .set({ executionControlDeadlineAt: new Date(Date.now() + 60_000) })
-            .where(
-              and(
-                eq(heartbeatRuns.id, run.id),
-                eq(heartbeatRuns.status, "running"),
-              ),
-            );
+          // The provider threw. Same per-step budget and same timeline as the
+          // clean-return path, so a throw that unwinds a long chain is measured
+          // the same way.
+          beginRunFinalization(run.id, {
+            companyId: agent.companyId,
+            providerThrew: true,
+          });
+          await renewExecutionControlDeadline(db, run.id);
           if (
             issueRef &&
             context.resumeSessionGoalHeartbeat === true &&
@@ -24746,11 +24792,13 @@ export function heartbeatService(
           throw adapterErr;
         } finally {
           try {
-            await revokeHeartbeatRunGatewayTokens({
-              db,
-              companyId: agent.companyId,
-              runId: run.id,
-            });
+            await withFinalizationStep("gateway_token_revoke", () =>
+              revokeHeartbeatRunGatewayTokens({
+                db,
+                companyId: agent.companyId,
+                runId: run.id,
+              }),
+            );
           } catch (revokeErr) {
             logger.warn(
               { err: revokeErr, runId: run.id, companyId: agent.companyId },
@@ -24847,7 +24895,14 @@ export function heartbeatService(
         const processCancellation =
           processRunCancellationSettlements.get(run.id) ??
           failedProcessRunCancellations.get(run.id);
-        await processCancellation?.settled;
+        // `settled` has no timeout of its own, so it is measured explicitly: a
+        // cancellation that never settles must show up as this step, not as an
+        // anonymous gap in the timeline.
+        if (processCancellation) {
+          await withFinalizationStep("cancellation_settlement", () =>
+            processCancellation.settled,
+          );
+        }
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
@@ -24924,7 +24979,9 @@ export function heartbeatService(
           compressed: boolean;
         } | null = null;
         if (handle) {
-          logSummary = await runLogStore.finalize(handle);
+          logSummary = await withFinalizationStep("run_log_finalize", () =>
+            runLogStore.finalize(handle!),
+          );
         }
         const finalLogBytes = logSummary?.bytes;
         if (outputProgressState.pending && typeof finalLogBytes === "number") {
@@ -24934,7 +24991,9 @@ export function heartbeatService(
 
         if (providerTraceCapture) {
           try {
-            await traceStore.finalize(run.id, run.companyId);
+            await withFinalizationStep("provider_trace_finalize", () =>
+              traceStore.finalize(run.id, run.companyId),
+            );
             providerTraceFinalized = true;
           } catch (error) {
             logger.warn(
@@ -25050,10 +25109,14 @@ export function heartbeatService(
           logSha256: logSummary?.sha256,
           logCompressed: logSummary?.compressed ?? false,
         };
-        const persistedRunWrite = await setRunStatusIfRunning(
-          run.id,
-          status,
-          finalRunPatch,
+        const persistedRunWrite = await withFinalizationStep(
+          "terminal_status_write",
+          () =>
+            setRunStatusIfRunning(
+              run.id,
+              status,
+              finalRunPatch,
+            ),
         );
         let persistedRun: typeof heartbeatRuns.$inferSelect | null =
           persistedRunWrite.run;
@@ -25149,7 +25212,9 @@ export function heartbeatService(
             );
           }
           const livenessRun = finalizedRun;
-          await refreshContinuationSummaryForRun(livenessRun, agent);
+          await withFinalizationStep("continuation_summary", () =>
+            refreshContinuationSummaryForRun(livenessRun, agent),
+          );
           const skipRunIssueComment =
             parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
           let resolvedPresentationDecision: RunPresentationDecision | null =
@@ -25330,23 +25395,31 @@ export function heartbeatService(
               agent,
             );
           }
-          const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
-            livenessRun,
-            agent,
-            resolvedPresentationDecision,
+          const issueCommentPolicyResult = await withFinalizationStep(
+            "issue_comment_policy",
+            () =>
+              finalizeIssueCommentPolicy(
+                livenessRun,
+                agent,
+                resolvedPresentationDecision,
+              ),
           );
           const conversationSettled = await settleConversationTurn(db, livenessRun);
-          await releaseIssueExecutionAndPromote(livenessRun, {
-            suppressImmediateRecovery: conversationSettled ||
-              readNonEmptyString(
-                parseObject(livenessRun.contextSnapshot).goalControlRequestId,
-              ) !== null ||
-              parseObject(livenessRun.contextSnapshot)
-                .resumeSessionGoalHeartbeat === true,
-          });
+          await withFinalizationStep("issue_release", () =>
+            releaseIssueExecutionAndPromote(livenessRun, {
+              suppressImmediateRecovery: conversationSettled ||
+                readNonEmptyString(
+                  parseObject(livenessRun.contextSnapshot).goalControlRequestId,
+                ) !== null ||
+                parseObject(livenessRun.contextSnapshot)
+                  .resumeSessionGoalHeartbeat === true,
+            }),
+          );
           if (!conversationSettled) {
           await handleRunLivenessContinuation(livenessRun);
-          await handleIssueReviewPathDisposition(livenessRun);
+          await withFinalizationStep("review_disposition", () =>
+            handleIssueReviewPathDisposition(livenessRun),
+          );
           await handleSuccessfulRunHandoff(
             issueCommentPolicyResult.outcome === "retry_queued" ||
               issueCommentPolicyResult.outcome === "retry_exhausted"
@@ -25459,15 +25532,17 @@ export function heartbeatService(
             }
           }
         }
-        await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
-          keepIdleOnFailure:
-            outcome === "failed" &&
-            ((finalizedRun
-              ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
-              : runErrorCode === "provider_quota") ||
-              isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
-          wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-        });
+        await withFinalizationStep("agent_status", () =>
+          finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
+            keepIdleOnFailure:
+              outcome === "failed" &&
+              ((finalizedRun
+                ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
+                : runErrorCode === "provider_quota") ||
+                isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
+            wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          }),
+        );
       } catch (err) {
         if (err instanceof NativeControllerDetachedForRestartError) {
           nativeSessionResumeScheduled = true;
@@ -25633,7 +25708,9 @@ export function heartbeatService(
         } | null = null;
         if (handle) {
           try {
-            logSummary = await runLogStore.finalize(handle);
+            logSummary = await withFinalizationStep("run_log_finalize", () =>
+              runLogStore.finalize(handle!),
+            );
           } catch (finalizeErr) {
             logger.warn(
               { err: finalizeErr, runId },
@@ -25655,34 +25732,38 @@ export function heartbeatService(
         const stoppedDuringFailure = executionControl.controller.signal.aborted;
         const stopSnapshot = stoppedDuringFailure ? await getRun(run.id) : null;
         const failureOutcome = stoppedDuringFailure ? "cancelled" : "failed";
-        const failedRunWrite = await setRunStatusIfRunning(run.id, failureOutcome, {
-          error: message,
-          errorCode: stopSnapshot?.errorCode ?? failureErrorCode,
-          finishedAt: new Date(),
-          resultJson: mergeRunStopMetadataForAgent(agent, failureOutcome, {
-            errorCode: failureErrorCode,
-            errorMessage: message,
-            resultJson: {
-              ...parseObject(stopSnapshot?.resultJson),
-              ...(workspaceValidationFailure?.resultJson ??
-                configurationIncompleteFailure?.resultJson ??
-                {}),
-              ...(!legacyAdapterEntered && run.runtimeMode !== "native"
-                ? {
-                    executionRecovery: {
-                      kind: "bootstrap",
-                      providerWorkStarted: false,
-                    },
-                  }
-                : {}),
-            },
-          }),
-          stdoutExcerpt,
-          stderrExcerpt,
-          logBytes: logSummary?.bytes,
-          logSha256: logSummary?.sha256,
-          logCompressed: logSummary?.compressed ?? false,
-        });
+        const failedRunWrite = await withFinalizationStep(
+          "terminal_status_write",
+          () =>
+            setRunStatusIfRunning(run.id, failureOutcome, {
+              error: message,
+              errorCode: stopSnapshot?.errorCode ?? failureErrorCode,
+              finishedAt: new Date(),
+              resultJson: mergeRunStopMetadataForAgent(agent, failureOutcome, {
+                errorCode: failureErrorCode,
+                errorMessage: message,
+                resultJson: {
+                  ...parseObject(stopSnapshot?.resultJson),
+                  ...(workspaceValidationFailure?.resultJson ??
+                    configurationIncompleteFailure?.resultJson ??
+                    {}),
+                  ...(!legacyAdapterEntered && run.runtimeMode !== "native"
+                    ? {
+                        executionRecovery: {
+                          kind: "bootstrap",
+                          providerWorkStarted: false,
+                        },
+                      }
+                    : {}),
+                },
+              }),
+              stdoutExcerpt,
+              stderrExcerpt,
+              logBytes: logSummary?.bytes,
+              logSha256: logSummary?.sha256,
+              logCompressed: logSummary?.compressed ?? false,
+            }),
+        );
         if (
           !failedRunWrite.updated &&
           !(
@@ -25729,38 +25810,54 @@ export function heartbeatService(
               "failed to complete skill test run after heartbeat adapter failure",
             );
           }
-          await refreshContinuationSummaryForRun(livenessRun, agent);
+          // Each step below is measured and re-arms the control budget. The run
+          // is already terminal at this point, so the renewal is a no-op; the
+          // timing is what survives, and it is what names the slow step if the
+          // sweep and this chain ever race again.
+          await withFinalizationStep("continuation_summary", () =>
+            refreshContinuationSummaryForRun(livenessRun, agent),
+          );
           if (
             !isWorkspaceValidationFailedRun(livenessRun) &&
             !isConfigurationIncompleteFailedRun(livenessRun)
           ) {
-            await finalizeIssueCommentPolicy(livenessRun, agent);
+            await withFinalizationStep("issue_comment_policy", () =>
+              finalizeIssueCommentPolicy(livenessRun, agent),
+            );
           }
-          await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-            livenessRun,
-            agent,
+          await withFinalizationStep("interaction_retry", () =>
+            scheduleInteractionContinuationInfrastructureRetryIfEligible(
+              livenessRun,
+              agent,
+            ),
           );
-          await releaseIssueExecutionAndPromote(livenessRun, {
-            // Native recovery owns the original heartbeat run through
-            // exhaustion. Once its durable coordinator has classified a
-            // terminal failure, generic issue recovery must not create a
-            // replacement retryOfRunId chain for the same provider work.
-            suppressImmediateRecovery: nativeTerminalFailureCode !== null,
-          });
-          await handleIssueReviewPathDisposition(livenessRun);
+          await withFinalizationStep("issue_release", () =>
+            releaseIssueExecutionAndPromote(livenessRun, {
+              // Native recovery owns the original heartbeat run through
+              // exhaustion. Once its durable coordinator has classified a
+              // terminal failure, generic issue recovery must not create a
+              // replacement retryOfRunId chain for the same provider work.
+              suppressImmediateRecovery: nativeTerminalFailureCode !== null,
+            }),
+          );
+          await withFinalizationStep("review_disposition", () =>
+            handleIssueReviewPathDisposition(livenessRun),
+          );
 
-          await updateRuntimeState(
-            agent,
-            livenessRun,
-            {
-              exitCode: null,
-              signal: null,
-              timedOut: false,
-              errorMessage: message,
-            },
-            {
-              legacySessionId: runtimeForAdapter.sessionId,
-            },
+          await withFinalizationStep("runtime_state", () =>
+            updateRuntimeState(
+              agent,
+              livenessRun,
+              {
+                exitCode: null,
+                signal: null,
+                timedOut: false,
+                errorMessage: message,
+              },
+              {
+                legacySessionId: runtimeForAdapter.sessionId,
+              },
+            ),
           );
 
           if (
@@ -25791,12 +25888,14 @@ export function heartbeatService(
           }
         }
 
-        await finalizeAgentStatus(agent.id, "failed", message, {
-          wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-          keepIdleOnFailure:
-            Boolean(nonRetryablePreflightFailureCode(err)) ||
-            isWorkspaceSyncConflictFailure(message),
-        });
+        await withFinalizationStep("agent_status", () =>
+          finalizeAgentStatus(agent.id, "failed", message, {
+            wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+            keepIdleOnFailure:
+              Boolean(nonRetryablePreflightFailureCode(err)) ||
+              isWorkspaceSyncConflictFailure(message),
+          }),
+        );
       }
     } catch (outerErr) {
       if (
@@ -26067,7 +26166,9 @@ export function heartbeatService(
           !nativeSessionResumeScheduled
         ) {
           try {
-            await traceStore.finalize(run.id, run.companyId);
+            await withFinalizationStep("provider_trace_finalize", () =>
+              traceStore.finalize(run.id, run.companyId),
+            );
             providerTraceFinalized = true;
           } catch (traceFinalizeError) {
             logger.warn(
@@ -26145,15 +26246,20 @@ export function heartbeatService(
           isHeartbeatRunTerminalStatus(latestRun.status)
         ) {
           const scratchForCleanup = runScratch;
+          const scratchProcessGroupId = latestRun.processGroupId;
           let scratchCleanup: Awaited<
             ReturnType<typeof cleanupHeartbeatRunScratch>
           > | null = null;
           try {
-            scratchCleanup = await cleanupHeartbeatRunScratch({
-              scratch: scratchForCleanup,
-              processGroupId: latestRun.processGroupId,
-              isProcessGroupAlive,
-            });
+            scratchCleanup = await withFinalizationStep(
+              "run_scratch_cleanup",
+              () =>
+                cleanupHeartbeatRunScratch({
+                  scratch: scratchForCleanup,
+                  processGroupId: scratchProcessGroupId,
+                  isProcessGroupAlive,
+                }),
+            );
           } catch (scratchCleanupError) {
             logger.warn(
               {
@@ -26252,6 +26358,10 @@ export function heartbeatService(
         }
         await startNextQueuedRunForAgent(run.agentId);
       }
+      // The executor is done with this run. Drop the timeline so a later sweep
+      // cannot read a finished chain as a live one, and so the map cannot grow
+      // with one entry per run the process has ever executed.
+      clearRunFinalizationTimeline(runId);
     }
   }
 

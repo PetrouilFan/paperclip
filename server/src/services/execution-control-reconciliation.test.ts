@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, completionContracts, createDb, heartbeatRuns, issues, issueRecoveryActions, issueThreadInteractions, nativeRunResults, statusDecisions, workAssessments } from "@paperclipai/db";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { agents, companies, completionContracts, createDb, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, issueThreadInteractions, nativeRunResults, statusDecisions, workAssessments } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -16,7 +16,15 @@ vi.mock("../sentry.js", async () => {
   };
 });
 
-import { reconcileAbandonedExecutionControl } from "./execution-control-reconciliation.js";
+import { reconcileAbandonedExecutionControl, resolveProviderOwnership } from "./execution-control-reconciliation.js";
+import {
+  beginFinalizationStep,
+  beginRunFinalization,
+  clearRunFinalizationTimeline,
+  readRunFinalizationTimeline,
+  renewExecutionControlDeadline,
+  resetRunFinalizationTimelines,
+} from "./execution-finalization-timeline.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -34,7 +42,9 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     await tempDb?.cleanup();
   });
 
-  async function seedAbandonedRunFixture() {
+  async function seedAbandonedRunFixture(
+    overrides: Partial<typeof heartbeatRuns.$inferInsert> = {},
+  ) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -60,6 +70,7 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
       status: "running",
       executionControlDeadlineAt: pastDeadline,
       contextSnapshot: { issueId },
+      ...overrides,
     });
     await db.insert(issues).values({
       id: issueId,
@@ -119,6 +130,280 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     // guard applies and no second "failed" write happens.
     expect(result.surfaced).toBe(1);
     expect(mockCaptureRunFailure.mock.calls.slice(captureCallsBefore)).toHaveLength(0);
+  });
+
+  it("keeps a run's own errorCode when the deadline sweep fires", async () => {
+    // The regression this issue was filed for: a run that already recorded its
+    // own outcome must not be relabelled `execution_finalization_deadline_exceeded`
+    // with no trace of the former.
+    const { companyId, runId } = await seedAbandonedRunFixture({
+      errorCode: "adapter_failed",
+      error: "The provider exited with code 1",
+    });
+
+    await reconcileAbandonedExecutionControl(db);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("adapter_failed");
+    expect(run?.error).toContain("The provider exited with code 1");
+    // The deadline fact is still recorded, in resultJson and in the recovery
+    // action, so the sweep is not silently lost either.
+    const record = (run?.resultJson as Record<string, any> | null)
+      ?.executionFinalizationDeadline;
+    expect(record).toMatchObject({
+      code: "execution_finalization_deadline_exceeded",
+      originalErrorCode: "adapter_failed",
+    });
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.companyId, companyId));
+    expect(action?.evidence).toMatchObject({
+      originalErrorCode: "adapter_failed",
+      originalError: "The provider exited with code 1",
+    });
+  });
+
+  it("keeps the deadline code when the run recorded no outcome of its own", async () => {
+    const { runId } = await seedAbandonedRunFixture();
+
+    await reconcileAbandonedExecutionControl(db);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.errorCode).toBe("execution_finalization_deadline_exceeded");
+  });
+
+  it("keeps the instruction out of `error` and names the fault instead", async () => {
+    const { runId } = await seedAbandonedRunFixture();
+
+    await reconcileAbandonedExecutionControl(db);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.error).not.toBe(run?.nextAction);
+    expect(run?.error).toContain("abandoned mid-finalization");
+    expect(run?.nextAction).toContain("verify its provider has stopped");
+  });
+
+  it("names the finalization step that was in flight when the budget expired", async () => {
+    const { runId } = await seedAbandonedRunFixture();
+    beginRunFinalization(runId, { companyId: "unused", providerThrew: false });
+    // A step that completed, then one that never returns.
+    beginFinalizationStep(runId, "run_log_finalize")();
+    beginFinalizationStep(runId, "issue_release");
+
+    await reconcileAbandonedExecutionControl(db);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const record = (run?.resultJson as Record<string, any> | null)
+      ?.executionFinalizationDeadline;
+    expect(record).toMatchObject({
+      finalizationInFlight: true,
+      pendingFinalizationStep: "issue_release",
+    });
+    expect(record?.error).toBeUndefined();
+    expect(run?.error).toContain('"issue_release"');
+    clearRunFinalizationTimeline(runId);
+  });
+
+  it("records an abandoned run as having no live finalization chain", async () => {
+    const { runId } = await seedAbandonedRunFixture();
+
+    await reconcileAbandonedExecutionControl(db);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(
+      (run?.resultJson as Record<string, any> | null)
+        ?.executionFinalizationDeadline,
+    ).toMatchObject({
+      finalizationInFlight: false,
+      pendingFinalizationStep: null,
+    });
+  });
+
+  it("establishes provider ownership instead of leaving it unverified", async () => {
+    // A PID that is certainly not running.
+    const deadPid = 2 ** 22 - 1;
+    const { companyId, runId } = await seedAbandonedRunFixture({ processPid: deadPid });
+
+    await reconcileAbandonedExecutionControl(db);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.companyId, companyId));
+    expect(action?.evidence).toMatchObject({
+      providerOwnership: "stopped",
+      providerPid: deadPid,
+    });
+    expect((action?.evidence as Record<string, any>).providerOwnershipDetail).toContain(
+      "is gone from this host",
+    );
+  });
+
+  it("reports a live provider rather than claiming it stopped", async () => {
+    const { companyId, runId } = await seedAbandonedRunFixture({
+      processPid: process.pid,
+    });
+
+    await reconcileAbandonedExecutionControl(db);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.companyId, companyId));
+    expect(action?.evidence).toMatchObject({
+      providerOwnership: "still_running",
+      providerPid: process.pid,
+    });
+  });
+
+  it("does not guess ownership for a run that recorded no PID", async () => {
+    const { companyId, runId } = await seedAbandonedRunFixture();
+
+    await reconcileAbandonedExecutionControl(db);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.companyId, companyId));
+    expect(action?.evidence).toMatchObject({
+      providerOwnership: "not_recorded",
+      providerPid: null,
+    });
+  });
+});
+
+describeEmbeddedPostgres("resolveProviderOwnership", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("provider-ownership-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+  afterAll(async () => { await tempDb?.cleanup(); });
+
+  it("reports a remote lease provider as not inspectable rather than guessing", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Remote ownership", issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Remote worker", adapterType: "codex_local" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", processPid: process.pid });
+    await db.insert(environmentLeases).values({
+      id: randomUUID(),
+      companyId,
+      heartbeatRunId: runId,
+      provider: "daytona",
+    });
+
+    const finding = await resolveProviderOwnership(
+      db,
+      (
+        await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))
+      )[0]!,
+    );
+
+    expect(finding.ownership).toBe("remote_not_inspectable");
+    expect(finding.detail).toContain("daytona");
+  });
+});
+
+describeEmbeddedPostgres("renewExecutionControlDeadline", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("finalization-deadline-renewal-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+  afterAll(async () => { await tempDb?.cleanup(); });
+
+  async function seedRun(status: string) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Renewal",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "codex_local" });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status, executionControlDeadlineAt: null,
+    });
+    return { companyId, agentId, runId };
+  }
+
+  it("re-arms the budget for a still-running run", async () => {
+    const { runId } = await seedRun("running");
+    const before = new Date();
+    await renewExecutionControlDeadline(db, runId, { now: before });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.executionControlDeadlineAt).not.toBeNull();
+    expect(run!.executionControlDeadlineAt!.getTime()).toBeGreaterThanOrEqual(
+      before.getTime() + 60_000 - 1_000,
+    );
+  });
+
+  it("never resurrects a deadline on a run the sweep already terminalized", async () => {
+    // This is what makes it safe to call from the post-terminal chain: the
+    // renewal is guarded on status, so a run the sweep failed stays failed with
+    // a null deadline instead of being re-armed into a second sweep.
+    const { runId } = await seedRun("failed");
+    await renewExecutionControlDeadline(db, runId);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.executionControlDeadlineAt).toBeNull();
+  });
+
+  it("does not throw when the write fails, so a lost renewal cannot fail its step", async () => {
+    const { runId } = await seedRun("running");
+    const brokenDb = {
+      update: () => ({ set: () => ({ where: () => Promise.reject(new Error("connection lost")) }) }),
+    } as unknown as Parameters<typeof renewExecutionControlDeadline>[0];
+    await expect(renewExecutionControlDeadline(brokenDb, runId)).resolves.toBeUndefined();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+  });
+});
+
+describe("finalization timeline", () => {
+  beforeEach(() => resetRunFinalizationTimelines());
+  afterEach(() => resetRunFinalizationTimelines());
+
+  it("returns null for a run no chain owns, so absent is distinguishable from idle", () => {
+    expect(readRunFinalizationTimeline("no-such-run")).toBeNull();
+  });
+
+  it("reports the in-flight step and the elapsed time spent in it", () => {
+    const runId = randomUUID();
+    beginRunFinalization(runId, { companyId: randomUUID(), providerThrew: true });
+    beginFinalizationStep(runId, "terminal_status_write");
+    const view = readRunFinalizationTimeline(runId)!;
+    expect(view.providerThrew).toBe(true);
+    expect(view.pendingStep?.step).toBe("terminal_status_write");
+    expect(view.completedSteps).toHaveLength(0);
+  });
+
+  it("keeps completed step timings so the slow step is identifiable from data", () => {
+    const runId = randomUUID();
+    beginRunFinalization(runId, { companyId: randomUUID(), providerThrew: false });
+    beginFinalizationStep(runId, "continuation_summary")();
+    beginFinalizationStep(runId, "run_log_finalize")();
+    const view = readRunFinalizationTimeline(runId)!;
+    expect(view.completedSteps.map((step) => step.step)).toEqual([
+      "continuation_summary",
+      "run_log_finalize",
+    ]);
+    expect(view.slowestStepMs).toBeGreaterThanOrEqual(0);
+    expect(view.pendingStep).toBeNull();
+  });
+
+  it("clears on request and ignores an end callback for an untracked run", () => {
+    const runId = randomUUID();
+    expect(() => beginFinalizationStep("untracked", "agent_status")()).not.toThrow();
+    beginRunFinalization(runId, { companyId: randomUUID(), providerThrew: false });
+    clearRunFinalizationTimeline(runId);
+    expect(readRunFinalizationTimeline(runId)).toBeNull();
   });
 });
 
