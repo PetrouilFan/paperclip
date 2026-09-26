@@ -31,6 +31,12 @@ import path from "node:path";
  * that this process be the parent: a reparented postmaster has no surviving
  * `paperclipai run` ancestor, while a split instance's postmaster is still
  * parented to the other server.
+ *
+ * That same distinction is what the startup refusal is built on, so the ancestry
+ * walk lives here rather than in the server entrypoint: `resolveLiveServerOwner`
+ * answers "is a *different* live `paperclipai run` server the parent of this
+ * database?", which is the one fact that separates a supported recovery from a
+ * split instance.
  */
 
 /** Ancestor walk bound. The deepest real chain (init -> login -> scope -> tab ->
@@ -110,24 +116,153 @@ export function resolveInstanceDatabaseGuard(
   }
   if (!isPidRunning(postmasterPid)) return null;
 
-  const protectedPids = [postmasterPid];
-  const seen = new Set(protectedPids);
-  let current = postmasterPid;
+  const protectedPids = [postmasterPid, ...readProcessAncestry(postmasterPid)];
+
+  return { postmasterPid, protectedPids };
+}
+
+/**
+ * The live ancestors of `pid`, nearest parent first.
+ *
+ * pid 1 (init) has ppid 0, which `readParentPid` reports as null, so the walk
+ * stops there and never grows to cover unrelated system processes. A `seen` set
+ * bounds a kernel-level cycle as well as the depth bound.
+ */
+export function readProcessAncestry(pid: number): number[] {
+  const ancestors: number[] = [];
+  const seen = new Set<number>([pid]);
+  let current = pid;
   for (let depth = 0; depth < MAX_ANCESTOR_DEPTH; depth += 1) {
     const parent = readParentPid(current);
-    // pid 1 (init) has ppid 0, which readParentPid reports as null. Stop there
-    // so the guard never grows to cover unrelated system processes.
     if (parent === null || seen.has(parent)) break;
-    protectedPids.push(parent);
+    ancestors.push(parent);
     seen.add(parent);
     current = parent;
   }
+  return ancestors;
+}
 
-  return { postmasterPid, protectedPids };
+/**
+ * The `paperclipai` bin however it was reached: the shim itself, or a `.js`
+ * entrypoint behind a node wrapper (`node /usr/local/bin/paperclipai run`).
+ * A development checkout is launched as `node <checkout>/server/dist/index.js
+ * run`, so the name can also appear as a path segment rather than a basename.
+ */
+const PAPERCLIP_BIN_PATTERN = /^paperclipai(\.(c|m)?js)?$/;
+
+function isPaperclipBinToken(token: string): boolean {
+  return token.split(/[\\/]/).some((segment) => PAPERCLIP_BIN_PATTERN.test(segment));
+}
+
+/**
+ * Is this argv a `paperclipai run` server?
+ *
+ * `run` is the only subcommand that serves, and it has to be the token
+ * immediately after the binary: `paperclipai doctor` and
+ * `paperclipai heartbeat run` are utilities that exit, and an agent process
+ * whose argv merely mentions the bin is not a server either.
+ *
+ * The first bin token decides the answer, so a later mention (a flag value, a
+ * path in an argument) cannot promote a process into a server. Both failure
+ * directions of a miss are asymmetric on purpose: a false positive refuses a
+ * legitimate startup, while a false negative leaves the pre-existing adopt
+ * behaviour in place, so the matcher errs towards the second.
+ *
+ * One shape is deliberately not recognised: the development runner launches the
+ * server through `tsx scripts/dev-runner.ts`, which never puts a bin name and a
+ * `run` in one argv. A dev server therefore never refuses a database, and a
+ * stray `paperclipai run` can still borrow one. That is the safe direction to
+ * miss in -- a dev host is a developer's own -- and closing it would mean
+ * pattern-matching on a dev script's internals.
+ */
+export function isPaperclipServerArgv(argv: readonly string[]): boolean {
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]!.trim();
+    if (!token) continue;
+    if (!isPaperclipBinToken(token)) continue;
+    return (argv[index + 1] ?? "").trim() === "run";
+  }
+  return false;
+}
+
+/** `/proc/<pid>/cmdline` as argv, or null when it cannot be read. */
+export function readProcessArgv(pid: number): string[] | null {
+  try {
+    const argv = fsSync
+      .readFileSync(`/proc/${pid}/cmdline`, "utf8")
+      .split("\0")
+      .filter((entry) => entry.length > 0);
+    return argv.length > 0 ? argv : null;
+  } catch {
+    // ESRCH (exited) and EACCES (not ours) both mean "cannot claim it".
+    return null;
+  }
+}
+
+/**
+ * The cgroup path of `pid`, for the operator to find the owning unit.
+ * `/proc/<pid>/cgroup` rows are `hierarchy-ID:controller-list:cgroup-path`; the
+ * unified hierarchy leaves the controller list empty.
+ */
+export function readProcessCgroup(pid: number): string | null {
+  let raw: string;
+  try {
+    raw = fsSync.readFileSync(`/proc/${pid}/cgroup`, "utf8");
+  } catch {
+    return null;
+  }
+  for (const line of raw.split("\n")) {
+    const cgroupPath = line.trim().split(":")[2]?.trim();
+    if (cgroupPath) return cgroupPath;
+  }
+  return null;
+}
+
+/** A live `paperclipai run` server found in a postmaster's ancestry. */
+export interface LiveServerProcess {
+  pid: number;
+  /** cgroup path, so the operator can find the unit or terminal that owns it. */
+  cgroup: string | null;
+  /** The full argv, so the operator can recognise the process. */
+  cmdline: string;
+}
+
+/**
+ * The live `paperclipai run` server that owns `postmasterPid`, or null when
+ * there is none.
+ *
+ * Ancestry is the whole test, and it is the distinction the recovery path turns
+ * on:
+ *
+ *  - A split instance's postmaster is a direct child of the *other* server, so
+ *    that server is in its ancestry and this returns it.
+ *  - A postmaster reparented to `systemd --user` after an unclean kill has no
+ *    surviving `paperclipai run` ancestor, so this returns null and the caller
+ *    keeps the supported reclaim behaviour.
+ *
+ * `selfPid` is this process, which is a legitimate owner whenever it started
+ * the postmaster itself and must never be reported as a collision.
+ */
+export function resolveLiveServerOwner(
+  postmasterPid: number,
+  options: { selfPid?: number } = {},
+): LiveServerProcess | null {
+  if (!Number.isInteger(postmasterPid) || postmasterPid <= 0) return null;
+  const selfPid = options.selfPid ?? process.pid;
+  for (const pid of readProcessAncestry(postmasterPid)) {
+    if (pid === selfPid) continue;
+    if (!isPidRunning(pid)) continue;
+    const argv = readProcessArgv(pid);
+    if (!argv || !isPaperclipServerArgv(argv)) continue;
+    return { pid, cgroup: readProcessCgroup(pid), cmdline: argv.join(" ") };
+  }
+  return null;
 }
 
 export const __testing = {
   readParentPid,
   isPidRunning,
+  readProcessArgv,
+  readProcessCgroup,
   MAX_ANCESTOR_DEPTH,
 };

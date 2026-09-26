@@ -8,6 +8,8 @@ import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";
 import { verifyStoppedNativeSessionForReplacement } from "./services/native-runtime/native-session-executor.js";
 import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
+import { decideEmbeddedPostgresReuse } from "./embedded-postgres-ownership.js";
+import { findListeningPortOwnerPid } from "./listening-port-owner.js";
 import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
@@ -514,6 +516,24 @@ async function startServerWithDatabaseTeardown(
     const runningPid = getRunningPid();
     if (runningPid) {
       port = embeddedPostgresOwnerPort(readFileSync(postmasterPidFile, "utf8"), dataDir, runningPid);
+      // Before dialling the running database: if a different live server owns
+      // it, this process is a split instance and must not become a second
+      // client of someone else's data directory, whatever the pid file says.
+      // A reparented orphan has no `paperclipai run` ancestor and falls through
+      // to the reclaim path below, which is the documented recovery.
+      const reuse = decideEmbeddedPostgresReuse({ dataDir, postmasterPid: runningPid, port });
+      if (reuse.action === "refuse") {
+        logger.error(
+          {
+            dataDir,
+            postmasterPid: runningPid,
+            port,
+            owner: reuse.liveServerOwner,
+          },
+          "Refusing to reuse the embedded PostgreSQL: a different live Paperclip server owns it",
+        );
+        throw new Error(reuse.message);
+      }
       const actualDataDir = await getPostgresDataDirectory(`postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`);
       if (typeof actualDataDir !== "string" || resolve(actualDataDir) !== resolve(dataDir)) {
         throw new Error("Refusing to reuse PostgreSQL: its data directory belongs to another instance.");
@@ -936,7 +956,15 @@ async function startServerWithDatabaseTeardown(
   server.headersTimeout = 186000;
   
   if (listenPort !== requestedListenPort) {
-    logger.warn(`Requested port is busy; using next free port (requestedPort=${requestedListenPort}, selectedPort=${listenPort})`);
+    // Still a WARN, because moving to a free port is recoverable and two
+    // instances with two data directories is a supported layout. It is not
+    // silent, though: the owning pid is what turns "which process took my
+    // port" into a one-line answer. A borrowed database never reaches here --
+    // the refusal above is fatal while the listen port is still undecided.
+    const portOwnerPid = findListeningPortOwnerPid(requestedListenPort);
+    logger.warn(
+      `Requested port is busy; using next free port (requestedPort=${requestedListenPort}, selectedPort=${listenPort}, ownerPid=${portOwnerPid ?? "unknown"})`,
+    );
   }
   
   const runtimeListenHost = config.host;

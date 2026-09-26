@@ -680,6 +680,40 @@ PAPERCLIP_HOME=/custom/path PAPERCLIP_INSTANCE_ID=dev pnpm paperclipai run
 
 No Docker or external database is required for this mode.
 
+### Reclaiming a running embedded database
+
+An instance's data directory is owned by one server at a time, and startup
+decides which case it is by walking the running postmaster's ancestors rather
+than by asking whether the postmaster is this process's own child:
+
+- **No live postmaster** — start one.
+- **Live postmaster, no live `paperclipai run` above it** — adopt it. This is the
+  supported recovery: when a server is killed without stopping the database, the
+  postmaster is reparented to `systemd --user` and the next server legitimately
+  reclaims it. Startup logs one `WARN`.
+- **Live postmaster with a different live `paperclipai run` above it** — refuse
+  to start, and log an `ERROR` naming the owning pid, that process's cgroup,
+  and the port the database is serving on. Adopting here is what turns a second
+  `paperclipai run` into a second instance with no database of its own, whose
+  availability depends on a process somebody left open in a terminal tab.
+
+The refusal is about the database, not the HTTP port. A busy requested port
+stays a `WARN` and the server moves to the next free one — that is recoverable,
+and two instances with two data directories is a supported layout — but the
+warning now names the pid holding the port. A borrowed database is never
+downgraded to a port move, because the refusal happens before the listen port is
+chosen.
+
+Two instances on one host are fine as long as they use different instances:
+
+```sh
+PAPERCLIP_INSTANCE_ID=default paperclipai run   # port 3100, db/ under the default root
+PAPERCLIP_INSTANCE_ID=dev paperclipai run       # port 3101, its own db/
+```
+
+If startup reports a refusal, stop the process named in the error, or start this
+server against a different instance.
+
 ## Storage in Dev (Auto-Handled)
 
 For local development, the default storage provider is `local_disk`, which persists uploaded images/attachments at:
