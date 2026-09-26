@@ -200,7 +200,42 @@ describeEmbeddedPostgres("issue list unknown query key rejection", () => {
     expect(res.body.knownQueryKeys).not.toContain("assigneeId");
   });
 
-  // 7. The guard must not require callers to pass filters.
+  // 7. The shape pin, and the reason the test above is not enough on its own.
+  //    Every other assertion in this block is `toContain`-only, and the 400 body
+  //    is now built by `rejectUnknownIssueQueryKeys`, which is *shared* with
+  //    `GET /issues/count`. So nothing in the suite notices the list route's own
+  //    body changing underneath a `toContain`: rewording the `"issues list"`
+  //    label leaves all 28 other tests green while changing what every caller
+  //    of this route actually receives.
+  //
+  //    Both halves are pinned exactly, because they fail for different reasons.
+  //    The message uses `toBe`: the label is a per-call-site *argument*, so no
+  //    test of the shared helper itself can cover it. The key set uses
+  //    `toEqual` against the allowlist, which pins membership and order in one
+  //    line. Note the order half is a *forward* guard, not a live one: both
+  //    allowlist literals are currently written in alphabetical order, so
+  //    dropping the route's `.sort()` is a byte-identical no-op today and
+  //    cannot fail. It becomes live the moment a key is appended out of order,
+  //    which is exactly the edit that would otherwise ship silently.
+  it("pins the list 400 body so the shared helper cannot drift it", async () => {
+    const seeded = await seed();
+    const res = await request(appFor(seeded))
+      .get(`/api/companies/${seeded.companyId}/issues`)
+      .query({ assigneeId: seeded.agentId })
+      .expect(400);
+
+    expect(res.body.error).toBe(
+      "Unknown issues list query parameter(s): assigneeId",
+    );
+    expect(res.body.knownQueryKeys).toEqual([...issueListKnownQueryKeys()]);
+    // Assert the ordering directly rather than trusting the allowlist literal to
+    // stay alphabetical, which is what makes the comparison above a real pin.
+    expect(res.body.knownQueryKeys).toEqual(
+      [...res.body.knownQueryKeys].sort(),
+    );
+  });
+
+  // 8. The guard must not require callers to pass filters.
   it("serves the list with no query string at all", async () => {
     const seeded = await seed();
     const res = await request(appFor(seeded))
@@ -466,6 +501,30 @@ describeEmbeddedPostgres("issue count unknown query key rejection", () => {
     // be dropped again.
     expect(res.body.knownQueryKeys).not.toContain("view");
     expect(res.body.knownQueryKeys).not.toContain("sortField");
+  });
+
+  // 7. The count route's own half of the same shape pin, and the one that is
+  //    actually load-bearing today. The label is a per-call-site argument, so
+  //    the shared helper cannot cover it: rewording `"issues/count"` here
+  //    leaves every other assertion in this block green, because they are all
+  //    `toContain`/`not.toContain`. Two endpoints that deliberately share a body
+  //    builder are exactly the pair whose separate call-site arguments drift
+  //    apart unnoticed -- and `issues/count` is read by the board UI, so its
+  //    message is a shipped contract, not an internal one.
+  it("pins the count 400 body so the shared helper cannot drift it", async () => {
+    const seeded = await seed();
+    const res = await request(countAppFor(seeded))
+      .get(`/api/companies/${seeded.companyId}/issues/count`)
+      .query({ attention: "blocked", assigneeId: "x" })
+      .expect(400);
+
+    expect(res.body.error).toBe(
+      "Unknown issues/count query parameter(s): assigneeId",
+    );
+    expect(res.body.knownQueryKeys).toEqual([...issueCountKnownQueryKeys()]);
+    expect(res.body.knownQueryKeys).toEqual(
+      [...res.body.knownQueryKeys].sort(),
+    );
   });
 });
 

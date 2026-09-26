@@ -8470,6 +8470,12 @@ export function issueRoutes(
     // every request that failed before still fails with the same message, and
     // the only requests this newly rejects are ones the handler was silently
     // answering a question they did not ask.
+    //
+    // Placed after `assertCompanyAccess` and the task-bridge 403 for the same
+    // reason the list route's guard is: this 400 echoes the endpoint's entire
+    // key set, so running it first would hand that set to any caller the access
+    // checks were about to refuse. Widening the access surface is the one
+    // regression the ordering above cannot be traded away for.
     if (
       rejectUnknownIssueQueryKeys(
         req,
