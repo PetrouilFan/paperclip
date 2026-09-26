@@ -190,6 +190,41 @@ export async function observeCrossIssueInfluence(
     // exercised and it must keep refusing a run that is bound to nothing.
     const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;
     if (!sourceIssueId) {
+      // The one target whose origin never needs a run to attribute it is the
+      // caller's own assigned ticket. `authorization.ts` already allows
+      // `issue:comment` / `issue:mutate` there (`reason: "allow_self"`, "the
+      // actor owns the assigned issue"), but this cap layer only ever derived
+      // attribution from run context or an issue-side checkout stamp, so an
+      // agent writing to the issue it is *assigned* was refused here as
+      // `no_context_source_and_target_unbound` — after the permission layer had
+      // already said yes.
+      //
+      // That refusal is not cross-issue influence under any reading of the cap:
+      // the limit exists to stop one agent writing across another agent's board,
+      // and the assignee owns this ticket. It is also self-defeating as a
+      // control. An agent that cannot comment on the ticket it holds cannot
+      // converge with the agent that filed it, so it files a second ticket
+      // instead — measured on a live board, 7 duplicate pairs, 5 of them minutes
+      // apart, plus every `blocked` issue (which cannot check out, and so can
+      // never reach a binding) left permanently unwritable. The gate was
+      // manufacturing the backlog it exists to contain (PET-273).
+      //
+      // The read is inside the same transaction as the run lock, so the
+      // exemption cannot race a concurrent reassignment. Scoping it to the
+      // fail-closed branch keeps it strictly narrower than the cap itself: a
+      // run that *does* have a source still spends its 20-write budget on any
+      // target that is not its own.
+      const targetAssignee = await tx
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(
+          eq(issues.id, input.targetIssueId),
+          eq(issues.companyId, input.companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (targetAssignee?.assigneeAgentId && targetAssignee.assigneeAgentId === input.agentId) {
+        return null;
+      }
       throw crossIssueInfluenceRunContextError("no_context_source_and_target_unbound");
     }
 
