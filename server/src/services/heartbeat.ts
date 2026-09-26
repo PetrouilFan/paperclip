@@ -501,6 +501,10 @@ import {
 } from "./recovery/stranded-notice.js";
 import { withRecoveryContext } from "./recovery/status-only-context.js";
 import {
+  NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS,
+  neverDispatchedQueuedRun,
+} from "./never-dispatched-run.js";
+import {
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   recoveryService,
 } from "./recovery/service.js";
@@ -763,6 +767,14 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "running",
   "scheduled_retry",
 ] as const;
+/**
+ * Terminal reason recorded on a run cancelled because the dispatcher never
+ * claimed it. Distinct from `cancelled` so an operator can tell an age-out apart
+ * from an operator Stop or an agent cancellation.
+ */
+const NEVER_DISPATCHED_RUN_ERROR_CODE = "never_dispatched_timeout";
+/** Bounds one sweep pass so a large backlog cannot monopolise the scheduler. */
+const NEVER_DISPATCHED_RUN_SWEEP_LIMIT = 50;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = [
   "queued",
   "running",
@@ -19535,6 +19547,7 @@ export function heartbeatService(
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
+    const now = new Date();
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -19615,6 +19628,33 @@ export function heartbeatService(
     for (const run of interruptedQueues) {
       await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }).catch((err) => {
         logger.error({ err, runId: run.id }, "failed to retry interrupted comment queue");
+      });
+    }
+
+    const strandedRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(neverDispatchedQueuedRun(now))
+      .orderBy(asc(heartbeatRuns.createdAt))
+      .limit(NEVER_DISPATCHED_RUN_SWEEP_LIMIT);
+    for (const stranded of strandedRuns) {
+      // Skip anything this process is actively trying to start. The sweep only
+      // exists to catch runs whose dispatch edge was dropped, and a run in
+      // `activeRunExecutions` demonstrably has a live owner.
+      if (liveRunExecutions.has(stranded.id)) continue;
+      logger.warn(
+        { runId: stranded.id, agentId: stranded.agentId, createdAt: stranded.createdAt },
+        "ageing out a queued run the dispatcher never claimed",
+      );
+      // cancelRunInternal releases the issue execution binding and re-queues a
+      // successor when the issue still needs work, so this both clears the
+      // strand and restores the assignee's write surface.
+      await cancelRunInternal(
+        stranded.id,
+        "Cancelled because the dispatcher never claimed this run; its issue execution lock is released and recovery re-queues the work",
+        { errorCode: NEVER_DISPATCHED_RUN_ERROR_CODE },
+      ).catch((err) => {
+        logger.error({ err, runId: stranded.id }, "failed to age out a never-dispatched queued run");
       });
     }
 

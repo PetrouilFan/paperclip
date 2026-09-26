@@ -141,6 +141,7 @@ import {
   type RunOutputSilenceSummary,
   type WatchdogDecisionActor,
 } from "../../modules/active-run-watchdog/index.js";
+import { notNeverDispatchedQueuedRun } from "../never-dispatched-run.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -1059,6 +1060,9 @@ export function recoveryService(
             inArray(heartbeatRuns.status, [
               ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
             ]),
+            // A `queued` run the dispatcher never claimed is not a live path. Left
+            // in, it makes this predicate confirm the very strand it must detect.
+            notNeverDispatchedQueuedRun(),
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             agentId ? eq(heartbeatRuns.agentId, agentId) : sql`true`,
           ),
@@ -3305,6 +3309,7 @@ export function recoveryService(
             inArray(heartbeatRuns.status, [
               ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
             ]),
+            notNeverDispatchedQueuedRun(),
             sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${action.sourceIssueId}`,
             sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId', '') <> ${action.id}`,
           ),
