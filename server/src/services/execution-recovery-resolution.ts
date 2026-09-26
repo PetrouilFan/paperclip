@@ -27,6 +27,13 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import {
+  executionRecoveryDispositionMerge,
+  isExecutionRecoveryAlreadySettled,
+  observeIssueForRecovery,
+  readExecutionRecoveryDisposition,
+  type ExecutionRecoverySettlementOutcome,
+} from "./execution-recovery-identity.js";
+import {
   deliverAgentUnblockNotification,
   strandedRunUnblockDescriptor,
 } from "./routable-blocked.js";
@@ -490,6 +497,48 @@ export async function settleUnrecoverableExecutions(
             !coordinator.failureDetail?.replacementDenied)
         )
           return;
+        // The decision is identified by (runId, issueId), not by this action's
+        // id: the id is re-minted on every sweep, so keying on it recognises
+        // nothing. A settlement already recorded for this pair against the same
+        // owner-bearing issue state IS this decision, and re-running it is the
+        // loop. Resolve the re-minted row and stop.
+        const settled = readExecutionRecoveryDisposition(run.resultJson);
+        if (
+          isExecutionRecoveryAlreadySettled({
+            disposition: settled,
+            runId: run.id,
+            issueId: task.id,
+            issue: task,
+          })
+        ) {
+          await tx
+            .update(issueRecoveryActions)
+            .set({
+              status: "resolved",
+              outcome: action.outcome ?? "cancelled",
+              resolvedAt: now,
+              updatedAt: now,
+              nextAction: action.nextAction,
+              resolutionNote: action.resolutionNote,
+              wakePolicy: null,
+              monitorPolicy: null,
+              evidence: {
+                ...action.evidence,
+                automaticRecovery: {
+                  policy: "preserve_without_replay_v1",
+                  runId: run.id,
+                  replay: "blocked",
+                  actionOutcome: "unknown",
+                  recordedAt: now.toISOString(),
+                  // Points at the action that actually made the decision, so the
+                  // receipt is traceable even though this row is not it.
+                  duplicateOfRecoveryActionId: settled!.recoveryActionId || null,
+                },
+              },
+            })
+            .where(eq(issueRecoveryActions.id, action.id));
+          return;
+        }
         const current =
           !isSupersededConversationRun(task, run) &&
           action.returnOwnerAgentId !== null &&
@@ -503,6 +552,14 @@ export async function settleUnrecoverableExecutions(
             : "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
+        let changedIssueState = false;
+        // The state this settlement leaves behind. The receipt records the
+        // post-settlement state, not the state it was handed: the decision it
+        // makes is about where the issue ends up, so that is what the next
+        // sweep has to compare against. Recording the pre-update state instead
+        // would make every receipt stale the moment it was written and cost one
+        // extra tick per run before the loop was recognised as closed.
+        let settledIssue: typeof issues.$inferSelect = task;
         if (current) {
           // A dead run is not a hold. Before blocking, check whether the issue
           // already has a first-class reason to be blocked; if it does not, the
@@ -568,36 +625,50 @@ export async function settleUnrecoverableExecutions(
             : null;
           const ownsBlock =
             unblockDescriptor !== null && (enteringBlocked || !task.blockedTransitionAt);
-          const [projected] = await tx
-            .update(issues)
-            .set({
-              status: "blocked",
-              executionRunId: null,
-              checkoutRunId: null,
-              updatedAt: now,
-              // Only a settle that owns the block re-arms the routable-blocked
-              // wake. An issue a human or dependency already held keeps its own
-              // transition stamp and its own exit.
-              ...(ownsBlock
-                ? { blockedTransitionAt: now, blockedOwnerNotifiedAt: null }
-                : {}),
-              ...(unblockDescriptor ? { unblockDescriptor } : {}),
-            })
-            .where(eq(issues.id, task.id)).returning();
+          // What this settle would actually write. A repeat settlement of an
+          // already-blocked, already-exited issue lands on identical values:
+          // writing them anyway bumps `statusVersion` and re-arms a wake for a
+          // transition that never happened, which is how one dead run burned
+          // dozens of sweeps.
+          changedIssueState =
+            enteringBlocked ||
+            ownsBlock ||
+            task.executionRunId === run.id ||
+            task.checkoutRunId === run.id;
+          const [projected] = changedIssueState
+            ? await tx
+                .update(issues)
+                .set({
+                  status: "blocked",
+                  executionRunId: null,
+                  checkoutRunId: null,
+                  updatedAt: now,
+                  // Only a settle that owns the block re-arms the routable-blocked
+                  // wake. An issue a human or dependency already held keeps its own
+                  // transition stamp and its own exit.
+                  ...(ownsBlock
+                    ? { blockedTransitionAt: now, blockedOwnerNotifiedAt: null }
+                    : {}),
+                  ...(unblockDescriptor ? { unblockDescriptor } : {}),
+                })
+                .where(eq(issues.id, task.id)).returning()
+            : [task];
           // Only a transition owned by this failure grants a recovery receipt.
           // An already-blocked task may have a separate human/dependency hold.
-          if (enteringBlocked && run.runtimeMode === "native") {
+          if (changedIssueState && enteringBlocked && run.runtimeMode === "native") {
             nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
           }
           if (ownsBlock) {
             unblockNotices.push({ issue: projected! });
           }
+          settledIssue = projected ?? task;
         }
+        const outcome: ExecutionRecoverySettlementOutcome = current ? "blocked" : "cancelled";
         await tx
           .update(issueRecoveryActions)
           .set({
             status: "resolved",
-            outcome: current ? "blocked" : "cancelled",
+            outcome,
             resolvedAt: now,
             updatedAt: now,
             nextAction: note,
@@ -613,10 +684,32 @@ export async function settleUnrecoverableExecutions(
                 replay: "blocked",
                 actionOutcome: "unknown",
                 recordedAt: now.toISOString(),
+                changedIssueState,
               },
             },
           })
           .where(eq(issueRecoveryActions.id, action.id));
+        // Mark the run consumed. A terminal recovery decision is a property of
+        // the run, not of the action row that happened to record it, so the next
+        // sweep and every other minter can see that this pair is done.
+        await tx
+          .update(heartbeatRuns)
+          .set({
+            resultJson: executionRecoveryDispositionMerge({
+              runId: run.id,
+              issueId: task.id,
+              outcome,
+              recoveryActionId: action.id,
+              changedIssueState,
+              settledAt: now.toISOString(),
+              observed: observeIssueForRecovery(settledIssue),
+            }),
+          })
+          .where(eq(heartbeatRuns.id, run.id));
+        // A settlement that changed nothing writes nothing. The action row and
+        // the run's disposition already hold the receipt; an activity row and a
+        // status re-broadcast would only re-report a non-event.
+        if (!changedIssueState) return;
         await persistActivity(tx as unknown as Db, {
           companyId: run.companyId,
           actorType: "system",
@@ -627,7 +720,7 @@ export async function settleUnrecoverableExecutions(
           runId: run.id,
           details: {
             recoveryActionId: action.id,
-            outcome: current ? "blocked" : "cancelled",
+            outcome,
             replay: "not_authorized",
           },
         });
