@@ -90,6 +90,18 @@ export interface IssueWriteDenialContext {
   responsibleUserName?: string | null;
   /** Display name of the target issue's current assignee. */
   assigneeLabel?: string | null;
+  /**
+   * The target is assigned to a *different* principal than the actor, so the
+   * actor cannot bind it to its own run.
+   *
+   * Carried as an explicit fact rather than inferred by comparing
+   * `actorLabel` against `assigneeLabel`: two principals can render the same
+   * label, and an unassigned target has no label to compare. Callers that
+   * already know the target's assignee should set this; copy then routes the
+   * actor at the two things that actually work instead of at a checkout that
+   * will be refused with a 409.
+   */
+  targetAssignedToOtherActor?: boolean | null;
   /** Target issue identifier, e.g. `TASK-482`. */
   issueIdentifier?: string | null;
   /** Per-run cross-issue influence cap. */
@@ -147,6 +159,15 @@ function actorLabel(name: string | null | undefined): string {
 const CHILD_ISSUE_PATH =
   "create a child issue with the request in its description (issue creation is a " +
   "separate, open write path) and let its assignee act";
+
+/**
+ * The other route for a target an actor may read but not bind: hand the work to
+ * whoever holds it. Pairing this with `CHILD_ISSUE_PATH` is the point — a
+ * rejection that names only one of them still dead-ends half its readers, and
+ * the 409 it leads into carries no guidance of its own.
+ */
+const REASSIGNMENT_PATH =
+  "request reassignment of the issue if it should be yours";
 
 export function describeIssueWriteDenial(
   code: IssueWriteDenialCode,
@@ -275,6 +296,35 @@ export function describeIssueWriteDenial(
       // is already resolved and only the *source issue* is absent — the header
       // is in the bearer token and the server already read it.
       if (context.runContextReason && !RUN_HEADER_FIX_REASONS.has(context.runContextReason)) {
+        // A target held by someone else is a different dead end from a target
+        // nobody holds. Check out the run's *own* task and the write is fine —
+        // but checking out *this* issue is a 409 checkout conflict, so telling
+        // this actor to check out a task it does not hold converts one correct
+        // refusal into a second, worse one. Name the two routes that work.
+        if (context.targetAssignedToOtherActor) {
+          return {
+            code,
+            status: 403,
+            tone: "boundary",
+            boundary: "Heartbeat run context",
+            title: "This run cannot write to a task someone else holds",
+            description:
+              `The run itself is valid and attributed — what is missing is a task it owns, ` +
+              `and ${issue} is assigned to ${assignee}, so binding it to this run would ` +
+              `overwrite the binding that already names the run doing that work. A ` +
+              `cross-issue write must be charged to a task, and this one cannot be ` +
+              `charged to ${issue}.`,
+            whoCanAct:
+              `${assignee}, who holds ${issue}. ${actor} can raise the request on a ` +
+              `task it does hold.`,
+            sanctionedPath:
+              `To get this onto ${issue}: ${CHILD_ISSUE_PATH}, or ${REASSIGNMENT_PATH} ` +
+              `if ${actor} should hold it outright. Either way the request travels on a ` +
+              `task ${actor} owns, and the write then counts against the per-run cap ` +
+              `like any other. Do not resend \`X-Paperclip-Run-Id\` — this run already ` +
+              `carried it.`,
+          };
+        }
         return {
           code,
           status: 403,
