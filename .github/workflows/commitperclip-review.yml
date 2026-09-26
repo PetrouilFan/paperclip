@@ -36,11 +36,25 @@ jobs:
       - name: Generate commitperclip token
         id: token
         run: |
-          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          set -euo pipefail
+          if [ -n "${COMMITPERCLIP_KEY:-}" ]; then
+            TOKEN="$(node .github/scripts/get-bot-token.mjs)"
+            COMMENTER='commitperclip[bot]'
+          else
+            # COMMITPERCLIP_KEY only exists where the commitperclip app is
+            # installed. Everywhere else this step exited non-zero, so every
+            # later step was skipped and the quality gates never ran. The
+            # gates only read the pull request and write one comment, and this
+            # job already grants exactly that, so fall back to the job token.
+            TOKEN="${GITHUB_TOKEN}"
+            COMMENTER='github-actions[bot]'
+          fi
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
+          echo "commenter=$COMMENTER" >> $GITHUB_OUTPUT
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Run quality gates
         id: quality
@@ -49,6 +63,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.token.outputs.value }}
+          GH_COMMENTER_LOGIN: ${{ steps.token.outputs.commenter }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
