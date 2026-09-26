@@ -187,6 +187,26 @@ AFTER_DIRS="$(ls "$STORE/installs/git" 2>/dev/null | sort)"
 [ "$BEFORE_DIRS" = "$AFTER_DIRS" ] && pass "7b no partial install dir left behind" || fail_ "7b no partial install dir left behind"
 "$SHIM" --version >/dev/null 2>&1 && pass "7c existing install still healthy" || fail_ "7c existing install still healthy"
 
+# The host's default-instance unit FILE, if it has one, active or not. Step 8 is
+# safe on such a host because every verb it issues is instance-scoped to `e2e`, so
+# it only ever names paperclipai-e2e.service. Step 10 is not: it runs a bare
+# `uninstall` with no --instance, which resolves to the `default` instance, and
+# SystemdServiceManager.uninstall ends in `fs.rm(<unit file>)`. So on a host whose
+# default-instance unit is merely stopped, step 10 deletes the host's production
+# unit file while 8f -- which only compares MainPID and ActiveEnterTimestamp, both
+# empty for any stopped unit -- prints PASS. Measured on run 36221631375: a
+# planted, started-then-stopped sentinel went LoadState=loaded/FragmentPath=set to
+# LoadState=not-found/FragmentPath=empty across the run.
+#
+# Computed here, before step 8, so it is set on every path into step 10 --
+# including the two that skip step 8 entirely.
+case "$(uname -s)" in
+  Linux) HOST_UNIT_FILE="$(systemctl --user show paperclipai.service -p FragmentPath --value 2>/dev/null || true)" ;;
+  Darwin) HOST_UNIT_FILE="$HOME/Library/LaunchAgents/ing.paperclip.paperclipai.plist"
+          [ -f "$HOST_UNIT_FILE" ] || HOST_UNIT_FILE="" ;;
+  *) HOST_UNIT_FILE="" ;;
+esac
+
 if [ "${E2E_SKIP_SERVICE:-0}" = "1" ]; then
   skip_ "8 service lifecycle" "E2E_SKIP_SERVICE=1"
 else
@@ -222,6 +242,10 @@ else
       abort_ "8 service lifecycle (PET-52 guard: host paperclipai.service is active)" \
         "" "production service active on this host; service leg not run"
     fi
+
+    # A host paperclipai.service that is *active* is refused outright. One that is
+    # merely stopped is allowed through, because step 8 cannot reach it -- but
+    # step 10 can, and does; see HOST_UNIT_FILE above.
 
     # A distinct instance id is what actually makes the leg safe, and the HOME
     # override alone is not. `systemctl --user <verb> <name>` addresses units the
@@ -367,13 +391,27 @@ fi
 
 note "10. uninstall preserves user data"
 mkdir -p "$HOME/.paperclip" && touch "$HOME/.paperclip/e2e-user-data-marker"
-if shim uninstall; then
+if [ -n "$HOST_UNIT_FILE" ]; then
+  # Refuse rather than skip silently: this step is the only coverage of the
+  # uninstall path, and it cannot be run at all on a host that has a real
+  # default-instance unit, because that is precisely the file it deletes.
+  # Reported as a FAIL so it cannot be mistaken for coverage.
+  echo "  host default-instance unit present at: $HOST_UNIT_FILE"
+  echo "  a bare \`uninstall\` resolves to the default instance and removes that file"
+  fail_ "10a uninstall exits 0"
+  fail_ "10b shim removed"
+  fail_ "10c managed store removed"
+  skip_ "10d user data under ~/.paperclip preserved" \
+    "not run: the uninstall this step covers was refused"
+elif shim uninstall; then
   pass "10a uninstall exits 0"
 else
   fail_ "10a uninstall exits 0"
 fi
-[ ! -e "$SHIM" ] && pass "10b shim removed" || fail_ "10b shim removed"
-[ ! -d "$STORE" ] && pass "10c managed store removed" || fail_ "10c managed store removed"
-[ -f "$HOME/.paperclip/e2e-user-data-marker" ] && pass "10d user data under ~/.paperclip preserved" || fail_ "10d user data preserved"
+[ -n "$HOST_UNIT_FILE" ] || {
+  [ ! -e "$SHIM" ] && pass "10b shim removed" || fail_ "10b shim removed"
+  [ ! -d "$STORE" ] && pass "10c managed store removed" || fail_ "10c managed store removed"
+  [ -f "$HOME/.paperclip/e2e-user-data-marker" ] && pass "10d user data under ~/.paperclip preserved" || fail_ "10d user data preserved"
+}
 
 summarize
