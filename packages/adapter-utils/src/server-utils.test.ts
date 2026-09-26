@@ -21,6 +21,7 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
+  PAYLOAD_WELL_FORMEDNESS_CLAUSE,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -1482,10 +1483,21 @@ describe("renderPaperclipWakePrompt", () => {
     // The clause qualifies the two-failure rule, so it has to sit immediately
     // before it on every surface that carries the rule. Patching one anchor and
     // not the others leaves an agent reading the incomplete rule.
-    const CLAUSE =
-      "Before treating a `5xx` from a control-plane write as transient, confirm the request payload is well-formed: parse the exact bytes you send before you spend a retry. A serialization error in the request is a client fault, not a server fault, and is not covered by the two-failure rule \u2014 it does not consume a retry, and a corrected payload is a new attempt rather than a repeat of the failed one. A `5xx` whose body is only a generic error such as `{\"error\":\"Internal server error\"}` names no field, no offset, and no parser message, so it is not evidence of a server fault: fix the payload and resend instead of spending retries or abandoning the deliverable.";
+    //
+    // Assert the exported constant, not a fourth hand-maintained copy of the
+    // text. A copy here could be edited to match a wrong source and the test
+    // would pass while the contract regressed.
+    const CLAUSE = PAYLOAD_WELL_FORMEDNESS_CLAUSE;
     const TWO_FAILURE_RULE =
       "After 2 consecutive failures of the same control-plane write";
+
+    // The clause has to say what a bare 5xx body does not: name no field, no
+    // offset, no parser message. Without that, the rule still reads as
+    // "the server is down, retry budget spent".
+    expect(CLAUSE).toContain("parse the exact bytes you send");
+    expect(CLAUSE).toContain("is a client fault, not a server fault");
+    expect(CLAUSE).toContain("does not consume a retry");
+    expect(CLAUSE).toContain("is not evidence of a server fault");
 
     // 1. heartbeat agent prompt template
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(CLAUSE);

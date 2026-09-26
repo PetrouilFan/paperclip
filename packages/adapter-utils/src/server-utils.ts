@@ -206,6 +206,23 @@ export function resolvePaperclipInstanceRootForAdapter(
   return path.resolve(homeDir, "instances", instanceId);
 }
 
+/**
+ * Qualifies the two-failure rule that every execution contract surface carries.
+ *
+ * The rule alone reads as a server-fault rule, so an agent that serialized a
+ * request body wrongly spends both retries on the same bad bytes and ends the
+ * run with no recorded disposition. A 5xx whose body is only
+ * `{"error":"Internal server error"}` names no field, no offset, and no parser
+ * message, so it is not evidence of a server fault.
+ *
+ * One constant, three surfaces. An agent sees exactly one contract per run
+ * shape, so all of them must carry the clause. Sharing the literal keeps the
+ * three renderings from drifting apart, and lets the test assert the real
+ * contract text instead of a fourth hand-maintained copy of it.
+ */
+export const PAYLOAD_WELL_FORMEDNESS_CLAUSE =
+  "Before treating a `5xx` from a control-plane write as transient, confirm the request payload is well-formed: parse the exact bytes you send before you spend a retry. A serialization error in the request is a client fault, not a server fault, and is not covered by the two-failure rule — it does not consume a retry, and a corrected payload is a new attempt rather than a repeat of the failed one. A `5xx` whose body is only a generic error such as `{\"error\":\"Internal server error\"}` names no field, no offset, and no parser message, so it is not evidence of a server fault: fix the payload and resend instead of spending retries or abandoning the deliverable.";
+
 export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
   "",
@@ -215,7 +232,7 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "- Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
   "- Final disposition checklist: mark `done` when complete; use `in_review` only with a real reviewer, approval, interaction, or monitor path; use `blocked` only with first-class blockers or a named unblock owner/action; create delegated follow-up issues with blockers when another agent owns the next step; keep `in_progress` only when a live continuation path exists.",
   "- Prefer the smallest verification that proves the change; do not default to full workspace typecheck/build/test on every heartbeat unless the task scope warrants it.",
-  "- Before treating a `5xx` from a control-plane write as transient, confirm the request payload is well-formed: parse the exact bytes you send before you spend a retry. A serialization error in the request is a client fault, not a server fault, and is not covered by the two-failure rule — it does not consume a retry, and a corrected payload is a new attempt rather than a repeat of the failed one. A `5xx` whose body is only a generic error such as `{\"error\":\"Internal server error\"}` names no field, no offset, and no parser message, so it is not evidence of a server fault: fix the payload and resend instead of spending retries or abandoning the deliverable.",
+  "- " + PAYLOAD_WELL_FORMEDNESS_CLAUSE,
   "- After 2 consecutive failures of the same control-plane write, stop retrying that write for the rest of the heartbeat. Continue useful work, report the failure in the final response, and rely on the adapter/runtime status channel as the sanctioned fallback.",
   "- Use child issues for parallel or long delegated work instead of polling agents, sessions, or processes.",
   "- If woken by a human comment on a dependency-blocked issue, respond or triage the comment without treating the blocked deliverable work as unblocked.",
@@ -238,7 +255,7 @@ export const DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE = [
   "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip conversation using the supplied chat mode directive.",
   "Use available tools and assigned skills as needed; respect budget, pause/cancel, approval gates, and company boundaries.",
   "Prefer the smallest verification that proves the action. Use PAPERCLIP_SCRATCH_DIR / PAPERCLIP_RUN_SCRATCH_DIR for temporary scratch files.",
-  "Before treating a `5xx` from a control-plane write as transient, confirm the request payload is well-formed: parse the exact bytes you send before you spend a retry. A serialization error in the request is a client fault, not a server fault, and is not covered by the two-failure rule — it does not consume a retry, and a corrected payload is a new attempt rather than a repeat of the failed one. A `5xx` whose body is only a generic error such as `{\"error\":\"Internal server error\"}` names no field, no offset, and no parser message, so it is not evidence of a server fault: fix the payload and resend instead of spending retries or abandoning the deliverable.",
+  PAYLOAD_WELL_FORMEDNESS_CLAUSE,
   "After 2 consecutive failures of the same control-plane write, stop retrying that write for the rest of the turn. Report the failure honestly; never claim an unconfirmed mutation succeeded.",
   "Never create probe or throwaway issue-thread interactions. Every interaction must carry a real, answerable prompt; withdraw one you no longer need.",
   "",
@@ -2356,7 +2373,7 @@ function renderPaperclipWakePromptBody(
         ]
       : includeExecutionContract
         ? [
-            "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Immediately before returning, verify that Paperclip records one of those dispositions; a successful process exit or final response is not sufficient. If no valid disposition is recorded, record it now and do not end the run. Before treating a `5xx` from a control-plane write as transient, confirm the request payload is well-formed: parse the exact bytes you send before you spend a retry. A serialization error in the request is a client fault, not a server fault, and is not covered by the two-failure rule — it does not consume a retry, and a corrected payload is a new attempt rather than a repeat of the failed one. A `5xx` whose body is only a generic error such as `{\"error\":\"Internal server error\"}` names no field, no offset, and no parser message, so it is not evidence of a server fault: fix the payload and resend instead of spending retries or abandoning the deliverable. After 2 consecutive failures of the same control-plane write, stop retrying it for the rest of the heartbeat, continue useful work, report the failure in the final response, and rely on the adapter/runtime status channel as the sanctioned fallback. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
+            "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Immediately before returning, verify that Paperclip records one of those dispositions; a successful process exit or final response is not sufficient. If no valid disposition is recorded, record it now and do not end the run. " + PAYLOAD_WELL_FORMEDNESS_CLAUSE + " After 2 consecutive failures of the same control-plane write, stop retrying it for the rest of the heartbeat, continue useful work, report the failure in the final response, and rely on the adapter/runtime status channel as the sanctioned fallback. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
             "",
           ]
         : [];
