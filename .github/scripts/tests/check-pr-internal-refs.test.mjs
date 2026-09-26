@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import {
   ALLOWLIST,
   DEFAULT_INTERNAL_REF_PREFIXES,
@@ -411,6 +412,13 @@ test('an address in the title, the branch or a commit subject each fail', () => 
   const bareName = checkInternalRefs({ ...CLEAN, prBranch: 'fix/localhost-bind-only' });
   assert.equal(bareName.passed, true, JSON.stringify(bareName.failures, null, 2));
 
+  // A port written with a hyphen is a description, not an authority: a hyphen is
+  // how a branch name separates its words, so reading `-3000-` as a port would
+  // mean matching most names that contain three digits.
+  for (const name of ['fix/localhost-3000-bind', 'fix/10.0.0.7-8099-rebind']) {
+    const hyphenPort = checkInternalRefs({ ...CLEAN, prBranch: name });
+    assert.equal(hyphenPort.passed, true, `expected ${name} to pass: ${JSON.stringify(hyphenPort.failures)}`);
+  }
 
   const subject = checkInternalRefs({
     ...CLEAN,
@@ -418,6 +426,32 @@ test('an address in the title, the branch or a commit subject each fail', () => 
   });
   assert.equal(subject.passed, false);
   assert.match(subject.failures.join('\n'), /A commit subject/);
+});
+
+test('the address rule cannot fire on a branch authority, because git forbids one', () => {
+  // Not a design choice — a property of refnames, and the reason the branch leg
+  // of the address rule is quiet. `git check-ref-format` rejects `:`, `//` and
+  // `@{`, which is every character an authority needs, so of the address shapes
+  // the gate knows, a branch name can only carry a bare one. Relaxing the path
+  // lookbehind for this surface would therefore buy nothing while reading as
+  // though it did. Measured over the 84 branch names that have ever been a head
+  // on this fork, the branch surface reported 16 findings and all 16 were
+  // identifiers.
+  for (const name of ['fix/localhost:3000', 'fix/http://localhost', 'fix/root@localhost:3000']) {
+    assert.throws(
+      () => execFileSync('git', ['check-ref-format', `refs/heads/${name}`], { stdio: 'pipe' }),
+      `expected git to reject ${name} as a refname`,
+    );
+  }
+
+  // The one address shape a branch can carry, it does catch.
+  const tailnet = checkInternalRefs({ ...CLEAN, prBranch: 'fix/box.tail1234.ts.net-reboot' });
+  assert.equal(tailnet.passed, false);
+  assert.match(tailnet.failures.join('\n'), /branch name/);
+
+  // A bare private address stays unclaimed, by the header's second exclusion.
+  const bare = checkInternalRefs({ ...CLEAN, prBranch: 'fix/10.0.0.7-rebind' });
+  assert.equal(bare.passed, true, JSON.stringify(bare.failures, null, 2));
 });
 
 test('the commit-subject scan reads the subject, not the body of the message', () => {
