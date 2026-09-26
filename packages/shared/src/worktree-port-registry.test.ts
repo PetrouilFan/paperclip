@@ -10,6 +10,7 @@ import {
 } from "./worktree-port-registry.js";
 
 const temporaryRoots: string[] = [];
+const liveResponders: { stop: () => Promise<void> }[] = [];
 
 function makeTemporaryRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-port-registry-lock-"));
@@ -67,15 +68,27 @@ function startProbeResponder(token: string): { port: number; stop: () => Promise
     void worker.terminate();
     throw new Error("The probe responder fixture did not bind a loopback port");
   }
-  return {
+  let terminated: Promise<void> | null = null;
+  const responder = {
     port,
     // Terminating the thread releases the listening socket, so a later probe is
-    // refused rather than answered.
-    stop: () => worker.terminate().then(() => undefined),
+    // refused rather than answered. Idempotent, because afterEach stops every
+    // responder this module still owns.
+    stop: () => (terminated ??= worker.terminate().then(() => undefined)),
   };
+  liveResponders.push(responder);
+  return responder;
 }
 
-afterEach(() => {
+afterEach(async () => {
+  // Release the responder at the end of the test that started it, not at pool
+  // teardown. A failing assertion between startProbeResponder() and the test's
+  // own stop() would otherwise leave a thread bound to its loopback socket and
+  // still answering probes for the rest of the run, so a later test's reclaim
+  // decision could be steered by a fixture whose test had already failed.
+  for (const responder of liveResponders.splice(0)) {
+    await responder.stop();
+  }
   for (const root of temporaryRoots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true });
   }
