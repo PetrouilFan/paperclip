@@ -36,6 +36,13 @@ export type InstallStorePaths = {
   lockPath: string;
   currentPath: string;
   shimPath: string;
+  /**
+   * Where the shim lived before `PAPERCLIP_SHIM_PATH` was honoured here, and the
+   * only place a default-location shim can still be found once it is set. Read
+   * only: `shimPath` is the sole write target, so a relocation never leaves two
+   * shims to reason about.
+   */
+  legacyShimPath: string;
 };
 
 function ensurePrivateDirectory(directoryPath: string): void {
@@ -54,6 +61,12 @@ function assertOwnedByCurrentUser(stat: fs.Stats, targetPath: string): void {
   }
 }
 
+/** Whether `candidate` is `root` itself or sits underneath it. */
+function isWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function writeFileAtomic(filePath: string, contents: string, mode: number): void {
   const temporaryPath = path.join(
     path.dirname(filePath),
@@ -70,10 +83,23 @@ function writeFileAtomic(filePath: string, contents: string, mode: number): void
 export function resolveInstallStorePaths(options: {
   paperclipHome?: string;
   homeDir?: string;
+  shimPath?: string;
 } = {}): InstallStorePaths {
   const paperclipHome = path.resolve(options.paperclipHome ?? resolvePaperclipHomeDir());
   const homeDir = path.resolve(options.homeDir ?? process.env.HOME ?? path.dirname(paperclipHome));
   const cliRoot = path.join(paperclipHome, "cli");
+  // The shim is the one path that is deliberately not under `paperclipHome`: it
+  // is a PATH convenience, and `install` writes `$HOME/.local/bin` into the
+  // operator's shell rc and the service manager points `ExecStart` at it. So it
+  // cannot simply follow the root, which leaves `PAPERCLIP_HOME` relocation with
+  // no supported way to move it. `PAPERCLIP_SHIM_PATH` is that way, and
+  // `resolveServiceShimPath` and the service health check already honour it --
+  // only the writer of the file did not, so the override pointed the service at
+  // a shim that `install` would never write. One knob, read the same way here.
+  const legacyShimPath = path.join(homeDir, ".local", "bin", "paperclipai");
+  const shimPath = path.resolve(
+    options.shimPath ?? process.env.PAPERCLIP_SHIM_PATH?.trim() ?? legacyShimPath,
+  );
   return {
     paperclipHome,
     cliRoot,
@@ -82,7 +108,8 @@ export function resolveInstallStorePaths(options: {
     markerPath: path.join(cliRoot, ".managed-install"),
     lockPath: path.join(cliRoot, ".install.lock"),
     currentPath: path.join(cliRoot, "current"),
-    shimPath: path.join(homeDir, ".local", "bin", "paperclipai"),
+    shimPath,
+    legacyShimPath,
   };
 }
 
@@ -348,15 +375,43 @@ export function pruneInstallPayloads(
   return removed;
 }
 
+/**
+ * Every ancestor directory of the shim, from its own parent up to the filesystem
+ * root.
+ *
+ * The default layout (`$HOME/.local/bin/paperclipai`) made "three levels up" a
+ * complete answer. `PAPERCLIP_SHIM_PATH` can put the shim anywhere, and those
+ * three levels are then arbitrary directories that say nothing about the path
+ * actually being written.
+ */
+function shimDirectoryChain(shimPath: string): string[] {
+  const chain: string[] = [];
+  let current = path.dirname(path.resolve(shimPath));
+  for (;;) {
+    chain.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) return chain;
+    current = parent;
+  }
+}
+
 export function assertManagedShimWritable(paths = resolveInstallStorePaths()): void {
-  const homeDir = path.dirname(path.dirname(path.dirname(paths.shimPath)));
-  for (const directoryPath of [homeDir, path.join(homeDir, ".local"), path.dirname(paths.shimPath)]) {
+  for (const directoryPath of shimDirectoryChain(paths.shimPath)) {
     if (!fs.existsSync(directoryPath)) continue;
     const directoryStat = fs.lstatSync(directoryPath);
     if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
       throw new Error(`Refusing to use unsafe shim directory ${directoryPath}.`);
     }
-    assertOwnedByCurrentUser(directoryStat, directoryPath);
+    // Ownership is asserted only inside the roots this install manages. Above
+    // them the directory is not ours to own -- `/opt` and `/` are root-owned on
+    // any healthy host -- and requiring our uid there would refuse every
+    // relocated shim. The shim file itself is still ownership-checked below, so
+    // the guarantee that matters (never replace another user's command) holds
+    // for any location.
+    const managedHomeDir = path.dirname(path.dirname(path.dirname(paths.legacyShimPath)));
+    if (isWithin(paths.paperclipHome, directoryPath) || isWithin(managedHomeDir, directoryPath)) {
+      assertOwnedByCurrentUser(directoryStat, directoryPath);
+    }
   }
   try {
     const stat = fs.lstatSync(paths.shimPath);
@@ -396,11 +451,17 @@ function isManagedShimContents(contents: string): boolean {
 
 export function writeManagedShim(paths = resolveInstallStorePaths()): void {
   assertManagedShimWritable(paths);
-  const homeDir = path.dirname(path.dirname(path.dirname(paths.shimPath)));
-  const localDir = path.dirname(path.dirname(paths.shimPath));
-  fs.mkdirSync(homeDir, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(localDir, { recursive: true, mode: 0o755 });
-  fs.mkdirSync(path.dirname(paths.shimPath), { recursive: true, mode: 0o755 });
+  // Create the shim's own parent chain. The old code also created `$HOME` and
+  // `$HOME/.local` with fixed modes, which only made sense while the shim was
+  // pinned three levels under the home directory; for a relocated shim those
+  // two paths are unrelated directories that must not be created or chmodded as
+  // a side effect of writing a shim. `$HOME` itself keeps its 0o700 when it has
+  // to be created, so relocating never widens a home directory.
+  const managedHomeDir = path.dirname(path.dirname(path.dirname(paths.legacyShimPath)));
+  for (const directoryPath of shimDirectoryChain(paths.shimPath).reverse()) {
+    const mode = path.resolve(directoryPath) === path.resolve(managedHomeDir) ? 0o700 : 0o755;
+    fs.mkdirSync(directoryPath, { recursive: true, mode });
+  }
   assertManagedShimWritable(paths);
   const entrypoint = path.join(paths.currentPath, "node_modules", "paperclipai", "dist", "index.js");
   // ACP servers and package-manager shims use /usr/bin/env node. Pin their
@@ -410,15 +471,33 @@ export function writeManagedShim(paths = resolveInstallStorePaths()): void {
 }
 
 export function removeManagedShim(paths = resolveInstallStorePaths()): boolean {
-  try {
-    const contents = fs.readFileSync(paths.shimPath, "utf8");
-    if (!isManagedShimContents(contents)) return false;
-    fs.rmSync(paths.shimPath, { force: true });
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-    throw error;
+  // A shim left behind by a previous install location is still a Paperclip
+  // command on the operator's PATH, still `exec`ing into this store. Removing
+  // only the current path would leave that one behind to fail confusingly after
+  // an uninstall, so both are swept -- each gated on the managed marker, so a
+  // real command that happens to sit at either path is never deleted.
+  const candidates = [...new Set([paths.shimPath, paths.legacyShimPath])];
+  let removedAny = false;
+  let foreignPresent = false;
+  for (const candidate of candidates) {
+    let contents: string;
+    try {
+      contents = fs.readFileSync(candidate, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (!isManagedShimContents(contents)) {
+      foreignPresent = true;
+      continue;
+    }
+    fs.rmSync(candidate, { force: true });
+    removedAny = true;
   }
+  // Having nothing to remove is a success, as it always was: the caller warns
+  // only when a real command was left standing, not when the path was already
+  // empty.
+  return removedAny || !foreignPresent;
 }
 
 export function managedPathBlock(): string {

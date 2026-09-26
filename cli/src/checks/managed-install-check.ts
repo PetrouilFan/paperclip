@@ -17,20 +17,44 @@ function pathContains(directory: string): boolean {
     .some((entry) => path.resolve(entry) === normalized);
 }
 
-function hasManagedArtifacts(paths: InstallStorePaths): boolean {
-  const persistentArtifacts = [
-    paths.manifestPath,
-    paths.markerPath,
-    paths.currentPath,
-    paths.shimPath,
-  ].some((entry) => fs.existsSync(entry));
-  if (persistentArtifacts) return true;
+function hasStoreArtifacts(paths: InstallStorePaths): boolean {
+  const inStore = [paths.manifestPath, paths.markerPath, paths.currentPath].some((entry) =>
+    fs.existsSync(entry),
+  );
+  if (inStore) return true;
   try {
     return fs.readdirSync(paths.installsRoot).length > 0;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     return true;
   }
+}
+
+/** The shim a reader would actually invoke: the current path, else the one a
+ *  previous install location left behind.
+ *
+ *  A file at either path is only a witness if it carries the managed marker.
+ *  `npm install -g` puts its own command at `$HOME/.local/bin/paperclipai`, and
+ *  that command `exec`s into npm's tree, never into a Paperclip store -- so its
+ *  presence says nothing about whether a store exists, and treating it as one
+ *  blocks the startup of a perfectly healthy global-npm install. That was
+ *  measured taking `paperclipai.service` down for 3m31s via start-limit-hit while
+ *  6 in-flight runs were reaped. `removeManagedShim` already gates on the same
+ *  marker so it never deletes a foreign command; this keeps the doctor and the
+ *  uninstaller in agreement about what is at that path. */
+function findManagedShim(paths: InstallStorePaths): string | null {
+  for (const candidate of new Set([paths.shimPath, paths.legacyShimPath])) {
+    try {
+      if (fs.readFileSync(candidate, "utf8").includes(MANAGED_SHIM_MARKER)) return candidate;
+    } catch {
+      // Missing, unreadable, or a directory: try the next location.
+    }
+  }
+  return null;
+}
+
+function hasManagedArtifacts(paths: InstallStorePaths): boolean {
+  return hasStoreArtifacts(paths) || findManagedShim(paths) !== null;
 }
 
 export function nodeRuntimeCheck(): CheckResult {
@@ -72,6 +96,31 @@ export function managedInstallChecks(
   }
 
   if (!manifest) {
+    // The store is empty but something still claims to be a managed install.
+    // The overwhelmingly common cause is a relocated root: the shim survives at
+    // the old location and still `exec`s into a store that is not there, while
+    // the manifest is looked for under the new one. Saying "artifacts exist"
+    // without naming the witness, and then prescribing `install`, is what made
+    // this self-contradictory -- `install` writes the manifest under the root it
+    // was just pointed at and leaves the shim where it was, so the operator loops
+    // forever against a hint that cannot converge.
+    const orphanShim = !hasStoreArtifacts(paths) ? findManagedShim(paths) : null;
+    if (orphanShim) {
+      return [
+        {
+          name: "Managed install manifest",
+          status: "fail",
+          message:
+            `The command at ${orphanShim} is a Paperclip shim, but the install store it points into is `
+            + `empty: no manifest at ${paths.manifestPath} under ${paths.paperclipHome}. `
+            + `The shim and the store are being resolved from two different roots.`,
+          repairHint:
+            `Point both at one location: set PAPERCLIP_SHIM_PATH to the shim's current path `
+            + `(${orphanShim}) so the store and the command agree, or set PAPERCLIP_HOME back to the `
+            + `root that holds the store, then re-run \`paperclipai install\`.`,
+        },
+      ];
+    }
     return [
       {
         name: "Managed install manifest",
@@ -112,24 +161,33 @@ export function managedInstallChecks(
         },
   );
 
-  let shimValid = false;
-  try {
-    shimValid = fs.readFileSync(paths.shimPath, "utf8").includes(MANAGED_SHIM_MARKER);
-  } catch {
-    shimValid = false;
-  }
+  // Prefer the configured path, fall back to one a previous install location
+  // left behind: reporting a relocated-away shim as "missing" would tell the
+  // operator to re-run `install` while the command they actually invoke is
+  // sitting on their PATH. Same marker gate as `findManagedShim`, and for the
+  // same reason -- one predicate, so the two cannot drift apart.
+  const resolvedShim = findManagedShim(paths);
+  const shimValid = resolvedShim !== null;
+  const shimDisplayPath = resolvedShim ?? paths.shimPath;
+  const shimElsewhere = resolvedShim !== null && resolvedShim !== paths.shimPath;
   results.push(
     shimValid
-      ? { name: "Managed install shim", status: "pass", message: paths.shimPath }
+      ? {
+          name: "Managed install shim",
+          status: "pass",
+          message: shimElsewhere
+            ? `${shimDisplayPath} (a previous install location; set PAPERCLIP_SHIM_PATH to this path to keep using it)`
+            : shimDisplayPath,
+        }
       : {
           name: "Managed install shim",
           status: "fail",
-          message: `Missing or unrecognized shim at ${paths.shimPath}`,
+          message: `Missing or unrecognized shim at ${shimDisplayPath}`,
           repairHint: "Re-run `paperclipai install`",
         },
   );
 
-  const shimDirectory = path.dirname(paths.shimPath);
+  const shimDirectory = path.dirname(shimDisplayPath);
   results.push(
     pathContains(shimDirectory)
       ? { name: "Managed install PATH", status: "pass", message: `${shimDirectory} is on PATH` }

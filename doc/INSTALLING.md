@@ -124,6 +124,45 @@ If `~/.local/bin` is not on `PATH`, the installer offers to update the relevant
 shell startup file when running interactively. Non-interactive installs print
 the exact `export PATH` command instead of editing shell files silently.
 
+### Moving the shim: `PAPERCLIP_SHIM_PATH`
+
+The install store and the `paperclipai` command are addressed by two
+independent roots, and only one of them moves with `PAPERCLIP_HOME`:
+
+| path | root | override |
+|---|---|---|
+| `install.json`, `current`, `installs/`, `.managed-install` | `PAPERCLIP_HOME` | `PAPERCLIP_HOME` |
+| the `paperclipai` shim | `$HOME` | `PAPERCLIP_SHIM_PATH` |
+
+The shim is deliberately *not* under `PAPERCLIP_HOME`: it is a `PATH`
+convenience, `install` adds its directory to a shell startup file, and
+`service install` writes `ExecStart` pointing at it. So relocating an instance
+with `PAPERCLIP_HOME` does not move the command, and the shim keeps pointing
+into the store it was written for.
+
+`PAPERCLIP_SHIM_PATH` is the knob that moves it. Set it to the location you
+want the command at, and `install`, `uninstall`, `doctor`, and
+`service install` all resolve the same file:
+
+```sh
+PAPERCLIP_SHIM_PATH=/opt/paperclip/bin/paperclipai paperclipai install
+```
+
+Two details worth knowing:
+
+- The service manager and the installer read the variable the same way, so
+  `service install` cannot write an `ExecStart` that points at a shim
+  `install` never writes.
+- `uninstall` removes a managed shim found at either the configured or the
+  default `$HOME/.local/bin` location, so relocating does not leave a stale
+  command behind. A file at either location that is not a Paperclip-managed
+  shim is never touched.
+
+If the two roots disagree — a shim at one, a store at the other — `doctor`
+reports a **blocking** `Managed install manifest` finding. It names both paths
+and the remedy, rather than asserting that "artifacts exist" at a store that
+does not exist.
+
 ## Install Sources
 
 Install the current stable release:

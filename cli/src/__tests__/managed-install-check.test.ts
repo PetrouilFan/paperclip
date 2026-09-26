@@ -85,4 +85,51 @@ describe("managed install doctor checks", () => {
       expect.objectContaining({ name: "Managed install", status: "pass" }),
     ]);
   });
+
+  // Regression for the measured 2026-07-25 outage: a global-npm install, a
+  // `PAPERCLIP_HOME` that holds no managed store, and the npm command sitting
+  // at `$HOME/.local/bin/paperclipai`. `paperclipai.service` printed a blocking
+  // "Managed install manifest" finding, exited 1, hit start-limit, and left the
+  // board down 3m31s while 6 in-flight runs were reaped.
+  //
+  // The command at the shim path is a witness only if it is a *managed* shim. An
+  // npm-installed command execs into npm's own tree, never into a Paperclip
+  // store, so it is not evidence of one -- and `removeManagedShim` already
+  // refuses to delete a file at that path unless it carries the managed marker.
+  // The doctor has to agree with the uninstaller about what lives there.
+  it("does not treat a foreign command at the shim path as a managed install", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-doctor-"));
+    const paths = resolveInstallStorePaths({
+      paperclipHome: path.join(root, "relocated", ".paperclip"),
+      homeDir: path.join(root, "real-home"),
+    });
+    fs.mkdirSync(path.dirname(paths.legacyShimPath), { recursive: true });
+    fs.writeFileSync(
+      paths.legacyShimPath,
+      '#!/bin/sh\nexec node "/usr/lib/node_modules/paperclipai/dist/index.js" "$@"\n',
+      { mode: 0o755 },
+    );
+
+    // `run.ts` gates startup on `summary.failed > 0`, so a fail here is an
+    // outage, not a warning.
+    expect(managedInstallChecks(paths)).toEqual([
+      expect.objectContaining({ name: "Managed install", status: "pass" }),
+    ]);
+  });
+
+  // The counterpart: a real managed shim whose store is gone is a genuine
+  // orphan, and must still block with a message that names the witness.
+  it("still blocks on a managed shim left pointing at an empty store", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-doctor-"));
+    const paths = resolveInstallStorePaths({
+      paperclipHome: path.join(root, "relocated", ".paperclip"),
+      homeDir: path.join(root, "real-home"),
+    });
+    writeManagedShim(paths);
+    fs.rmSync(paths.cliRoot, { recursive: true, force: true });
+
+    const [result] = managedInstallChecks(paths);
+    expect(result.status).toBe("fail");
+    expect(result.message).toContain(paths.shimPath);
+  });
 });
