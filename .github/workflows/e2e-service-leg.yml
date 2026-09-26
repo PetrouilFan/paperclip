@@ -1,0 +1,635 @@
+name: E2E Service Leg
+
+# PET-259. The service-lifecycle half of scripts/e2e-install-lifecycle.sh
+# (steps 8a-8f) and the whole of scripts/service-onboard-smoke.sh had never
+# been executed by anyone: the board host cannot run them, because step 8
+# installs and starts a real service and this machine's paperclipai.service
+# runs all eight agents.
+#
+# A throwaway GitHub-hosted runner is the only host that has what the legs
+# need: a real systemd user session (linger + XDG_RUNTIME_DIR) and no
+# production unit. Every job here gets its own fresh runner, which is also
+# what the scripts require -- both refuse to run over a dirty $HOME.
+#
+# Why this is a separate file rather than a job in release-smoke.yml: the
+# `smoke_service` job there exists, but it has never run either (this fork
+# has no workflow registered on its default branch, so `workflow_dispatch`
+# 404s). Keeping the heavy diagnostic leg separate also means it cannot
+# become a release gate by accident.
+#
+# Triggers on push to this branch as well as dispatch: the push trigger is
+# the only one that can run at all until a workflow file lands on master and
+# GitHub indexes it, and `actions/workflows/<file>` is resolved from the
+# default branch.
+
+on:
+  push:
+    branches:
+      - pet-259-service-leg
+  workflow_dispatch:
+    inputs:
+      e2e_ref:
+        description: Git ref for the bootstrap tarball and the managed install
+        required: false
+        default: master
+        type: string
+      paperclipai_version:
+        description: Published dist-tag for service-onboard-smoke.sh
+        required: false
+        default: canary
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # The upstream default (paperclipai/paperclip) does not carry this fork's
+  # e2e scripts, so the legs have to install from the fork.
+  E2E_REPO: PetrouilFan/paperclip
+  E2E_REF: ${{ inputs.e2e_ref || 'pet-259-service-leg' }}
+  # Poll budget for step 8b. The default is 300s; the runner is slower than a
+  # laptop so give it room rather than report a false 8b failure.
+  E2E_SERVICE_TIMEOUT_SECS: "600"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. service-onboard-smoke.sh in full, against paperclipai-smoke.service.
+  # ---------------------------------------------------------------------------
+  service_onboard_smoke:
+    name: service-onboard-smoke.sh (full pass)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Start a user systemd session
+        # The hosted runner has no login session for the runner user, so
+        # `systemctl --user` cannot reach a user manager until lingering
+        # starts one. Export the session address for the steps below.
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          uid="$(id -u)"
+          for _ in $(seq 1 30); do
+            [[ -S "/run/user/$uid/bus" ]] && break
+            sleep 1
+          done
+          [[ -S "/run/user/$uid/bus" ]]
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+          } >> "$GITHUB_ENV"
+
+      - name: Confirm the runner starts with no paperclipai unit and a free :3100
+        # service-onboard-smoke.sh pins HEALTH_URL to 127.0.0.1:3100 and refuses
+        # a caller override, so the port has to be free for the pass to mean
+        # anything. Recorded rather than assumed.
+        run: |
+          {
+            echo "== is-active paperclipai.service =="
+            systemctl --user is-active paperclipai.service 2>&1 || true
+            echo "== is-active paperclipai-smoke.service =="
+            systemctl --user is-active paperclipai-smoke.service 2>&1 || true
+            echo "== listeners on 3100 =="
+            ss -ltn '( sport = :3100 )' 2>&1 || true
+            echo "== all listeners =="
+            ss -ltn 2>&1 || true
+          } 2>&1 | tee "$RUNNER_TEMP/prestate.log"
+
+      - name: Run service-onboard-smoke.sh
+        env:
+          PAPERCLIPAI_VERSION: ${{ inputs.paperclipai_version || 'canary' }}
+          DATA_DIR: ${{ runner.temp }}/service-smoke-data
+          SMOKE_CLEANUP: "false"
+        run: |
+          set +e
+          ./scripts/service-onboard-smoke.sh 2>&1 | tee "$RUNNER_TEMP/service-onboard-smoke.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "smoke_exit=$code" | tee -a "$RUNNER_TEMP/service-onboard-smoke.log"
+          exit "$code"
+
+      - name: Inspect and then tear down paperclipai-smoke.service
+        # SMOKE_CLEANUP=false above deliberately left the unit up so this step
+        # can prove it exists and is serving. The last thing it does is remove
+        # it and prove that it is gone.
+        if: always()
+        run: |
+          {
+            echo "== unit state while installed =="
+            systemctl --user --no-pager status paperclipai-smoke.service || true
+            systemctl --user show paperclipai-smoke.service \
+              -p LoadState -p ActiveState -p MainPID -p ActiveEnterTimestamp || true
+            echo "== health =="
+            curl -fsS http://127.0.0.1:3100/api/health || echo "health endpoint not answering"
+          } 2>&1 | tee "$RUNNER_TEMP/poststate.log"
+          # The smoke keeps its isolated home on the success path (cleanup() is
+          # a no-op when SMOKE_CLEANUP=false), so the shim that owns the unit
+          # is still on disk and can be asked to uninstall it.
+          iso="$(ls -d "${TMPDIR:-/tmp}"/paperclip-smoke-iso.* /tmp/paperclip-smoke-iso.* 2>/dev/null | head -1 || true)"
+          echo "smoke_isohome=$iso"
+          if [ -n "$iso" ] && [ -x "$iso/.local/bin/paperclipai" ]; then
+            "$iso/.local/bin/paperclipai" service uninstall --instance smoke || true
+          else
+            echo "could not locate the smoke isolated home to uninstall through"
+          fi
+          {
+            echo "== after uninstall =="
+            systemctl --user is-active paperclipai-smoke.service 2>&1 || true
+            systemctl --user cat paperclipai-smoke.service 2>&1 || true
+            ls -l "$HOME/.config/systemd/user/" 2>&1 || true
+          } 2>&1 | tee -a "$RUNNER_TEMP/poststate.log"
+
+      - name: Upload service smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: service-onboard-smoke
+          path: ${{ runner.temp }}/*.log
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2. The real thing: e2e-install-lifecycle.sh step 8 on a clean host.
+  # ---------------------------------------------------------------------------
+  e2e_leg_clean_host:
+    name: e2e step 8a-8f (clean host, no paperclipai.service)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Start a user systemd session
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          uid="$(id -u)"
+          for _ in $(seq 1 30); do
+            [[ -S "/run/user/$uid/bus" ]] && break
+            sleep 1
+          done
+          [[ -S "/run/user/$uid/bus" ]]
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+          } >> "$GITHUB_ENV"
+
+      - name: Snapshot the host paperclipai.service before the leg
+        run: |
+          {
+            echo "== BEFORE =="
+            systemctl --user is-active paperclipai.service 2>&1 || true
+            systemctl --user show paperclipai.service \
+              -p LoadState -p ActiveState -p MainPID -p ActiveEnterTimestamp 2>&1 || true
+            systemctl --user list-unit-files 'paperclipai*' --no-pager 2>&1 || true
+          } 2>&1 | tee "$RUNNER_TEMP/before.log"
+
+      - name: Run e2e-install-lifecycle.sh
+        # The whole script, unedited: steps 1-7 are what put a managed shim in
+        # place, and step 8 runs `onboard` through that shim. Only the script's
+        # own exit code is tolerated here -- the pass/fail that matters is the
+        # 8a-8f extraction below.
+        run: |
+          set +e
+          ./scripts/e2e-install-lifecycle.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log" || true
+
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "script_exit=$code" | tee -a "$RUNNER_TEMP/e2e.log"
+      - name: Extract and require the 8a-8f result lines
+        run: |
+          log="$RUNNER_TEMP/e2e.log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$RUNNER_TEMP/e2e.clean.log"
+          {
+            echo "== step 8 result lines =="
+            grep -E '^(PASS|FAIL|SKIP) +8[a-f] ' "$RUNNER_TEMP/e2e.clean.log" || echo "(no 8a-8f lines found)"
+            echo
+            echo "== full RESULTS summary =="
+            sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/e2e.clean.log" || true
+          } 2>&1 | tee "$RUNNER_TEMP/leg-8a-8f.log"
+          missing=0
+          for leg in 8a 8b 8c 8d 8e 8f; do
+            if ! grep -qE "^PASS +$leg " "$RUNNER_TEMP/e2e.clean.log"; then
+              echo "MISSING PASS: $leg"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Assert the host unit was never activated, and the leg's unit is gone
+        if: always()
+        run: |
+          {
+            echo "== AFTER =="
+            systemctl --user is-active paperclipai.service 2>&1 || true
+            systemctl --user show paperclipai.service \
+              -p LoadState -p ActiveState -p MainPID -p ActiveEnterTimestamp 2>&1 || true
+            echo "== leg unit (paperclipai-e2e.service) after uninstall =="
+            systemctl --user is-active paperclipai-e2e.service 2>&1 || true
+            systemctl --user show paperclipai-e2e.service -p LoadState -p ActiveState 2>&1 || true
+            systemctl --user cat paperclipai-e2e.service 2>&1 || true
+            echo "== unit files on disk =="
+            ls -l "$HOME/.config/systemd/user/" 2>&1 || true
+            echo "== leftovers from the leg's isolated home =="
+            ls -d /tmp/e2e-service-iso.* 2>&1 || echo "(no isolated home left behind)"
+            echo "== the leg's own journal =="
+            journalctl --user -u paperclipai-e2e.service --no-pager -n 40 2>&1 || true
+          } 2>&1 | tee "$RUNNER_TEMP/after.log"
+
+      - name: Upload e2e leg evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-leg-clean-host
+          path: ${{ runner.temp }}/*.log
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. Same leg, but with a stopped-but-present paperclipai.service.
+  #
+  # This is the non-vacuity control. On a runner with no unit at all, 8f's
+  # `is-active paperclipai.service | grep -qx active` is trivially satisfied by
+  # absence, so it proves nothing. Plant a real unit, leave it stopped, and 8f
+  # has to mean "the unit that is there was not started".
+  # ---------------------------------------------------------------------------
+  e2e_leg_stopped_unit:
+    name: e2e step 8a-8f (stopped-but-present paperclipai.service)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Start a user systemd session
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          uid="$(id -u)"
+          for _ in $(seq 1 30); do
+            [[ -S "/run/user/$uid/bus" ]] && break
+            sleep 1
+          done
+          [[ -S "/run/user/$uid/bus" ]]
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+          } >> "$GITHUB_ENV"
+
+      - name: Plant a stopped paperclipai.service sentinel
+        run: |
+          mkdir -p "$HOME/.config/systemd/user"
+          cat > "$HOME/.config/systemd/user/paperclipai.service" <<'UNIT'
+          [Unit]
+          Description=Planted paperclipai.service sentinel (PET-259)
+
+          [Service]
+          Type=simple
+          ExecStart=/bin/sleep infinity
+
+          [Install]
+          WantedBy=default.target
+          UNIT
+          systemctl --user daemon-reload
+          # Start it once and stop it again, so the baseline is non-trivial:
+          # a never-started unit has an empty ActiveEnterTimestamp and
+          # MainPID=0, and "still empty" would be satisfied by the leg simply
+          # never having looked. With a real prior activation recorded, any
+          # activation by the leg moves the timestamp and the PID.
+          systemctl --user start paperclipai.service
+          systemctl --user is-active paperclipai.service | grep -qx active
+          systemctl --user stop paperclipai.service
+          systemctl --user reset-failed paperclipai.service || true
+          systemctl --user show paperclipai.service \
+            -p LoadState -p ActiveState -p MainPID -p ActiveEnterTimestamp \
+            -p InactiveEnterTimestamp -p FragmentPath 2>&1 | tee "$RUNNER_TEMP/sentinel-before.txt"
+          # The whole point: `inactive` contains the substring `active`, so a
+          # preflight written as `grep -q active` would call this host live.
+          if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
+            echo "sentinel is active; this job needs it stopped"
+            exit 1
+          fi
+          grep -qE "ActiveEnterTimestamp=.+" "$RUNNER_TEMP/sentinel-before.txt" || {
+            echo "sentinel has no recorded activation; the before/after comparison would be vacuous"
+            exit 1
+          }
+
+      - name: Run e2e-install-lifecycle.sh
+        run: |
+          set +e
+          ./scripts/e2e-install-lifecycle.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log" || true
+
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "script_exit=$code" | tee -a "$RUNNER_TEMP/e2e.log"
+      - name: Extract and require the 8a-8f result lines
+        run: |
+          sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/e2e.log" > "$RUNNER_TEMP/e2e.clean.log"
+          {
+            echo "== step 8 result lines =="
+            grep -E '^(PASS|FAIL|SKIP) +8[a-f] ' "$RUNNER_TEMP/e2e.clean.log" || echo "(no 8a-8f lines found)"
+            echo
+            echo "== did the preflight wrongly fire? =="
+            grep -n "PET-52 guard" "$RUNNER_TEMP/e2e.clean.log" || echo "(no: the grep -qx preflight correctly ignored an 'inactive' unit)"
+            echo
+            echo "== full RESULTS summary =="
+            sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/e2e.clean.log" || true
+          } 2>&1 | tee "$RUNNER_TEMP/leg-8a-8f.log"
+          missing=0
+          for leg in 8a 8b 8c 8d 8e 8f; do
+            if ! grep -qE "^PASS +$leg " "$RUNNER_TEMP/e2e.clean.log"; then
+              echo "MISSING PASS: $leg"
+              missing=1
+            fi
+          done
+          # And the guard must not have fired, or the whole point is lost.
+          if grep -q "PET-52 guard" "$RUNNER_TEMP/e2e.clean.log"; then
+            echo "PREFLIGHT FIRED on a stopped-but-present unit"
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Prove the sentinel is byte-identical before and after
+        if: always()
+        run: |
+          systemctl --user show paperclipai.service \
+            -p LoadState -p ActiveState -p MainPID -p ActiveEnterTimestamp \
+            -p InactiveEnterTimestamp -p FragmentPath 2>&1 | tee "$RUNNER_TEMP/sentinel-after.txt"
+          {
+            echo "== leg unit after uninstall =="
+            systemctl --user is-active paperclipai-e2e.service 2>&1 || true
+            systemctl --user cat paperclipai-e2e.service 2>&1 || true
+            echo "== unit files on disk =="
+            ls -l "$HOME/.config/systemd/user/" 2>&1 || true
+            echo "== isolated home leftovers =="
+            ls -d /tmp/e2e-service-iso.* 2>&1 || echo "(no isolated home left behind)"
+          } 2>&1 | tee -a "$RUNNER_TEMP/after.log"
+          # The two fields the issue asks to compare, before vs after.
+          for field in ActiveEnterTimestamp MainPID; do
+            b="$(grep -E "^$field=" "$RUNNER_TEMP/sentinel-before.txt" || true)"
+            a="$(grep -E "^$field=" "$RUNNER_TEMP/sentinel-after.txt" || true)"
+            echo "$field before: ${b:-<absent>}"
+            echo "$field after:  ${a:-<absent>}"
+            if [ "$b" != "$a" ]; then
+              echo "DRIFT in $field -- the leg changed the host unit"
+              exit 1
+            fi
+          done
+          # Belt and braces: the recorded activation must still be the old one
+          # and the unit must not be running.
+          systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active && {
+            echo "the host unit is active after the leg"
+            exit 1
+          }
+
+      - name: Upload stopped-sentinel evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-leg-stopped-sentinel
+          path: ${{ runner.temp }}/*.log
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 4. Guard: an ACTIVE host unit must make the preflight abort, not record.
+  # ---------------------------------------------------------------------------
+  guard_active_unit:
+    name: guard trip - active paperclipai.service must abort
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Start a user systemd session
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          uid="$(id -u)"
+          for _ in $(seq 1 30); do
+            [[ -S "/run/user/$uid/bus" ]] && break
+            sleep 1
+          done
+          [[ -S "/run/user/$uid/bus" ]]
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+          } >> "$GITHUB_ENV"
+
+      - name: Plant and START a paperclipai.service sentinel
+        run: |
+          mkdir -p "$HOME/.config/systemd/user"
+          cat > "$HOME/.config/systemd/user/paperclipai.service" <<'UNIT'
+          [Unit]
+          Description=Planted paperclipai.service sentinel (PET-259)
+
+          [Service]
+          Type=simple
+          ExecStart=/bin/sleep infinity
+
+          [Install]
+          WantedBy=default.target
+          UNIT
+          systemctl --user daemon-reload
+          systemctl --user start paperclipai.service
+          systemctl --user is-active paperclipai.service | grep -qx active
+          systemctl --user show paperclipai.service -p ActiveState -p MainPID -p ActiveEnterTimestamp | tee "$RUNNER_TEMP/before.log"
+
+      - name: Run e2e-install-lifecycle.sh (must abort at the preflight)
+        # E2E_SKIP_NPM=1 keeps this to the legs the guard depends on: the
+        # bootstrap, the managed install that provides the shim, and then
+        # step 8 -- which must never be entered.
+        env:
+          E2E_SKIP_NPM: "1"
+        run: |
+          set +e
+          ./scripts/e2e-install-lifecycle.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "script_exit=$code" | tee -a "$RUNNER_TEMP/e2e.log"
+
+      - name: Require the guard to trip and terminate
+        run: |
+          sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/e2e.log" > "$RUNNER_TEMP/e2e.clean.log"
+          bad=0
+          {
+            echo "== RESULTS =="
+            sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/e2e.clean.log" || true
+          } 2>&1 | tee "$RUNNER_TEMP/guard.log"
+          grep -q "PET-52 guard" "$RUNNER_TEMP/e2e.clean.log" || { echo "GUARD DID NOT FIRE"; bad=1; }
+          grep -q "could not\|not run" "$RUNNER_TEMP/e2e.clean.log" || echo "(no explanatory line)"
+          # The leg must not have started. 8a is the first thing it would print.
+          if grep -qE '^(PASS|FAIL) +8[a-f] ' "$RUNNER_TEMP/e2e.clean.log"; then
+            echo "THE LEG RAN DESPITE AN ACTIVE HOST UNIT"
+            bad=1
+          fi
+          # `8 isolation:` is printed immediately after the guards, so its
+          # absence proves control never reached the override.
+          if grep -q "8 isolation: instance=e2e" "$RUNNER_TEMP/e2e.clean.log"; then
+            echo "CONTROL REACHED THE HOME OVERRIDE"
+            bad=1
+          fi
+          exit "$bad"
+
+      - name: The sentinel must be untouched
+        if: always()
+        run: |
+          systemctl --user is-active paperclipai.service | grep -qx active || {
+            echo "the leg stopped the planted unit"
+            exit 1
+          }
+          systemctl --user show paperclipai.service -p ActiveState -p MainPID -p ActiveEnterTimestamp 2>&1 | tee "$RUNNER_TEMP/after.log"
+          systemctl --user show paperclipai-e2e.service -p LoadState -p ActiveState 2>&1 | tee -a "$RUNNER_TEMP/after.log" || true
+
+      - name: Upload active-sentinel guard evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: guard-active-unit
+          path: ${{ runner.temp }}/*.log
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 5. Guard: a broken mktemp must abort, not fall through to HOME="".
+  # ---------------------------------------------------------------------------
+  guard_broken_mktemp:
+    name: guard trip - broken mktemp must abort
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Start a user systemd session
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          uid="$(id -u)"
+          for _ in $(seq 1 30); do
+            [[ -S "/run/user/$uid/bus" ]] && break
+            sleep 1
+          done
+          [[ -S "/run/user/$uid/bus" ]]
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+          } >> "$GITHUB_ENV"
+
+      - name: Install an mktemp that fails only for the leg's template
+        # Surgical on purpose: a blanket broken mktemp would take pnpm and npm
+        # down with it and we would learn nothing. This one refuses exactly the
+        # `e2e-service-iso.XXXXXX` template and delegates everything else.
+        run: |
+          mkdir -p "$RUNNER_TEMP/fakebin"
+          cat > "$RUNNER_TEMP/fakebin/mktemp" <<'SHIM'
+          #!/usr/bin/env bash
+          for arg in "$@"; do
+            case "$arg" in
+              *e2e-service-iso.*) echo "mktemp: simulated failure" >&2; exit 1 ;;
+            esac
+          done
+          exec /usr/bin/mktemp "$@"
+          SHIM
+          chmod +x "$RUNNER_TEMP/fakebin/mktemp"
+          "$RUNNER_TEMP/fakebin/mktemp" -d /tmp/should-work.XXXXXX && echo "delegation works"
+          "$RUNNER_TEMP/fakebin/mktemp" -d /tmp/e2e-service-iso.XXXXXX && {
+            echo "the shim did not fail; the test is not testing anything"
+            exit 1
+          } || echo "shim fails only for the leg's template, as intended"
+
+      - name: Run e2e-install-lifecycle.sh (must abort at the mktemp guard)
+        env:
+          E2E_SKIP_NPM: "1"
+        run: |
+          set +e
+          export PATH="$RUNNER_TEMP/fakebin:$PATH"
+          ./scripts/e2e-install-lifecycle.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "script_exit=$code" | tee -a "$RUNNER_TEMP/e2e.log"
+
+      - name: Require the guard to trip and terminate
+        run: |
+          sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/e2e.log" > "$RUNNER_TEMP/e2e.clean.log"
+          bad=0
+          {
+            echo "== RESULTS =="
+            sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/e2e.clean.log" || true
+          } 2>&1 | tee "$RUNNER_TEMP/guard.log"
+          grep -q "could not create isolated HOME" "$RUNNER_TEMP/e2e.clean.log" || { echo "MKTEMP GUARD DID NOT FIRE"; bad=1; }
+          if grep -qE '^(PASS|FAIL) +8[a-f] ' "$RUNNER_TEMP/e2e.clean.log"; then
+            echo "THE LEG RAN WITH AN EMPTY ISOLATED HOME"
+            bad=1
+          fi
+          if grep -q "8 isolation: instance=e2e" "$RUNNER_TEMP/e2e.clean.log"; then
+            echo "CONTROL REACHED THE HOME OVERRIDE"
+            bad=1
+          fi
+          # OVERALL must be FAIL and the script must have exited non-zero: a
+          # guard that only records leaves FAILED=1 but keeps going, and the
+          # exit code is the difference between the two.
+          grep -q "OVERALL: FAIL" "$RUNNER_TEMP/e2e.clean.log" || { echo "expected OVERALL: FAIL"; bad=1; }
+          exit "$bad"
+
+      - name: Upload broken-mktemp guard evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: guard-broken-mktemp
+          path: ${{ runner.temp }}/*.log
+          retention-days: 14
+          if-no-files-found: error
