@@ -188,16 +188,46 @@ export function renderSystemdUnit(input: { instanceId: string; shimPath: string;
   return `[Unit]
 Description=Paperclip AI (${escapeSystemd(input.instanceId)})
 After=network.target
-# A fast-failing start must not be able to exhaust the burst. With
-# RestartSec=5 the previous 60s interval allowed five attempts inside 25
-# seconds, so any transient startup fault (a doctor check that failed on
-# ambiguous filesystem state, a shim mid-update) reached start-limit-hit
-# inside half a minute and left the unit down until a human intervened. Five
-# minutes keeps the same five attempts but spaces them across the window a
-# real recovery needs. StartLimitAction stays systemd's default (none), so
-# exhausting the burst still parks the unit rather than rebooting the host.
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# A fast-failing start must not be able to exhaust the burst.
+#
+# The mechanism is the exponential restart backoff in [Service] below, not this
+# interval. StartLimitIntervalSec is only the width of the sliding window that
+# StartLimitBurst counts starts in; it does not delay or space the attempts
+# themselves. Widening it from 60 to 300 while the attempts still land 5s apart
+# leaves the burst draining at the same ~25s. Measured on systemd 261.3 at this
+# host, two transient user units differing only in the interval, both with
+# Restart=always/RestartSec=5/StartLimitBurst=5/ExecStart=/bin/false: identical
+# attempt timestamps to the millisecond from attempt 2, both reaching
+# start-limit-hit at T+25s, and neither retrying again once the burst is
+# charged (observed for 400s, past both windows). systemd does not reschedule a
+# retry when the interval expires.
+#
+# This host is the proof that the interval alone is not the mechanism, and it
+# is worth keeping in mind before "fixing" this again. The deployed unit carries
+# a hand-written 70-start-timeout.conf pinning StartLimitIntervalSec=1h, and it
+# still does not help: measured on this host with interval 1h, burst 5 and no
+# backoff, the five attempts land 5.1s apart and reach start-limit-hit at T+26s
+# with ActiveState=failed. A wider window around attempts that are already
+# packed together is a wider window around the same failure.
+#
+# So the interval and the burst are set to match the backoff, not to look wide.
+# With RestartMaxDelaySec=60 the steady-state spacing between attempts is 60s,
+# so a 900s window holds ~15 starts and a burst of 12 is reachable: a fault
+# that outlives the retry budget still parks the unit, and a fault that clears
+# inside it is retried into recovery. Measured on systemd 261.3 at this host,
+# transient user units carrying exactly these directives and ExecStart=/bin/false:
+#   - a fault clearing on the 4th attempt recovers, ActiveState=active, T+27s;
+#   - a permanently failing start charges all 12 and parks at T+448s (7.5 min),
+#     against T+26s for the policy this replaces.
+# Getting this pairing wrong is the failure mode worth naming: interval 300 with
+# the original burst of 5 reaches start-limit-hit at T+49s, because 5
+# backoff-spaced starts fit inside 300s too. The backoff lengthens the budget;
+# only the burst decides where the budget ends.
+#
+# StartLimitAction stays systemd's default (none), so a genuinely permanent
+# failure parks the unit for a human rather than rebooting the host.
+StartLimitIntervalSec=900
+StartLimitBurst=12
 
 [Service]
 Type=notify
@@ -209,6 +239,25 @@ Environment="PAPERCLIP_HOME=${escapeSystemd(input.homeDir)}"
 WorkingDirectory=%h
 Restart=always
 RestartSec=5
+# Exponential backoff, the part that actually keeps a fast-failing start from
+# draining StartLimitBurst. systemd grows the delay before each restart from
+# RestartSec up to RestartMaxDelaySec, so the starts it counts are spread across
+# minutes instead of packed into the first half-minute. RestartSec is the floor
+# for the first retry, RestartMaxDelaySec the ceiling every later retry sits at.
+#
+# The growth curve is systemd's own and is deliberately not reimplemented or
+# predicted here. Measured on systemd 261.3 at this host with these values, the
+# delay before each successive restart was 5.2s, 8.5s, 13.8s, 22.3s, 36.8s, then
+# 60.3s for every attempt after that — growth of about 1.62x per restart, not
+# the RestartSteps-fold step the name suggests. The only two facts anything
+# should rely on are the documented ones: the delay starts at RestartSec, and it
+# never exceeds RestartMaxDelaySec.
+#
+# RestartSteps and RestartMaxDelaySec need systemd v250+. On anything older they
+# are ignored and the unit falls back to a flat RestartSec=5, which is the
+# behaviour before this change rather than a new failure mode.
+RestartSteps=5
+RestartMaxDelaySec=60
 # Type=notify cannot send READY=1 until the embedded postmaster is accepting
 # connections and migrations have run, because the postmaster lives inside this
 # unit's cgroup and the server owns its shutdown. systemd's 90s default therefore

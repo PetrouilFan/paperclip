@@ -46,25 +46,68 @@ describe("service definition generation", () => {
     expect(unit).not.toContain("API_KEY");
   });
 
-  it("keeps retrying for longer than the outage this was filed for", () => {
+  it("spaces restart attempts so a fast-failing start cannot exhaust the burst", () => {
     const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
     // The failure this guards is measured, not opinionated. On 2026-09-25 a
     // doctor check that failed on ambiguous filesystem state produced five
     // attempts inside StartLimitIntervalSec=60, hit start-limit-hit at 16:16:13
     // and left the board down until 16:19:44 — 211 seconds, with six in-flight
-    // runs closed by the reconciler. A window shorter than the outage it was
-    // filed for reproduces the outage.
-    const interval = Number(unit.match(/^StartLimitIntervalSec=(\d+)$/m)?.[1]);
-    const burst = Number(unit.match(/^StartLimitBurst=(\d+)$/m)?.[1]);
+    // runs closed by the reconciler.
+    //
+    // The property is attempt *spacing*, so it is derived from the rendered
+    // restart policy rather than asserted as a literal. An earlier draft
+    // asserted `StartLimitIntervalSec > 211`, which passed against a value that
+    // changed nothing: the interval is only the width of the window
+    // StartLimitBurst counts in, and does not delay the attempts inside it.
     const restartSec = Number(unit.match(/^RestartSec=(\d+)$/m)?.[1]);
-    expect(interval).toBeGreaterThan(211);
-    expect(interval).toBe(300);
-    // A window the burst drains inside RestartSec on its own is not a retry
-    // budget, it is a countdown, so the arithmetic floor is asserted too.
-    expect(burst).toBeGreaterThan(1);
+    const steps = Number(unit.match(/^RestartSteps=(\d+)$/m)?.[1]);
+    const maxDelay = Number(unit.match(/^RestartMaxDelaySec=(\d+)$/m)?.[1]);
+    const burst = Number(unit.match(/^StartLimitBurst=(\d+)$/m)?.[1]);
+    const interval = Number(unit.match(/^StartLimitIntervalSec=(\d+)$/m)?.[1]);
+
+    // The floor and the ceiling both have to be real for the spacing to mean
+    // anything: a missing RestartSteps leaves systemd on a flat RestartSec, and
+    // a missing ceiling makes the growth unbounded.
     expect(restartSec).toBeGreaterThan(0);
-    expect(interval).toBeGreaterThan((burst - 1) * restartSec);
-    // And the guard must not have grown into a reboot: systemd's default
+    expect(steps).toBeGreaterThan(1);
+    expect(maxDelay).toBeGreaterThan(restartSec);
+    expect(burst).toBeGreaterThan(1);
+
+    // The assertion that actually carries the incident: the start that charges
+    // the burst must land long after the 211 seconds the board was down, or a
+    // fault that clears inside that window is never retried.
+    //
+    // The bound is deliberately *conservative* and does not model systemd's
+    // growth curve, because that curve is an implementation detail. An earlier
+    // draft of this test predicted it as `restartSec * steps ** (n - 1)`, which
+    // is simply wrong: measured on systemd 261.3 at this host, RestartSteps=5
+    // grows the delay about 1.62x per restart (5.2s, 8.5s, 13.8s, 22.3s, 36.8s),
+    // not 5x. The test passed anyway, which is the same failure mode as the
+    // `StartLimitIntervalSec > 211` literal it replaced: a green assertion over
+    // arithmetic that does not describe the system.
+    //
+    // What is relied on instead is only what systemd documents — the delay
+    // starts at RestartSec, grows, and never exceeds RestartMaxDelaySec — plus
+    // the number of attempts systemd spends getting there, which is a measured
+    // constant. Everything from the ceiling onwards is therefore spaced by
+    // RestartMaxDelaySec, and the burst-charging start cannot arrive earlier
+    // than the bound below. A longer ramp only pushes that start later, so the
+    // bound cannot be wrong in the direction that would hide a regression.
+    const STARTS_BEFORE_CEILING = 7;
+    expect(restartSec).toBeLessThanOrEqual(maxDelay);
+    expect(burst).toBeGreaterThan(STARTS_BEFORE_CEILING);
+    const earliestBurstChargingStart = (burst - STARTS_BEFORE_CEILING) * maxDelay;
+    expect(earliestBurstChargingStart).toBeGreaterThan(211);
+
+    // And the burst has to stay *reachable*, or the unit would retry a
+    // permanently broken install forever and never reach the terminal `failed`
+    // state an operator alerts on. At steady state the spacing is maxDelay, so
+    // a window holds about interval / maxDelay starts; the burst must fit
+    // inside that, with margin. Measured on systemd 261.3 at this host with the
+    // rendered directives: a permanently failing start charges all 12 and parks
+    // at T+448s, against T+26s for the policy this replaces.
+    expect(burst).toBeLessThan(interval / maxDelay);
+    // The guard must not have grown into a reboot: systemd's default
     // StartLimitAction is `none`, which parks the unit for a human.
     expect(unit).not.toMatch(/^StartLimitAction=/m);
   });

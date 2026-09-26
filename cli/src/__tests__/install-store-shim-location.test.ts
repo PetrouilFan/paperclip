@@ -116,15 +116,35 @@ describe("PET-292: relocating the store no longer produces a self-contradictory 
     expect(shimCheck?.status).toBe("pass");
   });
 
-  it("still blocks with the original wording when a real store is half-torn", () => {
+  // PET-111: this assertion was `fail` and was changed to `warn` deliberately,
+  // not as a side effect of a rebase. #29 called the half-torn store a blocking
+  // state; this branch calls it the one state the check cannot classify.
+  //
+  // `hasManagedArtifacts` is a heuristic that a single existing path trips, so a
+  // store caught mid-update is indistinguishable from one that lost its
+  // manifest to something worse. `commands/run.ts` refuses to bind the server
+  // port on any `fail`, so treating the unprovable state as provable made the
+  // board unreachable on restart — which is the incident PET-111 documents, and
+  // the reason this host sat down for 3m31s with six runs closed.
+  //
+  // The provable siblings of this state keep their veto and are covered
+  // elsewhere in this file: an unreadable manifest, a dangling `current`, and
+  // the relocated-root mismatch immediately above. Nothing on the boot path
+  // reads the manifest either — `version.ts` and `update-notice.ts` both use
+  // `readInstallManifest(...)?.…` and degrade to a default, and the managed shim
+  // execs `$current/node_modules/paperclipai/dist/index.js`. So `warn` lets a
+  // slightly less well-described instance boot; it does not let a broken one.
+  it("warns, without blocking startup, when a real store is half-torn", () => {
     const home = relocatedHome("torn");
     const p = store(home);
     seed(p);                       // manifest, marker and current all present
     fs.rmSync(p.manifestPath);     // ...except the manifest
     const finding = managedInstallChecks(p).find((c) => c.name === "Managed install manifest");
-    expect(finding?.status).toBe("fail");
+    expect(finding?.status).toBe("warn");
     expect(finding?.message).toContain("artifacts exist but");
-    expect(finding?.repairHint).toBe("Re-run `paperclipai install`");
+    // The repair hint has to say what the downgrade means, or an operator
+    // reading `warn` cannot tell a non-blocking finding from a soft one.
+    expect(finding?.repairHint).toContain("does not block startup");
   });
 });
 
