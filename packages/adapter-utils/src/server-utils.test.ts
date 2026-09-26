@@ -21,6 +21,7 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
+  PAYLOAD_WELL_FORMEDNESS_CLAUSE,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -1475,6 +1476,77 @@ describe("renderPaperclipWakePrompt", () => {
     );
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
       "Respect budget, pause/cancel, approval gates, and company boundaries",
+    );
+  });
+
+  it("states the payload well-formedness clause at every run shape, ahead of the two-failure rule", () => {
+    // The clause qualifies the two-failure rule, so it has to sit immediately
+    // before it on every surface that carries the rule. Patching one anchor and
+    // not the others leaves an agent reading the incomplete rule.
+    //
+    // Assert the exported constant, not a fourth hand-maintained copy of the
+    // text. A copy here could be edited to match a wrong source and the test
+    // would pass while the contract regressed.
+    const CLAUSE = PAYLOAD_WELL_FORMEDNESS_CLAUSE;
+    const TWO_FAILURE_RULE =
+      "After 2 consecutive failures of the same control-plane write";
+
+    // The clause has to say what a bare 5xx body does not: name no field, no
+    // offset, no parser message. Without that, the rule still reads as
+    // "the server is down, retry budget spent".
+    expect(CLAUSE).toContain("parse the exact bytes you send");
+    expect(CLAUSE).toContain("is a client fault, not a server fault");
+    expect(CLAUSE).toContain("does not consume a retry");
+    expect(CLAUSE).toContain("is not evidence of a server fault");
+
+    // 1. heartbeat agent prompt template
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(CLAUSE);
+    expect(
+      DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.indexOf(CLAUSE),
+    ).toBeLessThan(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.indexOf(TWO_FAILURE_RULE));
+    // Reading order within a bullet list, not a substring of one line.
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
+      `- ${CLAUSE}\n- ${TWO_FAILURE_RULE}`,
+    );
+
+    // 2. conversation prompt template
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(CLAUSE);
+    expect(
+      DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE.indexOf(CLAUSE),
+    ).toBeLessThan(
+      DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE.indexOf(TWO_FAILURE_RULE),
+    );
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(
+      `${CLAUSE}\n${TWO_FAILURE_RULE}`,
+    );
+
+    // 3. server task-context markdown, rendered into the wake prompt
+    const wakePrompt = renderPaperclipWakePrompt(
+      {
+        reason: "issue_assigned",
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-1",
+          title: "Update prompts",
+          status: "in_progress",
+        },
+        commentWindow: {
+          requestedCount: 0,
+          includedCount: 0,
+          missingCount: 0,
+        },
+        comments: [],
+        fallbackFetchNeeded: false,
+      },
+      { includeExecutionContract: true },
+    );
+    expect(wakePrompt).toContain(CLAUSE);
+    expect(wakePrompt.indexOf(CLAUSE)).toBeLessThan(
+      wakePrompt.indexOf(TWO_FAILURE_RULE),
+    );
+    // Same rendered paragraph, so the clause reads as part of the contract.
+    expect(wakePrompt).toContain(
+      `do not end the run. ${CLAUSE} ${TWO_FAILURE_RULE}`,
     );
   });
 
