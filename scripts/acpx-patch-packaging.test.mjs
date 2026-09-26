@@ -21,6 +21,7 @@ import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
   createBundledInstallManifest,
   materializePublishManifest,
+  readWorkspacePackageVersions,
   selectBundledDependencyPatches,
 } from "./prepare-bundled-package.mjs";
 
@@ -173,6 +174,59 @@ test("bundled package staging materializes workspace dependency versions", () =>
     caret: "^2026.723.0",
     tilde: "~2026.723.0",
   });
+});
+
+test("a workspace specifier resolves to the dependency's own version, not the dependent's", () => {
+  // The regression this guards: in an unstamped checkout (@paperclipai/plugin-sdk 1.0.0,
+  // @paperclipai/server 0.3.1) rewriting against the dependent's version emitted
+  // `@paperclipai/plugin-sdk@0.3.1`, a version in neither the payload tarballs nor the
+  // registry, and `install --ref` died with ETARGET.
+  const staged = materializePublishManifest(
+    {
+      name: "@paperclipai/server",
+      version: "0.3.1",
+      dependencies: { "@paperclipai/plugin-sdk": "workspace:*", "@paperclipai/shared": "workspace:^" },
+    },
+    { resolveWorkspaceVersion: (name) => ({ "@paperclipai/plugin-sdk": "1.0.0", "@paperclipai/shared": "0.3.1" })[name] },
+  );
+
+  assert.deepEqual(staged.dependencies, {
+    "@paperclipai/plugin-sdk": "1.0.0",
+    "@paperclipai/shared": "^0.3.1",
+  });
+});
+
+test("an unresolvable workspace specifier names the package instead of inventing a version", () => {
+  assert.throws(
+    () =>
+      materializePublishManifest(
+        { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/absent": "workspace:*" } },
+        { resolveWorkspaceVersion: () => undefined },
+      ),
+    /@paperclipai\/absent is not a package of this workspace/,
+  );
+});
+
+test("this checkout is not in lockstep, which is why the dependent's version is wrong", () => {
+  // If this ever asserts equal, the resolver is untestable against the real tree and the
+  // ETARGET regression can come back unnoticed.
+  const versions = readWorkspacePackageVersions();
+  assert.equal(versions.get("@paperclipai/server"), serverPackage.version);
+  assert.equal(versions.get("@paperclipai/plugin-sdk"), "1.0.0");
+  assert.notEqual(versions.get("@paperclipai/plugin-sdk"), versions.get("@paperclipai/server"));
+
+  for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    for (const [name, specifier] of Object.entries(serverPackage[section] ?? {})) {
+      if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) continue;
+      const resolved = versions.get(name);
+      assert.equal(typeof resolved, "string", `${name} is a workspace dependency of server but absent from the manifest`);
+      assert.equal(
+        materializePublishManifest(serverPackage, { resolveWorkspaceVersion: (n) => versions.get(n) })[section][name],
+        `${specifier.slice("workspace:".length) === "^" ? "^" : ""}${resolved}`,
+        `server's ${section}.${name} must be staged at the dependency's own version`,
+      );
+    }
+  }
 });
 
 test("bundled package staging installs only dependencies included in the tarball", () => {

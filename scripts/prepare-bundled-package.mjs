@@ -7,7 +7,21 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-export function materializePublishManifest(pkg) {
+// A `workspace:` specifier names a sibling package, so the version that satisfies it is
+// the *dependency's* version -- never the depending package's own `version`. They are
+// only equal when every shipping package is stamped in lockstep, which is what
+// scripts/release.sh does, so the two call paths agreed until `install --ref` began
+// packaging a fresh checkout of the source tree, where nothing has been stamped:
+// @paperclipai/plugin-sdk is 1.0.0 there while @paperclipai/server is 0.3.1, so
+// rewriting against pkg.version produced `@paperclipai/plugin-sdk@0.3.1` -- a version
+// that exists neither in the payload tarballs nor on the registry, which npm reports as
+// `ETARGET No matching version found`.
+//
+// `resolveWorkspaceVersion` returns the dependency's real version, or undefined when the
+// name is not a workspace package of this repository. Omitting it keeps the historical
+// pkg.version behaviour for callers that pin a version deliberately
+// (scripts/preview-artifacts.mjs) and for a tree that really is in lockstep.
+export function materializePublishManifest(pkg, { resolveWorkspaceVersion } = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -22,13 +36,45 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        const resolved = resolveWorkspaceVersion?.(name);
+        if (resolved === undefined) {
+          // No resolver, or not a package of this repository. In lockstep that is the
+          // dependent's version; unstamped it would silently name a version that does
+          // not exist, so say which package is unresolvable rather than packing it.
+          if (resolveWorkspaceVersion) {
+            throw new Error(
+              `${pkg.name} declares "${name}": "${specifier}", but ${name} is not a package of this ` +
+                `workspace (see scripts/release-package-manifest.json). A workspace specifier cannot be ` +
+                `rewritten to a publishable version without knowing the dependency's own version.`,
+            );
+          }
+          return [name, `${prefix}${pkg.version}`];
+        }
+        return [name, `${prefix}${resolved}`];
       }),
     );
   }
 
   delete publishManifest.publishConfig;
   return publishManifest;
+}
+
+// The real version of every workspace package, read from the checkout rather than
+// assumed. scripts/release-package-manifest.json is already the authoritative list of
+// shipping packages (cli/src/commands/install.ts resolves the git-install payload from
+// it), so it is the one place that already has to stay in sync with what ships.
+export function readWorkspacePackageVersions(sourceRoot = repoRoot) {
+  const manifestPath = resolve(sourceRoot, "scripts", "release-package-manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const versions = new Map();
+  for (const entry of manifest) {
+    const packageJsonPath = resolve(sourceRoot, entry.dir, "package.json");
+    if (!existsSync(packageJsonPath)) continue;
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    if (typeof packageJson.version !== "string" || packageJson.version.length === 0) continue;
+    versions.set(entry.name, packageJson.version);
+  }
+  return versions;
 }
 
 export function createBundledInstallManifest(publishManifest, bundledDependencies) {
@@ -168,7 +214,10 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const workspaceVersions = readWorkspacePackageVersions(sourceRoot);
+  const publishManifest = materializePublishManifest(sourcePackage, {
+    resolveWorkspaceVersion: (name) => workspaceVersions.get(name),
+  });
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
