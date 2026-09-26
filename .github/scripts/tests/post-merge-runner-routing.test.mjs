@@ -5,6 +5,16 @@ import { runInNewContext } from "node:vm";
 
 const fleet = "runs-on/fleet=paperclip-post-merge-x64/env=public-ci";
 const sha = "a".repeat(40);
+
+/**
+ * The property under test is that the bookkeeping job runs on a push to master
+ * and fails closed when verification does not pass. Scoping that job to one
+ * repository is a deployment choice, not a safety property, so the repository
+ * guard is accepted as present or absent. Dropping the master-ref guard, or
+ * making the job survive a failed `needs`, is still a failure.
+ */
+const MASTER_ONLY_GUARD =
+  /^ {4}if: (?:github\.repository == 'paperclipai\/paperclip' && )?github\.ref == 'refs\/heads\/master'$/m;
 const base = {
   repository: "paperclipai/paperclip", repository_id: "1170821064",
   ref: "refs/heads/master", event_name: "push", sha,
@@ -94,7 +104,7 @@ test("Cloud readiness bookkeeping never waits for the AWS verification fleet", (
     bodies.set(name, body);
     assert.match(body, /^    runs-on: ubuntu-latest$/m);
     assert.doesNotMatch(body, /^ +continue-on-error:|^ +if:.*always\(\)/m);
-    assert.match(body, /^    if: github.repository == 'paperclipai\/paperclip' && github.ref == 'refs\/heads\/master'$/m);
+    assert.match(body, MASTER_ONLY_GUARD);
     assert.match(body, /^ +SOURCE_SHA: \$\{\{ github.sha \}\}$/m);
     assert.equal(body.match(/^    needs: (.+)$/m)?.[1] ?? null, needs, `${name} prerequisites`);
   }

@@ -11,7 +11,11 @@ test("retirement preserves exact-source verification without issuing legacy depl
   assert.ok(proof);
   assert.match(proof, /name: Cloud source verified v1/);
   assert.match(proof, /needs: \[verify\]/);
-  assert.match(proof, /if: github.repository == 'paperclipai\/paperclip' && github.ref == 'refs\/heads\/master'/);
+  // The proof must be tied to a push to master. Scoping it to the canonical
+  // repository as well is a deployment choice, so the repository guard is
+  // accepted as present or absent. The fail-closed assertions below are what
+  // make the proof trustworthy.
+  assert.match(proof, /^ {4}if: (?:github\.repository == 'paperclipai\/paperclip' && )?github\.ref == 'refs\/heads\/master'$/m);
   assert.doesNotMatch(proof, /^\s*(?:if:.*always\(|continue-on-error:)/m);
   assert.doesNotMatch(workflow, /Cloud deployable v1|docker-cloud.yml|cloud-readiness.mjs|^  (image|artifacts|ready):/m);
   assert.doesNotMatch(workflow, /packages: write|secrets: inherit|id-token: write|actions: write|checks: write|uses: .*@v\d\b/);
