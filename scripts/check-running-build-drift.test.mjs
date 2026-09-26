@@ -141,3 +141,62 @@ test("sentinel ids are unique so a report never double-counts one fix", () => {
   const ids = RUNNING_BUILD_SENTINELS.map((s) => s.id);
   assert.equal(new Set(ids).size, ids.length);
 });
+
+test("the source-attribution sentinel is not satisfied by the superseded fallback variant", () => {
+  // The variant that shipped as a hand-patch, reproduced from the running
+  // build. It carries TERMINAL_HEARTBEAT_RUN_STATUSES, so the older
+  // `run-bound-fallback-scoped` sentinel reads it as deployed — but it never
+  // derives a source from the binding and reports a terminal run under the
+  // generic reason, so it must still read as drift.
+  const supersededVariant = [
+    "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+    "if (!contextSourceIssueId && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {",
+    "  const targetIsBound = await tx.select().where(/* target only */);",
+    "  if (targetIsBound) return null;",
+    "}",
+    "if (!contextSourceIssueId)",
+    "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+    "const sourceIssueId = contextSourceIssueId;",
+  ].join("\n");
+
+  const source = [
+    "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+    "let boundSourceIssueId = null;",
+    "let targetIsBound = false;",
+    "if (!contextSourceIssueId) {",
+    "  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status))",
+    "    throw crossIssueInfluenceRunContextError('terminal_status');",
+    "  targetIsBound = boundIssues.some((row) => row.id === input.targetIssueId);",
+    "}",
+    "if (targetIsBound) return null;",
+    "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
+  ].join("\n");
+
+  const path = "server/src/services/cross-issue-influence-limit.ts";
+  // Every shipped sentinel is evaluated, so the stub has to serve each source
+  // path. Only the fallback file's contents decide the two states asserted
+  // below; the checkout sentinel is served a body carrying its marker so it
+  // does not muddy the result.
+  const git = (args) => {
+    const spec = args[1];
+    if (spec === `HEAD:${path}`) return source;
+    if (spec === "HEAD:server/src/services/issues.ts") return "function assertCheckoutRunIsActive() {}\n";
+    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+  };
+  const root = distRootWith({
+    "cross-issue-influence-limit.js": supersededVariant,
+    "issues.js": "function assertCheckoutRunIsActive() {}\n",
+  });
+  const results = evaluateSentinels(RUNNING_BUILD_SENTINELS, { distRoot: root, git });
+  const byId = Object.fromEntries(results.map((r) => [r.id, r]));
+
+  // The pre-existing sentinel is fooled by this variant; that is the bug.
+  assert.equal(byId["run-bound-fallback-scoped"].state, "deployed");
+  // The new one is not.
+  assert.equal(byId["run-bound-fallback-attributes-source"].state, "drifted");
+  assert.deepEqual(
+    byId["run-bound-fallback-attributes-source"].missingFromDeployed,
+    ["boundSourceIssueId", "terminal_status"],
+  );
+  assert.ok(summarize(results).drifted.includes("run-bound-fallback-attributes-source"));
+});

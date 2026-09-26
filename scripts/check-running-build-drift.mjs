@@ -85,6 +85,27 @@ export const RUNNING_BUILD_SENTINELS = [
     markers: ["no_context_source_and_target_unbound"],
     summary: "the 403 details carry the reason that fired",
   },
+  {
+    // The sentinel above is satisfied by the *superseded* variant of the
+    // fallback, so a build that predates the widened fix reports green. That
+    // variant exempts only the target issue and then fails closed; it never
+    // derives a source from the binding, so a context-less run bound to one
+    // issue still cannot write to another, and it reports a terminal run under
+    // the generic `no_context_source_and_target_unbound` rather than the
+    // distinct `terminal_status`. These markers are absent from that variant
+    // and present in the committed one, so they separate the two.
+    //
+    // `terminal_status` is a reason-code string literal, which survives
+    // compilation unconditionally; `boundSourceIssueId` is the identifier that
+    // carries the source attribution. Both are required, so losing either one
+    // reports drift.
+    id: "run-bound-fallback-attributes-source",
+    sinceCommit: "d17e7ee1e",
+    sourcePath: "server/src/services/cross-issue-influence-limit.ts",
+    distPath: "services/cross-issue-influence-limit.js",
+    markers: ["boundSourceIssueId", "terminal_status"],
+    summary: "the run-bound fallback attributes a write to the bound issue and names a terminal run",
+  },
 ];
 
 /** First candidate root that actually holds a server dist. */
