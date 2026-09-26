@@ -592,6 +592,79 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     });
   });
 
+  it("keeps the woken run's mutation scope valid once the fingerprint is recorded as already reviewed", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-ALREADY-REVIEWED", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const { service } = createService();
+
+    // The run is woken for this fingerprint and starts reviewing it.
+    await service.reconcileTaskWatchdogs({ companyId });
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const pinnedFingerprint = watchdog!.lastObservedFingerprint!;
+    const watchdogIssueId = watchdog!.watchdogIssueId!;
+    expect(watchdog!.lastReviewedFingerprint).toBeNull();
+
+    // The run reaches its review disposition, which records the fingerprint as
+    // adjudicated. This is the state the woken run is in when it goes on to
+    // write the recovery it was woken to write.
+    await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, watchdogIssueId));
+    await service.reconcileTaskWatchdogs({ companyId });
+    const [reviewed] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    expect(reviewed?.lastReviewedFingerprint).toBe(pinnedFingerprint);
+
+    const revalidated = await service.revalidateMutationScope({
+      kind: "watchdog",
+      watchdogId: watchdog!.id,
+      companyId,
+      watchedIssueId: sourceId,
+      stopFingerprint: pinnedFingerprint,
+    });
+
+    // `already_reviewed` suppresses a redundant *trigger*; it must not refuse the
+    // run already working on the fingerprint. Otherwise the subtree is wedged:
+    // the fingerprint only changes through a write, every write is gated on the
+    // fingerprint, and the scheduler never creates a fresh run for an
+    // already-reviewed fingerprint.
+    expect(revalidated.allowed).toBe(true);
+    expect(revalidated.classification?.state).toBe("already_reviewed");
+  });
+
+  it("still refuses a woken run's mutation once the watched subtree fingerprint changes", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-ALREADY-REVIEWED-DRIFT", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const { service } = createService();
+
+    await service.reconcileTaskWatchdogs({ companyId });
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const pinnedFingerprint = watchdog!.lastObservedFingerprint!;
+    const watchdogIssueId = watchdog!.watchdogIssueId!;
+    await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, watchdogIssueId));
+    await service.reconcileTaskWatchdogs({ companyId });
+
+    // A material field moves in the watched subtree after the run was woken.
+    await db
+      .update(issues)
+      .set({ status: "in_progress", updatedAt: new Date(Date.now() + 60_000) })
+      .where(eq(issues.id, sourceId));
+
+    const revalidated = await service.revalidateMutationScope({
+      kind: "watchdog",
+      watchdogId: watchdog!.id,
+      companyId,
+      watchedIssueId: sourceId,
+      stopFingerprint: pinnedFingerprint,
+    });
+
+    expect(revalidated.allowed).toBe(false);
+    expect(revalidated.reason).toContain("stop fingerprint changed");
+    expect(revalidated.reason).toContain("re-read the watched subtree");
+    expect(revalidated.classification?.state).toBe("stopped");
+  });
+
   it("surfaces pending interaction kinds and approval ids in the wake and watchdog comment", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-WAITS", status: "in_review" });
