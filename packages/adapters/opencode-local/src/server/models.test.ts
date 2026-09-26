@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
+import * as runtimeConfig from "./runtime-config.js";
 import {
   discoverOpenCodeModels,
   ensureOpenCodeModelConfiguredAndAvailable,
@@ -37,6 +38,22 @@ afterEach(async () => {
 // a bare banner on one line, the actionable detail indented on the next.
 const UNSUPPORTED_REFRESH_STDERR =
   "\nERROR\n  Unrecognized flag: --refresh in command opencode models\n";
+
+/**
+ * The availability gate reads locally declared OpenCode providers before it
+ * treats a catalog as authoritative, and that read touches the real filesystem.
+ * These cases run under `vi.useFakeTimers()`, which does not drive real I/O, so
+ * an unmocked read never settles and the test times out instead of asserting.
+ *
+ * Pinning it to "nothing is declared" is the honest precondition for both cases:
+ * each one exists to pin the *refresh* path, and a local declaration would
+ * short-circuit that path before the refresh is ever reached.
+ */
+function stubNoLocalDeclarations() {
+  return vi
+    .spyOn(runtimeConfig, "readLocallyDeclaredOpenCodeModels")
+    .mockResolvedValue({ models: new Set<string>(), sources: [] });
+}
 
 function childResult(over: {
   exitCode?: number | null;
@@ -331,6 +348,7 @@ describe("openCode models", () => {
   });
 
   it("still re-enumerates after a failed refresh and accepts a model the re-read finds", async () => {
+    stubNoLocalDeclarations();
     vi.useFakeTimers();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     let plainCalls = 0;
@@ -372,6 +390,7 @@ describe("openCode models", () => {
   });
 
   it("proceeds with the configured model when the catalog is stale and the CLI cannot refresh it", async () => {
+    stubNoLocalDeclarations();
     vi.useFakeTimers();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     let plainCalls = 0;
