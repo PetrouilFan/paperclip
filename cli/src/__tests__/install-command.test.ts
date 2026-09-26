@@ -178,7 +178,11 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    // An exact count on purpose: it is the tripwire for a build step that gets added
+    // to the git install path without an explicit env. 9 -> 10 when the ui-dist build
+    // (server/package.json ships ui-dist in `files`, and nothing else built it) joined
+    // the path. Bump it deliberately, never by loosening it.
+    expect(buildCalls).toHaveLength(10);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
