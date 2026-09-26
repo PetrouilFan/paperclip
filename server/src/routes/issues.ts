@@ -413,6 +413,86 @@ const ISSUE_LIST_KNOWN_QUERY_KEYS = new Set([
 export const issueListKnownQueryKeys = (): readonly string[] =>
   [...ISSUE_LIST_KNOWN_QUERY_KEYS].sort();
 
+/**
+ * Query keys `GET /companies/:companyId/issues/count` reads.
+ *
+ * Deliberately *narrower* than `ISSUE_LIST_KNOWN_QUERY_KEYS`, and that
+ * difference is the whole point. The count route is not a list route with a
+ * smaller page size: it accepts a different set of filters, forces
+ * `includeBlockedBy` and `includeBlockedInboxAttention` to true whatever the
+ * caller sent, and ignores pagination and sorting because neither means
+ * anything for a count. Reusing the list superset here would let precisely the
+ * keys this change exists to catch -- `view`, `sortField`, `offset` and the
+ * rest -- clear the guard and then be dropped in silence, which is the defect
+ * rather than a fix for it.
+ *
+ * `limit` and `offset` are listed because the handler *reads* them in order to
+ * reject them with a specific 400. Keeping them here is what leaves that
+ * rejection reachable, with its own message, instead of being shadowed by a
+ * generic unknown-key error.
+ *
+ * As on the list route, `parentIssueId` is a supported synonym for `parentId`
+ * and so is its own entry, and value spellings (`"1"`, the `"null"` sentinel)
+ * are validated below rather than widening the key set.
+ */
+const ISSUE_COUNT_KNOWN_QUERY_KEYS = new Set([
+  "assigneeAgentId",
+  "assigneeUserId",
+  "attention",
+  "createdFromIssueId",
+  "descendantOf",
+  "excludeRoutineExecutions",
+  "executionWorkspaceId",
+  "hasPlanDocument",
+  "includePluginOperations",
+  "includeRoutineExecutions",
+  "labelId",
+  "limit",
+  "offset",
+  "originId",
+  "originKind",
+  "originKindPrefix",
+  "parentId",
+  "parentIssueId", // documented alias for `parentId`
+  "participantAgentId",
+  "projectId",
+  "q",
+  "status",
+  "workspaceId",
+]);
+
+/** @internal exported for the allowlist-drift regression test. */
+export const issueCountKnownQueryKeys = (): readonly string[] =>
+  [...ISSUE_COUNT_KNOWN_QUERY_KEYS].sort();
+
+/**
+ * Answers `false` when every key is known, and `true` once it has written the
+ * 400, so a handler can `return` immediately.
+ *
+ * Echoes the offending keys *and* the full known set: a caller that guessed a
+ * filter name fixes its call in one round trip instead of bisecting the
+ * parameter list. Fails loud on an unread key, which is the opposite of the
+ * behaviour this replaces -- silently dropping the key and answering a
+ * question the caller did not ask.
+ */
+function rejectUnknownIssueQueryKeys(
+  req: Request,
+  res: Response,
+  knownKeys: ReadonlySet<string>,
+  label: string,
+): boolean {
+  const unknownQueryKeys = Object.keys(req.query).filter(
+    (key) => !knownKeys.has(key),
+  );
+  if (unknownQueryKeys.length === 0) return false;
+  res.status(400).json({
+    error: `Unknown ${label} query parameter(s): ${unknownQueryKeys.join(", ")}`,
+    unknownQueryKeys,
+    knownQueryKeys: [...knownKeys].sort(),
+  });
+  return true;
+}
+
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -8072,15 +8152,14 @@ export function issueRoutes(
     }
     // Placed after assertCompanyAccess + the task-bridge 403 so it widens no
     // access surface, and before the value checks so a typo fails on the typo.
-    const unknownQueryKeys = Object.keys(req.query).filter(
-      (key) => !ISSUE_LIST_KNOWN_QUERY_KEYS.has(key),
-    );
-    if (unknownQueryKeys.length > 0) {
-      res.status(400).json({
-        error: `Unknown issues list query parameter(s): ${unknownQueryKeys.join(", ")}`,
-        unknownQueryKeys,
-        knownQueryKeys: issueListKnownQueryKeys(),
-      });
+    if (
+      rejectUnknownIssueQueryKeys(
+        req,
+        res,
+        ISSUE_LIST_KNOWN_QUERY_KEYS,
+        "issues list",
+      )
+    ) {
       return;
     }
     const assigneeUserFilterRaw = req.query.assigneeUserId as
@@ -8502,6 +8581,23 @@ export function issueRoutes(
       res
         .status(400)
         .json({ error: "hasPlanDocument must be true or false when provided" });
+      return;
+    }
+    // Placed after the three checks above, not before them, and that ordering is
+    // deliberate: this endpoint has a separately consumed error contract, and
+    // the cheapest way to break it would be to let a generic unknown-key error
+    // outrank `attention=blocked` or the `limit`/`offset` rejection. Placed here,
+    // every request that failed before still fails with the same message, and
+    // the only requests this newly rejects are ones the handler was silently
+    // answering a question they did not ask.
+    if (
+      rejectUnknownIssueQueryKeys(
+        req,
+        res,
+        ISSUE_COUNT_KNOWN_QUERY_KEYS,
+        "issues/count",
+      )
+    ) {
       return;
     }
 
