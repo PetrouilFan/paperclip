@@ -3,14 +3,25 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { z } from "zod";
 import { heartbeatRuns, issueComments, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { EXECUTION_RECONCILIATION_CAUSES, type ExecutionBlocker } from "@paperclipai/shared";
+import { liveWatchExemptCondition } from "./execution-recovery-identity.js";
 
-/** Resolved recovery bookkeeping can still carry an effective no-replay hold. */
+/**
+ * Resolved recovery bookkeeping can still carry an effective no-replay hold.
+ *
+ * The `liveWatchExempt` carve-out is the one case where the receipt is kept and
+ * the hold is not. The no-replay guarantee lives in
+ * `evidence.automaticRecovery.replay`, which the carve-out never changes; what it
+ * drops is the refusal to admit execution. A ticket under an active task
+ * watchdog with a live monitor is demonstrably being worked, and holding it would
+ * stop the very watch that is supposed to report the failure.
+ */
 export function executionBlockerPredicate() {
   return and(
     not(conversationRecoveryActionPredicate()!),
     inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
-      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
+      and(sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        not(liveWatchExemptCondition()))),
   );
 }
 
