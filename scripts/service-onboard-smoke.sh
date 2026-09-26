@@ -33,23 +33,36 @@ if [[ -z "$SMOKE_ISOHOME" || ! -d "$SMOKE_ISOHOME" ]]; then
   echo "Service smoke failed: isolated HOME was not created (got '${SMOKE_ISOHOME}')" >&2
   exit 1
 fi
-export HOME="$SMOKE_ISOHOME"
-export XDG_CONFIG_HOME="$SMOKE_ISOHOME/.config"
-
-# A distinct instance id is the part that actually makes this safe, and the HOME
-# override alone is not. `systemctl --user <verb> <name>` addresses units the
-# manager already loaded; XDG_CONFIG_HOME only decides where *new* unit files are
-# searched. Measured on a host with a live paperclipai.service: with HOME and
-# XDG_CONFIG_HOME pointed at an empty temp dir, `systemctl --user cat/is-active`
-# still resolved the real unit. So the override protects the unit file that
-# uninstall deletes by path, but NOT the by-name stop/disable in the same
-# uninstall, and NOT the `systemctl --user stop` in cleanup() below.
-# Its own instance renames the unit to paperclipai-smoke.service, a name the host
-# cannot have, so no verb can reach the production unit.
+# PET-52: e2e scripts must not address the real service in the real $HOME.
+#
+# The isolated home below is DATA isolation only. $HOME and $XDG_CONFIG_HOME
+# are deliberately NOT pointed at it, because doing so makes this script
+# incapable of passing.
+#
+# Measured (PET-259, 2026-09-26) on a host with a live systemd --user manager
+# using a throwaway unit name: `systemctl --user enable <name>` resolves unit
+# files from the MANAGER's search path, captured when the manager started. A
+# unit written under an overridden HOME/XDG_CONFIG_HOME is invisible to it and
+# enable fails with "Failed to enable unit: Unit <name> does not exist." The
+# client's environment makes no difference in either direction; with the file
+# in the manager's own path the same command resolves it with no daemon-reload.
+# The earlier comment here claimed the opposite, citing a measurement that only
+# showed the *host* unit is not moved -- the wrong direction to test.
+#
+# So the override could only ever break the smoke, never protect it: this
+# script has never once got as far as starting the service it exists to test.
+# Isolation rests on what measurably works -- the distinct instance id, which
+# renames the unit to paperclipai-smoke.service, a name the host cannot have,
+# so no by-name verb can reach the production unit. The instance's own data
+# still goes to the mktemp'd dir via --data-dir below, and the mktemp/guard
+# checks above stay load-bearing.
 SMOKE_INSTANCE="smoke"
 SERVICE_NAME="paperclipai-${SMOKE_INSTANCE}.service"
 export PAPERCLIP_INSTANCE_ID="$SMOKE_INSTANCE"   # what `onboard` reads
-SHIM_PATH="${PAPERCLIP_SHIM_PATH:-$SMOKE_ISOHOME/.local/bin/paperclipai}"
+# resolveServiceShimPath is keyed to os.homedir(), so with $HOME left alone the
+# shim is the one in the real ~/.local/bin. The old default pointed into
+# $SMOKE_ISOHOME, which nothing creates.
+SHIM_PATH="${PAPERCLIP_SHIM_PATH:-$HOME/.local/bin/paperclipai}"
 # Cleanup defaults to on so a local run does not leave a service behind; CI
 # disables it so the diagnostics step can still inspect the unit.
 SMOKE_CLEANUP="${SMOKE_CLEANUP:-true}"
@@ -60,8 +73,8 @@ SMOKE_CREATED="false"
 
 fail() {
   echo "Service smoke failed: $*" >&2
-  # Restore HOME before exit so the caller's environment is not poisoned.
-  unset HOME XDG_CONFIG_HOME
+  # $HOME is no longer overridden (see above), so there is nothing to restore;
+  # only the instance's own data dir goes.
   rm -rf "$SMOKE_ISOHOME"
   exit 1
 }

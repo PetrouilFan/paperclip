@@ -46,7 +46,13 @@ summarize() {
 }
 # fail_ and skip_ only record. A guard that needs to stop must say so, or the
 # script walks into the state the guard was written to prevent.
-abort_() { fail_ "$1" "${2:-}"; skip_ "$1" "${3:-aborted}"; summarize; }
+# abort_ <label> [reason] [skip-note]
+# fail_ takes one argument, so the reason used to be silently dropped: the guard
+# fired, the leg stopped, and the only thing on the record was the label. That is
+# what made PET-259's broken-mktemp job un-diagnosable from its own log -- and it
+# left the job asserting on a string the script never printed. Print the reason
+# here so a tripping guard says what tripped.
+abort_() { fail_ "$1"; [ -n "${2:-}" ] && note "  reason: $2"; skip_ "$1" "${3:-aborted}"; summarize; }
 
 shim() { "$SHIM" "$@"; }
 current_target() { readlink "$STORE/current" 2>/dev/null || echo "<missing>"; }
@@ -181,6 +187,26 @@ AFTER_DIRS="$(ls "$STORE/installs/git" 2>/dev/null | sort)"
 [ "$BEFORE_DIRS" = "$AFTER_DIRS" ] && pass "7b no partial install dir left behind" || fail_ "7b no partial install dir left behind"
 "$SHIM" --version >/dev/null 2>&1 && pass "7c existing install still healthy" || fail_ "7c existing install still healthy"
 
+# The host's default-instance unit FILE, if it has one, active or not. Step 8 is
+# safe on such a host because every verb it issues is instance-scoped to `e2e`, so
+# it only ever names paperclipai-e2e.service. Step 10 is not: it runs a bare
+# `uninstall` with no --instance, which resolves to the `default` instance, and
+# SystemdServiceManager.uninstall ends in `fs.rm(<unit file>)`. So on a host whose
+# default-instance unit is merely stopped, step 10 deletes the host's production
+# unit file while 8f -- which only compares MainPID and ActiveEnterTimestamp, both
+# empty for any stopped unit -- prints PASS. Measured on run 36221631375: a
+# planted, started-then-stopped sentinel went LoadState=loaded/FragmentPath=set to
+# LoadState=not-found/FragmentPath=empty across the run.
+#
+# Computed here, before step 8, so it is set on every path into step 10 --
+# including the two that skip step 8 entirely.
+case "$(uname -s)" in
+  Linux) HOST_UNIT_FILE="$(systemctl --user show paperclipai.service -p FragmentPath --value 2>/dev/null || true)" ;;
+  Darwin) HOST_UNIT_FILE="$HOME/Library/LaunchAgents/ing.paperclip.paperclipai.plist"
+          [ -f "$HOST_UNIT_FILE" ] || HOST_UNIT_FILE="" ;;
+  *) HOST_UNIT_FILE="" ;;
+esac
+
 if [ "${E2E_SKIP_SERVICE:-0}" = "1" ]; then
   skip_ "8 service lifecycle" "E2E_SKIP_SERVICE=1"
 else
@@ -217,6 +243,10 @@ else
         "" "production service active on this host; service leg not run"
     fi
 
+    # A host paperclipai.service that is *active* is refused outright. One that is
+    # merely stopped is allowed through, because step 8 cannot reach it -- but
+    # step 10 can, and does; see HOST_UNIT_FILE above.
+
     # A distinct instance id is what actually makes the leg safe, and the HOME
     # override alone is not. `systemctl --user <verb> <name>` addresses units the
     # manager has already loaded; XDG_CONFIG_HOME only decides where *new* unit
@@ -234,17 +264,53 @@ else
     export PAPERCLIP_INSTANCE_ID="$SERVICE_INSTANCE"   # what `onboard` reads
     echo "8 isolation: instance=$SERVICE_INSTANCE unit=$SERVICE_NAME home=$SERVICE_ISOHOME"
 
-    # Save the caller's environment; steps 9-10 run after this block and use $HOME.
-    REAL_HOME="$HOME"
-    REAL_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}"
-    export HOME="$SERVICE_ISOHOME"
-    export XDG_CONFIG_HOME="$SERVICE_ISOHOME/.config"
-    SERVICE_SHIM="$SERVICE_ISOHOME/.local/bin/paperclipai"
+    # Baseline for 8f, taken before the leg runs. On a host that has no
+    # paperclipai.service at all both fields are empty and 8f holds trivially --
+    # there is nothing to protect. The case that matters (a real, loaded unit that
+    # is merely stopped) yields a non-empty identity, and the preflight above has
+    # already refused to run when it is active.
+    HOST_UNIT_BEFORE="MainPID=$(systemctl --user show paperclipai.service -p MainPID --value 2>/dev/null) ActiveEnterTimestamp=$(systemctl --user show paperclipai.service -p ActiveEnterTimestamp --value 2>/dev/null)"
+    echo "8 host unit baseline: $HOST_UNIT_BEFORE"
+
+    # No env var is overridden, for two measured reasons.
+    #
+    # 1. systemd's unit search path. `systemctl --user enable <name>` resolves
+    #    unit files from the MANAGER's search path, captured when the manager
+    #    started; a unit file written under an overridden HOME/XDG_CONFIG_HOME is
+    #    invisible to it ("Unit <name> does not exist"). The client's environment
+    #    makes no difference either way, so the old override guaranteed 8a failed
+    #    on every host with a running user manager -- i.e. every host this leg may
+    #    run on -- and no product change can rescue it, because the manager still
+    #    would not search there.
+    #
+    # 2. install-store.ts splits its own root across two of them.
+    # resolveInstallStorePaths() keys `cliRoot` (and therefore cli/install.json)
+    # to resolvePaperclipHomeDir() i.e. PAPERCLIP_HOME, but keys `shimPath` to
+    # $HOME. Move PAPERCLIP_HOME alone and hasManagedArtifacts() still returns
+    # true -- the shim is real, it just lives under the other root -- while
+    # readInstallManifest() finds nothing at the moved path. That is exactly the
+    # combination managed-install-check.ts turns into a *blocking* failure:
+    #
+    #   x Managed install manifest: Managed install artifacts exist but
+    #     <iso>/.paperclip/cli/install.json is missing
+    #   Doctor found blocking issues. Not starting server.
+    #
+    # which is how 8a and 8b failed on 2026-09-26 (run 36220097455) even after
+    # the unit file became visible. A managed install cannot be relocated by
+    # moving PAPERCLIP_HOME, so the leg does not try.
+    #
+    # Isolation is the distinct instance id (paperclipai-e2e.service, a name the
+    # host cannot have), the PET-52 preflight above, 8f and 8g below. The
+    # mktemp'd dir is still load-bearing: it owns the leg's log capture, so 8c
+    # has a file to write and a path to print, and the abort_ guards above stop
+    # the leg before it records anything without one.
+    SERVICE_LOG="$SERVICE_ISOHOME/service.log"
+    # The shim lives at $HOME/.local/bin/paperclipai (resolveServiceShimPath is
+    # keyed to os.homedir()), i.e. the one step 2 already installed and step 10
+    # uninstalls. $SERVICE_SHIM was a distinct path that nothing ever creates.
+    SERVICE_SHIM="$SHIM"
 
     # Real quickstart path: onboard with defaults, then install + start the service.
-    # Onboard runs through the REAL shim ($SHIM, an absolute path in the original
-    # $HOME, captured before the override) because $SERVICE_SHIM does not exist yet
-    # -- it is what this very step creates. Calling "$SERVICE_SHIM" here exits 127.
     if shim onboard --yes --install-service; then
       pass "8a onboard --yes --install-service exits 0"
     else
@@ -253,7 +319,7 @@ else
     DEADLINE=$(( $(date +%s) + E2E_SERVICE_TIMEOUT_SECS ))
     ACTIVE=0
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-      STATUS_JSON="$(SERVICE_SHIM service status --json --instance "$SERVICE_INSTANCE" 2>/dev/null || true)"
+      STATUS_JSON="$("$SERVICE_SHIM" service status --json --instance "$SERVICE_INSTANCE" 2>/dev/null || true)"
       if echo "$STATUS_JSON" | grep -q '"active"[[:space:]]*:[[:space:]]*true'; then ACTIVE=1; break; fi
       sleep 5
     done
@@ -261,24 +327,53 @@ else
       pass "8b service reached active within ${E2E_SERVICE_TIMEOUT_SECS}s"
     else
       echo "last status: ${STATUS_JSON:-<none>}"
-      SERVICE_SHIM service logs -n 60 --instance "$SERVICE_INSTANCE" || true
+      "$SERVICE_SHIM" service logs -n 60 --instance "$SERVICE_INSTANCE" || true
       fail_ "8b service reached active"
     fi
-    SERVICE_SHIM service logs -n 20 --instance "$SERVICE_INSTANCE" >/dev/null 2>&1 \
-      && pass "8c service logs readable" || fail_ "8c service logs readable"
-    if SERVICE_SHIM service stop --instance "$SERVICE_INSTANCE"; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
-    if SERVICE_SHIM service uninstall --instance "$SERVICE_INSTANCE"; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
-    # The leg must not have touched the production unit: it is still addressable
-    # by name and must still be stopped, because a name collision would be fatal.
-    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
-      fail_ "8f isolation held: host paperclipai.service never activated by this leg"
+    # 8c used to discard the log and assert only that the command exited 0, which
+    # it did on run 36220097455 for a service that had never started -- a green
+    # line next to FAIL 8b. Capture it and assert the leg's own instance appears
+    # in it, so "logs readable" cannot pass on an empty journal.
+    if "$SERVICE_SHIM" service logs -n 20 --instance "$SERVICE_INSTANCE" > "$SERVICE_LOG" 2>&1 \
+       && [ -s "$SERVICE_LOG" ] && grep -q "$SERVICE_INSTANCE" "$SERVICE_LOG"; then
+      pass "8c service logs readable and mention instance=$SERVICE_INSTANCE ($SERVICE_LOG)"
     else
-      pass "8f isolation held: host paperclipai.service untouched"
+      echo "  captured $(wc -l < "$SERVICE_LOG" 2>/dev/null || echo 0) lines into $SERVICE_LOG"
+      fail_ "8c service logs readable and mention instance=$SERVICE_INSTANCE"
+    fi
+    if "$SERVICE_SHIM" service stop --instance "$SERVICE_INSTANCE"; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
+    if "$SERVICE_SHIM" service uninstall --instance "$SERVICE_INSTANCE"; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
+    # The leg must not have touched the production unit. `is-active` alone is a
+    # weak witness: it cannot tell "never activated" from "activated and stopped
+    # again", and it passes vacuously on a host with no such unit at all. Compare
+    # the identity of the host unit before and after instead -- MainPID and
+    # ActiveEnterTimestamp both move if and only if it was (re)started.
+    HOST_UNIT_IDENTITY="MainPID=$(systemctl --user show paperclipai.service -p MainPID --value 2>/dev/null) ActiveEnterTimestamp=$(systemctl --user show paperclipai.service -p ActiveEnterTimestamp --value 2>/dev/null)"
+    if [ "$HOST_UNIT_IDENTITY" = "$HOST_UNIT_BEFORE" ]; then
+      pass "8f isolation held: host paperclipai.service untouched ($HOST_UNIT_IDENTITY)"
+    else
+      echo "  host unit before: $HOST_UNIT_BEFORE"
+      echo "  host unit after:  $HOST_UNIT_IDENTITY"
+      fail_ "8f isolation held: host paperclipai.service never activated by this leg"
+    fi
+    # And the leg's own unit must be gone, so the next run starts clean.
+    if systemctl --user show "$SERVICE_NAME" -p LoadState --value 2>/dev/null | grep -qx "not-found"; then
+      pass "8g leg unit $SERVICE_NAME removed"
+    else
+      fail_ "8g leg unit $SERVICE_NAME removed"
     fi
 
-    # Restore the caller's environment (do not unset: steps 9-10 use $HOME).
-    if [ -n "$REAL_XDG_CONFIG_HOME" ]; then export XDG_CONFIG_HOME="$REAL_XDG_CONFIG_HOME"; else unset XDG_CONFIG_HOME; fi
-    export HOME="$REAL_HOME"
+    # The leg wrote the e2e instance's data (config, secrets, db, logs) under the
+    # real $HOME, because PAPERCLIP_HOME is no longer overridden. It is
+    # instance-scoped -- $HOME/.paperclip/instances/e2e -- so it cannot collide
+    # with the host's own instance, but leaving it behind would make run N+1
+    # start on run N's database. Remove exactly that subtree, and only it.
+    SERVICE_INSTANCE_HOME="$HOME/.paperclip/instances/$SERVICE_INSTANCE"
+    if [ -e "$SERVICE_INSTANCE_HOME" ]; then
+      echo "8 cleanup: removing leg instance home $SERVICE_INSTANCE_HOME"
+      rm -rf "$SERVICE_INSTANCE_HOME"
+    fi
+    unset PAPERCLIP_HOME
     unset PAPERCLIP_INSTANCE_ID
     rm -rf "$SERVICE_ISOHOME"
   fi
@@ -296,13 +391,27 @@ fi
 
 note "10. uninstall preserves user data"
 mkdir -p "$HOME/.paperclip" && touch "$HOME/.paperclip/e2e-user-data-marker"
-if shim uninstall; then
+if [ -n "$HOST_UNIT_FILE" ]; then
+  # Refuse rather than skip silently: this step is the only coverage of the
+  # uninstall path, and it cannot be run at all on a host that has a real
+  # default-instance unit, because that is precisely the file it deletes.
+  # Reported as a FAIL so it cannot be mistaken for coverage.
+  echo "  host default-instance unit present at: $HOST_UNIT_FILE"
+  echo "  a bare \`uninstall\` resolves to the default instance and removes that file"
+  fail_ "10a uninstall exits 0"
+  fail_ "10b shim removed"
+  fail_ "10c managed store removed"
+  skip_ "10d user data under ~/.paperclip preserved" \
+    "not run: the uninstall this step covers was refused"
+elif shim uninstall; then
   pass "10a uninstall exits 0"
 else
   fail_ "10a uninstall exits 0"
 fi
-[ ! -e "$SHIM" ] && pass "10b shim removed" || fail_ "10b shim removed"
-[ ! -d "$STORE" ] && pass "10c managed store removed" || fail_ "10c managed store removed"
-[ -f "$HOME/.paperclip/e2e-user-data-marker" ] && pass "10d user data under ~/.paperclip preserved" || fail_ "10d user data preserved"
+[ -n "$HOST_UNIT_FILE" ] || {
+  [ ! -e "$SHIM" ] && pass "10b shim removed" || fail_ "10b shim removed"
+  [ ! -d "$STORE" ] && pass "10c managed store removed" || fail_ "10c managed store removed"
+  [ -f "$HOME/.paperclip/e2e-user-data-marker" ] && pass "10d user data under ~/.paperclip preserved" || fail_ "10d user data preserved"
+}
 
 summarize

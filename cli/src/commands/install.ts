@@ -278,16 +278,43 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // server/package.json lists `ui-dist` in `files`, and prepare-bundled-package.mjs
+    // cpSync's every entry in `files`. Nothing in the steps above builds it: the UI is
+    // only built by scripts/prepare-server-ui-dist.sh, which until now was called from
+    // scripts/release.sh alone. So `install --ref <git-ref>` always died with
+    // ENOENT .../source/server/ui-dist before it could produce a payload.
+    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
+      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[]; files?: string[] };
       const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
+      // `skills` is a `files` entry with no build step behind it. scripts/release.sh
+      // materialises it by copying the repo-root skills/ into each shipping package
+      // (and deletes it again afterwards), so a fresh checkout has no server/skills at
+      // all -- `git ls-files server/skills` is empty. Both packers then fail: the
+      // bundled path cpSync's every `files` entry, and `pnpm pack` with no `prepack`
+      // packs `files` as it finds them. Drive it off `files` rather than a hardcoded
+      // package list so the next package that ships skills cannot re-break this.
+      if (packageJson.files?.includes("skills") && !fs.existsSync(path.join(packageDir, "skills")) && fs.existsSync(path.join(checkoutPath, "skills"))) {
+        fs.cpSync(path.join(checkoutPath, "skills"), path.join(packageDir, "skills"), { recursive: true });
+      }
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        // `--ignore-scripts` is not optional here, and the release pipeline already
+        // proves it: release-lib.sh's run_bundled_npm_pack packs this same staged
+        // directory with `--ignore-scripts`, and without it `install --ref` always dies.
+        // The staged dir sits at stagingRoot/workspace-package-N, i.e. *outside* the
+        // pnpm workspace, so npm's `prepack` -- which server/package.json defines as
+        // `pnpm run prepare:ui-dist && pnpm run build` -- runs a build with no workspace
+        // packages loaded ("Cannot resolve package from workspace because workspace
+        // packages were not loaded into the resolver") and no ../packages/paperclip-
+        // runner/dist to copy from. It is also pure waste: prepare-bundled-package.mjs
+        // has already cpSync'd every `files` entry, so dist/ui-dist/skills are present
+        // before the pack begins.
+        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
