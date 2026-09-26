@@ -202,7 +202,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
     };
 
-    // PET-273: the run holds nothing, yet the target is the run agent's own
+    // The run holds nothing, yet the target is the run agent's own
     // assigned ticket. Exempt, and it costs the run no budget.
     await expect(observeCrossIssueInfluence(db, { ...base, targetIssueId: assignedTargetId }))
       .resolves.toBeNull();

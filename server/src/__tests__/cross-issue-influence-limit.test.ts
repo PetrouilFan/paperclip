@@ -246,7 +246,7 @@ describe("cross-issue influence limit rollout", () => {
 });
 
 /**
- * PET-156. `POST /checkout` stamps the run onto the issue but never stamps the
+ * `POST /checkout` stamps the run onto the issue but never stamps the
  * issue back onto the run, so a run woken by `heartbeat_timer` (created with no
  * issue in its context) held a real claim to its checked-out issue and still had
  * no source. The guard threw before the same-issue short-circuit, so that run
@@ -372,7 +372,7 @@ describe("cross-issue influence: run-side binding is bidirectional", () => {
 });
 
 /**
- * PET-273. `authorization.ts` allows `issue:comment` / `issue:mutate` on the
+ * `authorization.ts` allows `issue:comment` / `issue:mutate` on the
  * caller's own assigned ticket (`reason: "allow_self"`), but this cap layer
  * derived attribution only from run context or an issue-side checkout stamp. An
  * agent bound to nothing was therefore refused on the issue it was *assigned*.

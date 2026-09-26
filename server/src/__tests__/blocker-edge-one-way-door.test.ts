@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
- * A blocker edge must never be a one-way door (PET-392).
+ * A blocker edge must never be a one-way door.
  *
  * `blockedByIssueIds` is the prescribed way to park an issue behind a dependency,
  * so an agent that follows the documented disposition correctly writes the edge
@@ -50,7 +50,7 @@ function refusalSites(): number[] {
     .flatMap((line, index) => (line.includes(REFUSAL) ? [index + 1] : []));
 }
 
-describe("unresolved-blocker refusals are not a one-way door (PET-392)", () => {
+describe("unresolved-blocker refusals are not a one-way door", () => {
   it("finds the gates this invariant is meant to cover", () => {
     // Guards the guard: if a refactor moves or removes the refusal, the
     // assertions below would silently pass over an empty set.

@@ -2,7 +2,7 @@
 /**
  * Behavioural policy probe for the cross-issue influence write gate.
  *
- * WHY THIS EXISTS (PET-195)
+ * WHY THIS EXISTS
  *
  * The board has repeatedly tried to answer "is the cross-issue 403 fix deployed?"
  * with `grep -c targetIsBound`. That is the wrong instrument twice over:
@@ -264,9 +264,9 @@ const POLICY_SCENARIOS = [
   {
     id: "taskless.unbound",
     label: "task-less run, target NOT checked out by the run",
-    // This single scenario IS acceptance criterion 3 of PET-195:
+    // This single scenario IS the third acceptance criterion:
     // "a task-less run writes a comment with no prior checkout and gets 201".
-    criterion: "PET-195 done-when #3",
+    criterion: "done-when #3: a task-less run writes a comment with no prior checkout and gets 201",
     run: { contextSnapshot: {}, status: "running" },
     targetBoundToRun: false,
     priorCount: 0,
@@ -394,7 +394,7 @@ async function runScenario(mod, scenario) {
     agentId,
     responsibleUserId: null,
     targetIssueId: UUID_TARGET,
-    targetIssueIdentifier: "PET-999",
+    targetIssueIdentifier: "CAP-999",
     kind: "comment",
     now: new Date("2026-09-25T00:00:00.000Z"),
   };

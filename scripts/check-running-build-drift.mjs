@@ -4,7 +4,7 @@
  *
  * "The fix is committed" and "the fix is running" look identical on the board:
  * both are a green PR, and a reinstall that keeps an older artifact looks like a
- * successful deploy. PET-227 hit the concrete case — PR #15 merged
+ * successful deploy. One case hit exactly that — PR #15 merged
  * `assertCheckoutRunIsActive`, the endpoint kept answering `200` for a run the
  * server had itself marked `failed`, and nothing on the board said so.
  *

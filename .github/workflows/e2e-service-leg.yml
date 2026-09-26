@@ -1,6 +1,6 @@
 name: E2E Service Leg
 
-# PET-259. The service-lifecycle half of scripts/e2e-install-lifecycle.sh
+# The service-lifecycle half of scripts/e2e-install-lifecycle.sh
 # (steps 8a-8f) and the whole of scripts/service-onboard-smoke.sh had never
 # been executed by anyone: the board host cannot run them, because step 8
 # installs and starts a real service and this machine's paperclipai.service
@@ -361,7 +361,7 @@ jobs:
           rm -f "$RUNNER_TEMP/sentinel-activations"
           cat > "$HOME/.config/systemd/user/paperclipai.service" <<UNIT
           [Unit]
-          Description=Planted paperclipai.service sentinel (PET-259)
+          Description=Planted paperclipai.service sentinel (e2e service leg)
 
           [Service]
           Type=simple
@@ -424,7 +424,7 @@ jobs:
             grep -E '^(PASS|FAIL|SKIP) +8[a-f] ' "$RUNNER_TEMP/e2e.clean.log" || echo "(no 8a-8f lines found)"
             echo
             echo "== did the preflight wrongly fire? =="
-            grep -n "PET-52 guard" "$RUNNER_TEMP/e2e.clean.log" || echo "(no: the grep -qx preflight correctly ignored an 'inactive' unit)"
+            grep -n "host-unit guard" "$RUNNER_TEMP/e2e.clean.log" || echo "(no: the grep -qx preflight correctly ignored an 'inactive' unit)"
             echo
             echo "== full RESULTS summary =="
             sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/e2e.clean.log" || true
@@ -437,7 +437,7 @@ jobs:
             fi
           done
           # And the guard must not have fired, or the whole point is lost.
-          if grep -q "PET-52 guard" "$RUNNER_TEMP/e2e.clean.log"; then
+          if grep -q "host-unit guard" "$RUNNER_TEMP/e2e.clean.log"; then
             echo "PREFLIGHT FIRED on a stopped-but-present unit"
             missing=1
           fi
@@ -557,7 +557,7 @@ jobs:
           mkdir -p "$HOME/.config/systemd/user"
           cat > "$HOME/.config/systemd/user/paperclipai.service" <<'UNIT'
           [Unit]
-          Description=Planted paperclipai.service sentinel (PET-259)
+          Description=Planted paperclipai.service sentinel (e2e service leg)
 
           [Service]
           Type=simple
@@ -592,7 +592,7 @@ jobs:
             echo "== RESULTS =="
             sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/e2e.clean.log" || true
           } 2>&1 | tee "$RUNNER_TEMP/guard.log"
-          grep -q "PET-52 guard" "$RUNNER_TEMP/e2e.clean.log" || { echo "GUARD DID NOT FIRE"; bad=1; }
+          grep -q "host-unit guard" "$RUNNER_TEMP/e2e.clean.log" || { echo "GUARD DID NOT FIRE"; bad=1; }
           grep -q "could not\|not run" "$RUNNER_TEMP/e2e.clean.log" || echo "(no explanatory line)"
           # The leg must not have started. 8a is the first thing it would print.
           if grep -qE '^(PASS|FAIL) +8[a-f] ' "$RUNNER_TEMP/e2e.clean.log"; then

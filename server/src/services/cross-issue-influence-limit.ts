@@ -207,7 +207,7 @@ export async function observeCrossIssueInfluence(
       // instead — measured on a live board, 7 duplicate pairs, 5 of them minutes
       // apart, plus every `blocked` issue (which cannot check out, and so can
       // never reach a binding) left permanently unwritable. The gate was
-      // manufacturing the backlog it exists to contain (PET-273).
+      // manufacturing the backlog it exists to contain.
       //
       // The read is inside the same transaction as the run lock, so the
       // exemption cannot race a concurrent reassignment. Scoping it to the

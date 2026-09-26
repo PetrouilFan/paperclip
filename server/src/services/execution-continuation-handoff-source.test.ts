@@ -32,7 +32,7 @@ const support = await getEmbeddedPostgresTestSupport();
      * cancelled with `issue_reassigned` and its id is recorded as the successor's
      * `interruptedRunId`. `sourceIssueId` is what the cancelled run's own context
      * snapshot carries — `null` is the taskless `heartbeat_timer` run that has no
-     * `issueId` key at all, which is the PET-307 defect.
+     * `issueId` key at all, which is the defect this file pins.
      */
     async function handoffFixture(sourceIssueId: string | null) {
       const companyId = randomUUID(),
@@ -100,7 +100,7 @@ const support = await getEmbeddedPostgresTestSupport();
       return { companyId, agentId, issueId, otherIssueId: randomUUID(), interruptedRunId, commentId, build };
     }
 
-    it("builds an envelope when the rejected handoff source is taskless (the PET-307 defect)", async () => {
+    it("builds an envelope when the rejected handoff source is taskless", async () => {
       const f = await handoffFixture(null);
       const envelope = await f.build();
       expect(envelope.issueId).toBe(f.issueId);

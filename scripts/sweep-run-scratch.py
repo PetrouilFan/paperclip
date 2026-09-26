@@ -5,7 +5,7 @@
 ``/tmp``), so the same script sweeps the tmpfs and the disk-backed root that run
 scratch is being migrated to. Roots that do not exist are skipped.
 
-Background (PET-204). Paperclip gives every agent run a private scratch
+Background. Paperclip gives every agent run a private scratch
 directory under ``os.tmpdir()`` and exports it as ``TMPDIR``/``PAPERCLIP_*_SCRATCH_DIR``.
 The in-process cleanup path removes that directory when a run finishes
 normally. It cannot run when the process is hard-killed (SIGKILL, a server
@@ -16,7 +16,7 @@ needs temp space all break at once.
 
 This script is the *host-level* mitigation. It is deliberately independent of
 the in-process reaper so it still works against a deployment that predates it
-(PET-203 tracks deploying that reaper). It never deletes a directory that a
+(deploying that in-process reaper is tracked separately). It never deletes a
 live run could still be using.
 
 Safety model
@@ -353,7 +353,7 @@ class Sweeper:
 
     def candidates(self) -> list[tuple[Path, str]]:
         # More than one root is normal: run scratch is migrating off the tmpfs
-        # onto the root filesystem (PET-204, drop-in 60-run-scratch-root.conf),
+        # onto the root filesystem (drop-in 60-run-scratch-root.conf),
         # so both locations have to be swept until the old one is empty.
         # A root that does not exist is skipped, not an error: the state dir
         # only appears once the daemon has restarted onto it.

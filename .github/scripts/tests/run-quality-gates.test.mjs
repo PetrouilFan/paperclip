@@ -1,11 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   buildComment,
   buildProvenanceLine,
+  collectBlockingFailures,
   COMMITPERCLIP_LOGINS,
   findExistingComment,
 } from '../run-quality-gates.mjs';
+import { checkInternalRefs } from '../check-pr-internal-refs.mjs';
 
 test('findExistingComment: paginates until it finds the commitperclip comment', async () => {
   const seenPaths = [];
@@ -141,4 +145,15 @@ test('buildComment: omits the stamp when there is no provenance to record', () =
   assert.ok(body.endsWith('— commitperclip'));
   assert.equal(body.split('— commitperclip').length - 1, 1, 'exactly one commitperclip signature');
   assert.doesNotMatch(body, /gate revision/, 'an unstamped comment must not claim provenance');
+});
+
+test('collectBlockingFailures tolerates a gate that returned nothing', () => {
+  assert.deepEqual(collectBlockingFailures([undefined, null, { failures: undefined }, { failures: ['x'] }]), ['x']);
+});
+
+test('the internal-refs gate is wired into the blocking failure list', () => {
+  const source = readFileSync(fileURLToPath(new URL('../run-quality-gates.mjs', import.meta.url)), 'utf8');
+  assert.match(source, /import \{ checkInternalRefs \} from '\.\/check-pr-internal-refs\.mjs'/);
+  assert.match(source, /const internalRefsResult = checkInternalRefs\(\{/);
+  assert.match(source, /internalRefsResult,/);
 });

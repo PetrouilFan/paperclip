@@ -49,7 +49,7 @@ summarize() {
 # abort_ <label> [reason] [skip-note]
 # fail_ takes one argument, so the reason used to be silently dropped: the guard
 # fired, the leg stopped, and the only thing on the record was the label. That is
-# what made PET-259's broken-mktemp job un-diagnosable from its own log -- and it
+# what made the broken-mktemp job un-diagnosable from its own log -- and it
 # left the job asserting on a string the script never printed. Print the reason
 # here so a tripping guard says what tripped.
 abort_() { fail_ "$1"; [ -n "${2:-}" ] && note "  reason: $2"; skip_ "$1" "${3:-aborted}"; summarize; }
@@ -217,7 +217,7 @@ else
 
     # ISOHOME override: run the service lifecycle against an isolated home so
     # the e2e scripts can never uninstall the host's live paperclipai.service.
-    # PET-52: e2e scripts must not address the real service in the real $HOME.
+    # e2e scripts must not address the real service in the real $HOME.
     # NOTE: the mktemp template must not be quote-escaped. `\"` inside the
     # substitution makes mktemp receive literal quote characters, it fails,
     # SERVICE_ISOHOME ends up empty, and `export HOME=""` below would then
@@ -239,7 +239,7 @@ else
     # `grep -q active` calls every stopped host live and skips the leg always.
     if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
       rm -rf "$SERVICE_ISOHOME"
-      abort_ "8 service lifecycle (PET-52 guard: host paperclipai.service is active)" \
+      abort_ "8 service lifecycle (host-unit guard: host paperclipai.service is active)" \
         "" "production service active on this host; service leg not run"
     fi
 
@@ -300,7 +300,7 @@ else
     # moving PAPERCLIP_HOME, so the leg does not try.
     #
     # Isolation is the distinct instance id (paperclipai-e2e.service, a name the
-    # host cannot have), the PET-52 preflight above, 8f and 8g below. The
+    # host cannot have), the host-unit preflight above, 8f and 8g below. The
     # mktemp'd dir is still load-bearing: it owns the leg's log capture, so 8c
     # has a file to write and a path to print, and the abort_ guards above stop
     # the leg before it records anything without one.
