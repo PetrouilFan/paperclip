@@ -4,12 +4,16 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
 import {
+  approvals,
   chatActions,
   environmentLeases,
   heartbeatRuns,
+  issueApprovals,
   issueRecoveryActions,
+  issueRelations,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -22,6 +26,10 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import {
+  deliverAgentUnblockNotification,
+  strandedRunUnblockDescriptor,
+} from "./routable-blocked.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -310,7 +318,17 @@ export async function deliverReconciledExecutions(
 export async function settleUnrecoverableExecutions(
   db: Db,
   now = new Date(),
-  options: { failpoint?: (phase: "persisted") => void } = {},
+  options: {
+    failpoint?: (phase: "persisted") => void;
+    wakeup?: (agentId: string, options: {
+      source: "automation";
+      triggerDetail: "system";
+      reason: "issue_unblock_requested";
+      idempotencyKey: string;
+      payload: { issueId: string; action: string };
+      contextSnapshot: { wakeReason: "issue_unblock_requested"; issueId: string; taskId: string };
+    }) => Promise<unknown>;
+  } = {},
 ) {
   // Fold obsolete conversation holds without waking historical work on upgrade.
   // Keep their evidence and record the policy change in the task's activity log.
@@ -397,6 +415,10 @@ export async function settleUnrecoverableExecutions(
       ),
     )
     .limit(25);
+  // Unblock owners are woken after their transaction commits. A wake issued
+  // inside the transaction would hand the agent work that a rollback then
+  // un-does, and a rejected delivery would take the settle down with it.
+  const unblockNotices: Array<{ issue: typeof issues.$inferSelect }> = [];
   for (const { action: candidate } of candidates) {
     const runId = candidate.evidence.runId;
     if (typeof runId !== "string") continue;
@@ -482,6 +504,70 @@ export async function settleUnrecoverableExecutions(
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         if (current) {
+          // A dead run is not a hold. Before blocking, check whether the issue
+          // already has a first-class reason to be blocked; if it does not, the
+          // settle has to leave an exit behind, or `blocked` strands the ticket
+          // permanently. Same disjunction the issue route enforces.
+          const [existingHold] = await tx
+            .select({ held: sql<boolean>`true` })
+            .from(issueRelations)
+            .innerJoin(
+              issues,
+              and(
+                eq(issues.companyId, issueRelations.companyId),
+                eq(issues.id, issueRelations.issueId),
+              ),
+            )
+            .where(
+              and(
+                eq(issueRelations.companyId, task.companyId),
+                eq(issueRelations.relatedIssueId, task.id),
+                eq(issueRelations.type, "blocks"),
+                notInArray(issues.status, ["done", "cancelled"]),
+              ),
+            )
+            .limit(1);
+          const [pendingInteraction] = await tx
+            .select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.companyId, task.companyId),
+                eq(issueThreadInteractions.issueId, task.id),
+                eq(issueThreadInteractions.status, "pending"),
+              ),
+            )
+            .limit(1);
+          const [pendingApproval] = await tx
+            .select({ id: approvals.id })
+            .from(issueApprovals)
+            .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+            .where(
+              and(
+                eq(issueApprovals.companyId, task.companyId),
+                eq(issueApprovals.issueId, task.id),
+                eq(approvals.status, "pending"),
+              ),
+            )
+            .limit(1);
+          const enteringBlocked = task.status !== "blocked";
+          // Nothing else is holding this issue and no exit was ever written, so
+          // this settle owns the block: it stamps the transition and names who
+          // releases it. An issue that already carries a descriptor keeps that
+          // separate hold's exit, and a repeat settle of the same dead run
+          // rewrites nothing.
+          const strandedHold =
+            !existingHold && !pendingInteraction && !pendingApproval;
+          const unblockDescriptor = strandedHold
+            ? strandedRunUnblockDescriptor({
+                existing: task.unblockDescriptor,
+                assigneeAgentId: task.assigneeAgentId,
+                assigneeUserId: task.assigneeUserId,
+                action: note,
+              })
+            : null;
+          const ownsBlock =
+            unblockDescriptor !== null && (enteringBlocked || !task.blockedTransitionAt);
           const [projected] = await tx
             .update(issues)
             .set({
@@ -489,12 +575,22 @@ export async function settleUnrecoverableExecutions(
               executionRunId: null,
               checkoutRunId: null,
               updatedAt: now,
+              // Only a settle that owns the block re-arms the routable-blocked
+              // wake. An issue a human or dependency already held keeps its own
+              // transition stamp and its own exit.
+              ...(ownsBlock
+                ? { blockedTransitionAt: now, blockedOwnerNotifiedAt: null }
+                : {}),
+              ...(unblockDescriptor ? { unblockDescriptor } : {}),
             })
             .where(eq(issues.id, task.id)).returning();
           // Only a transition owned by this failure grants a recovery receipt.
           // An already-blocked task may have a separate human/dependency hold.
-          if (task.status !== "blocked" && run.runtimeMode === "native") {
+          if (enteringBlocked && run.runtimeMode === "native") {
             nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
+          }
+          if (ownsBlock) {
+            unblockNotices.push({ issue: projected! });
           }
         }
         await tx
@@ -561,6 +657,30 @@ export async function settleUnrecoverableExecutions(
       logger.warn(
         { err, recoveryActionId: candidate.id },
         "Automatic recovery disposition remains pending",
+      );
+    }
+  }
+  if (!options.wakeup) return;
+  const wakeup = options.wakeup;
+  for (const { issue } of unblockNotices) {
+    try {
+      await deliverAgentUnblockNotification({
+        issue,
+        wakeup,
+        markNotified: async (notifiedAt) => {
+          await db
+            .update(issues)
+            .set({ blockedOwnerNotifiedAt: notifiedAt })
+            .where(eq(issues.id, issue.id));
+        },
+        now: () => now,
+      });
+    } catch (err) {
+      // The settle is already durable. A missed wake must not be silent, and
+      // must not undo the block; the next sweep re-arms it.
+      logger.warn(
+        { err, issueId: issue.id },
+        "failed to wake the stranded issue's unblock owner",
       );
     }
   }

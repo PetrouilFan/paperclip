@@ -105,6 +105,7 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../issue-dependency-wakeups.js";
+import { strandedRunUnblockDescriptor } from "../routable-blocked.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import {
@@ -262,6 +263,22 @@ export function shouldRouteRecoveryToOriginalAgent(
 }
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
+
+/**
+ * The unblock instruction a stranded issue carries. It has to name the run that
+ * died, because "something is blocking this" is what makes the state legible
+ * and what tells the woken owner what to check before resuming.
+ */
+export function strandedUnblockAction(
+  latestRun: LatestIssueRun,
+  cause: StrandedRecoveryCause,
+): string {
+  const failure = latestRun?.error?.trim();
+  const causeText = cause.replace(/_/g, " ");
+  return failure
+    ? `The run for this issue stopped before it could settle its work (${causeText}): ${failure}. Recorded work is preserved and no action with an unverified outcome was repeated. Confirm the recorded state, then resume this issue.`
+    : `The run for this issue stopped before it could settle its work (${causeText}). Recorded work is preserved and no action with an unverified outcome was repeated. Confirm the recorded state, then resume this issue.`;
+}
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -3770,9 +3787,29 @@ export function recoveryService(
       input.issue.companyId,
       input.issue.id,
     );
+    // A stranded run is not a hold. When nothing else is holding the issue, the
+    // block has to name who releases it, or `blocked` strands the ticket
+    // permanently: the assignee cannot check a blocked issue back out, and no
+    // blocker exists for the dependency path to release. Same disjunction the
+    // issue route enforces for a human-authored block.
+    //
+    // The owner is the board, matching `board_escalation_no_takeover_v1`: this
+    // sweep deliberately does not hand the work back to the agent that just
+    // failed. A board-owned descriptor is what the attention service surfaces to
+    // the operator as an unblock/reassign decision, so the ticket is visible
+    // without anyone having to notice the blocked pile.
+    const unblockDescriptor =
+      blockerIds.length > 0
+        ? null
+        : strandedRunUnblockDescriptor({
+            existing: input.issue.unblockDescriptor,
+            owner: "board",
+            action: strandedUnblockAction(input.latestRun, recoveryCause),
+          });
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
+      ...(unblockDescriptor ? { unblockDescriptor } : {}),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
