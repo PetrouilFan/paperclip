@@ -349,6 +349,70 @@ import {
 } from "../services/issue-queued-comment-queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+
+/**
+ * Every query key `GET /companies/:companyId/issues` actually reads.
+ *
+ * The handler never used to inspect the key set, so an unread key was dropped
+ * silently and the caller received the *unfiltered* board — a typo like
+ * `?assigneeId=` (the real key is `assigneeAgentId`) returned every issue in
+ * the company instead of an error. Rejecting unknown keys turns that
+ * maximally-wrong silent answer into a loud, self-describing 400.
+ *
+ * Two rules keep this set honest:
+ *
+ * 1. **Aliases are keys, not rewrites.** `parentIssueId` is a supported synonym
+ *    for `parentId`, so it belongs here as its own entry.
+ * 2. **Value spellings are not keys.** Every `include*` flag accepts both
+ *    `"true"` and `"1"`, and `assigneeAgentId` accepts the sentinel `"null"`.
+ *    Those are validated below and do not widen the key set.
+ *
+ * `server/src/__tests__/issues-unknown-query-key.test.ts` asserts this set
+ * stays exactly in sync with the handler's `req.query.*` reads, so adding a
+ * filter without registering it here fails the suite instead of 400ing a
+ * legitimate caller in production.
+ */
+const ISSUE_LIST_KNOWN_QUERY_KEYS = new Set([
+  "afterId",
+  "assigneeAgentId",
+  "assigneeUserId",
+  "attention",
+  "createdFromIssueId",
+  "descendantOf",
+  "excludeRoutineExecutions",
+  "executionWorkspaceId",
+  "hasPlanDocument",
+  "inboxArchivedByUserId",
+  "includeBlockedBy",
+  "includeBlockedInboxAttention",
+  "includeLiveDescendantSummary",
+  "includePluginOperations",
+  "includeRoutineExecutions",
+  "labelId",
+  "limit",
+  "offset",
+  "originId",
+  "originKind",
+  "originKindPrefix",
+  "parentId",
+  "parentIssueId", // documented alias for `parentId`
+  "participantAgentId",
+  "projectId",
+  "q",
+  "sortDir",
+  "sortField",
+  "status",
+  "touchedByUserId",
+  "unreadForUserId",
+  "updatedSince",
+  "view",
+  "workspaceId",
+]);
+
+/** @internal exported for the allowlist-drift regression test. */
+export const issueListKnownQueryKeys = (): readonly string[] =>
+  [...ISSUE_LIST_KNOWN_QUERY_KEYS].sort();
+
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -8003,6 +8067,19 @@ export function issueRoutes(
     if (isTaskBridgeKeyActor(req)) {
       res.status(403).json({
         error: "Task bridge keys cannot use company-wide issue list APIs",
+      });
+      return;
+    }
+    // Placed after assertCompanyAccess + the task-bridge 403 so it widens no
+    // access surface, and before the value checks so a typo fails on the typo.
+    const unknownQueryKeys = Object.keys(req.query).filter(
+      (key) => !ISSUE_LIST_KNOWN_QUERY_KEYS.has(key),
+    );
+    if (unknownQueryKeys.length > 0) {
+      res.status(400).json({
+        error: `Unknown issues list query parameter(s): ${unknownQueryKeys.join(", ")}`,
+        unknownQueryKeys,
+        knownQueryKeys: issueListKnownQueryKeys(),
       });
       return;
     }
