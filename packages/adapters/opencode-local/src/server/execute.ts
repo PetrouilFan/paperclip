@@ -58,6 +58,7 @@ import {
   parseOpenCodeModelsOutput,
   requireOpenCodeModelId,
 } from "./models.js";
+import { assertOpenCodeEngineVersion } from "./engine.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -356,6 +357,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timeoutSec,
     });
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
+    // Resolvability only proves the name resolves. On a host with two engines
+    // installed, PATH order decides which one that is, per spawn, and the wrong
+    // engine fails downstream for reasons that never name it. Read the engine's
+    // own version here, log it on every run, and stop the run when it
+    // contradicts an explicit `expectedMajorVersion` pin. A remote target's
+    // engine lives on the remote host and is probed by the remote lane, not
+    // from this board.
+    if (!executionTargetIsRemote) {
+      await assertOpenCodeEngineVersion({
+        command,
+        resolvedCommand,
+        config,
+        cwd,
+        env: runtimeEnv,
+        onLog,
+      });
+    }
     let loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
       runtimeEnv,
       includeRuntimeKeys: ["HOME"],
