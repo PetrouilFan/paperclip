@@ -24,8 +24,10 @@
  * list that drifts from the code and reports a permanently green board.
  *
  * Exit codes: 0 no drift, 1 drift found, 2 the check could not be evaluated
- * (no running build found, or a manifest/source mismatch — which is a bug in
- * this file, not a deploy state, and must never be read as "all clear").
+ * (no running build found, a manifest/source mismatch, or an unreadable source
+ * tree — the last two are bugs in this file, not deploy states). Every
+ * unevaluated path returns 2, never 1, so a broken check can never be read as
+ * a deploy finding.
  */
 
 import { execFileSync } from "node:child_process";
@@ -198,22 +200,65 @@ export function formatReport(report) {
   return lines.join("\n");
 }
 
+export const EXIT_OK = 0;
+export const EXIT_DRIFT = 1;
+export const EXIT_UNEVALUATED = 2;
+
+/**
+ * The whole check, as a function of its inputs, returning an exit code.
+ *
+ * Every path that cannot answer the question returns `EXIT_UNEVALUATED`, never
+ * `EXIT_DRIFT`. A `git show HEAD:<file>` failure (the wrong working directory,
+ * a detached or missing checkout) used to escape as an uncaught exception, and
+ * Node exits an uncaught exception with status 1 — the same code that means
+ * "drift found". A board consumer reading the exit code would have read a
+ * broken check as a deploy finding, which is the one confusion this file
+ * exists to rule out.
+ */
+export function runCheck({
+  asJson = false,
+  distRoot,
+  git,
+  exists = existsSync,
+  sentinels = RUNNING_BUILD_SENTINELS,
+  write = (text) => process.stdout.write(text),
+} = {}) {
+  const emit = (payload, text) =>
+    write(asJson ? `${JSON.stringify(payload, null, 2)}\n` : `${text}\n`);
+
+  if (!distRoot) {
+    emit(
+      { error: "no running @paperclipai/server dist found", unevaluated: true },
+      "no running @paperclipai/server dist found; cannot evaluate deploy state",
+    );
+    return EXIT_UNEVALUATED;
+  }
+
+  let results;
+  try {
+    results = evaluateSentinels(sentinels, { distRoot, git, exists });
+  } catch (error) {
+    // The source half could not be read. That is a broken check, not a deploy
+    // state, and it must not borrow the drift code.
+    const reason = error instanceof Error ? error.message : String(error);
+    emit(
+      { error: `could not read the source tree at HEAD: ${reason}`, unevaluated: true },
+      `could not read the source tree at HEAD: ${reason}`,
+    );
+    return EXIT_UNEVALUATED;
+  }
+
+  const report = { distRoot, ...summarize(results), results };
+  write(asJson ? `${JSON.stringify(report, null, 2)}\n` : `${formatReport(report)}\n`);
+  if (report.manifestMismatch.length > 0) return EXIT_UNEVALUATED;
+  return report.drifted.length > 0 ? EXIT_DRIFT : EXIT_OK;
+}
+
 function main(argv) {
   const asJson = argv.includes("--json");
   const distRoot = resolveRunningServerDist(runningServerDistCandidates());
-  if (!distRoot) {
-    const message = "no running @paperclipai/server dist found; cannot evaluate deploy state";
-    process.stdout.write(asJson ? `${JSON.stringify({ error: message }, null, 2)}\n` : `${message}\n`);
-    return 2;
-  }
-
   const git = (args) => execFileSync("git", args, { cwd: process.cwd(), encoding: "utf8" });
-  const results = evaluateSentinels(RUNNING_BUILD_SENTINELS, { distRoot, git });
-  const report = { distRoot, ...summarize(results), results };
-
-  process.stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : `${formatReport(report)}\n`);
-  if (report.manifestMismatch.length > 0) return 2;
-  return report.drifted.length > 0 ? 1 : 0;
+  return runCheck({ asJson, distRoot, git });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

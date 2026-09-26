@@ -5,10 +5,14 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  EXIT_DRIFT,
+  EXIT_OK,
+  EXIT_UNEVALUATED,
   RUNNING_BUILD_SENTINELS,
   evaluateSentinels,
   formatReport,
   resolveRunningServerDist,
+  runCheck,
   runningServerDistCandidates,
   summarize,
 } from "./check-running-build-drift.mjs";
@@ -199,4 +203,120 @@ test("the source-attribution sentinel is not satisfied by the superseded fallbac
     ["boundSourceIssueId", "terminal_status"],
   );
   assert.ok(summarize(results).drifted.includes("run-bound-fallback-attributes-source"));
+});
+
+test("an unreadable source tree is unevaluated, not drift", () => {
+  // `git show HEAD:<file>` fails when the check runs outside a checkout. Node
+  // exits an uncaught exception with status 1, which is the drift code, so a
+  // board consumer would have read a broken check as a deploy finding.
+  const root = distRootWith({ "example.js": "stale\n" });
+  let out = "";
+  const code = runCheck({
+    distRoot: root,
+    git: () => {
+      throw new Error("fatal: not a git repository");
+    },
+    sentinels: [FIXTURE],
+    write: (text) => {
+      out += text;
+    },
+  });
+  assert.equal(code, EXIT_UNEVALUATED);
+  assert.notEqual(code, EXIT_DRIFT);
+  assert.match(out, /could not read the source tree at HEAD/);
+  assert.doesNotMatch(out, /DRIFT/);
+});
+
+test("a missing running build is unevaluated, and says so in --json", () => {
+  let out = "";
+  const code = runCheck({
+    asJson: true,
+    distRoot: null,
+    git: gitServing(FIXTURE.sourcePath, "const GUARD_SYMBOL = 1;\n"),
+    sentinels: [FIXTURE],
+    write: (text) => {
+      out += text;
+    },
+  });
+  assert.equal(code, EXIT_UNEVALUATED);
+  const parsed = JSON.parse(out);
+  assert.equal(parsed.unevaluated, true);
+  assert.ok(parsed.error.includes("no running @paperclipai/server dist"));
+});
+
+test("a manifest mismatch is unevaluated rather than a deploy finding", () => {
+  const root = distRootWith({ "example.js": "stale\n" });
+  let out = "";
+  const code = runCheck({
+    distRoot: root,
+    git: gitServing(FIXTURE.sourcePath, "const RENAMED = 1;\n"),
+    sentinels: [FIXTURE],
+    write: (text) => {
+      out += text;
+    },
+  });
+  assert.equal(code, EXIT_UNEVALUATED);
+  assert.match(out, /bug in check-running-build-drift\.mjs/);
+});
+
+test("exit codes stay distinct: deployed is 0, drift is 1, and never the reverse", () => {
+  const deployed = distRootWith({ "example.js": "function GUARD_SYMBOL() {}\n" });
+  const stale = distRootWith({ "example.js": "nothing here\n" });
+  const serving = gitServing(FIXTURE.sourcePath, "const GUARD_SYMBOL = 1;\n");
+  const quiet = () => {};
+  assert.equal(runCheck({ distRoot: deployed, git: serving, sentinels: [FIXTURE], write: quiet }), EXIT_OK);
+  assert.equal(runCheck({ distRoot: stale, git: serving, sentinels: [FIXTURE], write: quiet }), EXIT_DRIFT);
+  // A drifted build is still not an unevaluated check, and vice versa.
+  assert.notEqual(EXIT_UNEVALUATED, EXIT_DRIFT);
+  assert.notEqual(EXIT_UNEVALUATED, EXIT_OK);
+});
+
+test("the run shape of the live build still reports exactly the two real findings", () => {
+  // Guards against the exit-code refactor changing what the check measures. The
+  // source carries every marker (as HEAD does), while the artifact is the
+  // hand-patched build: the checkout guard is gone and the fallback is the
+  // superseded narrow variant. That must read as two drifts, not one and not a
+  // manifest mismatch.
+  const crossSource = [
+    "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+    "let boundSourceIssueId = null;",
+    "  throw crossIssueInfluenceRunContextError('terminal_status');",
+    "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+    "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
+  ].join("\n");
+  const crossSupersededVariant = [
+    "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+    "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+    "const sourceIssueId = contextSourceIssueId;",
+  ].join("\n");
+  const p = "server/src/services/cross-issue-influence-limit.ts";
+  const git = (args) => {
+    const spec = args[1];
+    if (spec === `HEAD:${p}`) return crossSource;
+    if (spec === "HEAD:server/src/services/issues.ts") {
+      return "function assertCheckoutRunIsActive() {}\n";
+    }
+    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+  };
+  const root = distRootWith({
+    "cross-issue-influence-limit.js": crossSupersededVariant,
+    "issues.js": "// build predates the checkout guard\n",
+  });
+  let out = "";
+  const code = runCheck({
+    distRoot: root,
+    git,
+    write: (text) => {
+      out += text;
+    },
+  });
+  assert.equal(code, EXIT_DRIFT);
+  assert.match(out, /DRIFT checkout-refuses-terminal-run/);
+  assert.match(out, /DRIFT run-bound-fallback-attributes-source/);
+  // The two sentinels the superseded variant does satisfy stay green, which is
+  // the discrimination the check exists to make.
+  assert.match(out, /ok   run-bound-fallback-scoped/);
+  assert.match(out, /ok   cross-issue-403-names-the-gate/);
+  assert.doesNotMatch(out, /BUG  /);
+  assert.match(out, /2 fix\(es\) are committed/);
 });
