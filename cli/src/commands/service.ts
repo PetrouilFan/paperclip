@@ -6,6 +6,7 @@ import { readConfig, resolveConfigPath } from "../config/store.js";
 import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "../config/home.js";
 import { detectServiceManager, type ServiceManager, type ServiceStatus } from "../services/service-manager.js";
 import { buildLocalHealthUrl } from "../utils/health-url.js";
+import { readProcessStartedAt } from "../utils/process-identity.js";
 
 type CommonOptions = { instance?: string; json?: boolean };
 type HealthResult = { ok: boolean; serverVersion: string | null; serverStartedAt: string | null; error?: string };
@@ -186,10 +187,33 @@ export async function writeHotRestartIntent(
   status: ServiceStatus,
   instanceId: string,
   drainRequired: boolean,
-  options: { query?: () => Promise<string[]>; probe?: (id: string) => Promise<HealthResult> } = {},
+  options: {
+    query?: () => Promise<string[]>;
+    probe?: (id: string) => Promise<HealthResult>;
+    readStartedAt?: (pid: number) => Promise<string | null>;
+  } = {},
 ): Promise<{ requestedAt: string; preflightActiveRunIds: string[] }> {
   if (!status.pid) throw new Error(`Cannot restart ${status.serviceName}: supervisor did not report a server pid.`);
   const health = await (options.probe ?? probeHealth)(instanceId);
+  // `serverInfo` is only on the health response when the deployment is not
+  // `authenticated`, or when the caller is a board/agent actor. This probe is
+  // unauthenticated, so on an authenticated instance the field is redacted and
+  // the boot identity has to come from the operating system instead. Recording
+  // `null` here is not a smaller record: `previousServerIdentity` is what proves
+  // the intent belongs to the incarnation being replaced, and the server's own
+  // writer refuses to emit an intent without one.
+  const previousServerStartedAt = health.serverStartedAt
+    ?? await (options.readStartedAt ?? readProcessStartedAt)(status.pid);
+  if (!previousServerStartedAt) {
+    throw new Error(
+      `Refusing to restart ${status.serviceName}: could not establish the boot identity of the running `
+      + `server (pid ${status.pid}), so the hot-restart intent could not be tied to the incarnation it `
+      + "replaces. A pid alone cannot distinguish the running server from an unrelated process that "
+      + "inherited the number, which is how a restart misclassifies another instance's runs. The server's "
+      + "own intent writer refuses the same record, so the CLI must not be the path that produces one. "
+      + "Retry once /api/health reports serverInfo, or restart the unit directly with systemctl.",
+    );
+  }
   const preflightActiveRunIds = drainRequired
     ? []
     : await readPreflightActiveRunIds({ ...options, instanceId });
@@ -201,7 +225,12 @@ export async function writeHotRestartIntent(
     version: 1,
     requestedAt,
     previousServerPid: status.pid,
-    previousServerIdentity: health.serverStartedAt,
+    // Both spellings: the health value when it was readable, the OS value
+    // otherwise. `previousServerStartedAt` is the branch the server falls back
+    // to when `previousServerIdentity` is absent, and it is the only one
+    // populated on an authenticated instance.
+    previousServerIdentity: health.serverStartedAt ?? previousServerStartedAt,
+    previousServerStartedAt,
     previousServerVersion: health.serverVersion,
     drainRequired,
     requestedByRunId: process.env.PAPERCLIP_RUN_ID?.trim() || null,

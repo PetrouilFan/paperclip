@@ -100,6 +100,76 @@ describe("hot-restart intent written by the CLI restart path", () => {
   });
 });
 
+describe("hot-restart intent boot identity", () => {
+  // `/api/health` only carries `serverInfo` when the deployment is not
+  // `authenticated` or the caller is a board/agent actor. This probe is
+  // unauthenticated, so on an authenticated instance the health value is
+  // redacted and the OS is the only remaining source.
+  const redactedProbe = async () => ({
+    ok: true,
+    serverVersion: "2026.916.1",
+    serverStartedAt: null as string | null,
+  });
+
+  it("falls back to the OS process start time when the health probe redacts serverInfo", async () => {
+    const readStartedAt = vi.fn(async () => "2026-09-25T00:29:58.000Z");
+
+    await writeHotRestartIntent(activeStatus, "default", false, {
+      query: async () => ["run-1"],
+      probe: redactedProbe,
+      readStartedAt,
+    });
+
+    expect(readStartedAt).toHaveBeenCalledWith(4242);
+    const intent = await readIntent();
+    expect(intent.previousServerStartedAt).toBe("2026-09-25T00:29:58.000Z");
+    expect(intent.previousServerIdentity).toBe("2026-09-25T00:29:58.000Z");
+  });
+
+  it("prefers the health value over the OS reading and records both", async () => {
+    const readStartedAt = vi.fn(async () => "2026-09-25T00:29:58.000Z");
+
+    await writeHotRestartIntent(activeStatus, "default", false, {
+      query: async () => ["run-1"],
+      probe: healthyProbe,
+      readStartedAt,
+    });
+
+    const intent = await readIntent();
+    expect(intent.previousServerIdentity).toBe("2026-09-25T00:31:04.000Z");
+    expect(readStartedAt).not.toHaveBeenCalled();
+  });
+
+  it("refuses to write an intent it cannot tie to a boot identity", async () => {
+    const query = vi.fn(async () => ["run-1"]);
+
+    await expect(
+      writeHotRestartIntent(activeStatus, "default", false, {
+        query,
+        probe: redactedProbe,
+        readStartedAt: async () => null,
+      }),
+    ).rejects.toThrow(/could not establish the boot identity of the running server \(pid 4242\)/);
+
+    // The server's own writer refuses an intent with no identity, so the CLI
+    // must not be the path that produces one.
+    expect(query).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(instanceRoot, "hot-restart-intent.json"))).toBe(false);
+  });
+
+  it("refuses a drain too, so the CLI never writes a record the server would reject", async () => {
+    await expect(
+      writeHotRestartIntent(activeStatus, "default", true, {
+        query: async () => [],
+        probe: redactedProbe,
+        readStartedAt: async () => null,
+      }),
+    ).rejects.toThrow(/could not establish the boot identity/);
+
+    expect(fs.existsSync(path.join(instanceRoot, "hot-restart-intent.json"))).toBe(false);
+  });
+});
+
 describe("hot-restart intent rollback when the restart never reaches systemd", () => {
   const intentPath = () => path.join(instanceRoot, "hot-restart-intent.json");
   const reportPath = () => path.join(instanceRoot, "hot-restart-report.json");
