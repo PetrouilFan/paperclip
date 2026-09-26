@@ -103,15 +103,49 @@ Eight `.pre-pet110-20260925T171750Z` files and two `.bak-20260925T002012Z` files
 
 `services/cross-issue-influence-limit.js` gained a `TERMINAL_HEARTBEAT_RUN_STATUSES` set, a `reason` parameter on `crossIssueInfluenceRunContextError` emitting `malformed_run_id`, `run_not_found`, and `no_context_source_and_target_unbound`, and `status: heartbeatRuns.status` added to the run select. That in turn let a run-binding fallback trust an issue's `checkoutRunId` / `executionRunId` **only while the run is not terminal**. The published release has no `reason` field and refuses any run with no source issue outright.
 
-Neither patch is on `master`. The second matches commits on the unmerged branch `fix/cross-issue-influence-target-binding-v2` (73784955c "key run-bound fallback on the target issue", f80a08c00 "name the failing gate in the 403 details"), i.e. work still in development.
+At the time this was written neither patch was on `master`, and the second matched commits on the then-unmerged branch `fix/cross-issue-influence-target-binding-v2` (73784955c "key run-bound fallback on the target issue", f80a08c00 "name the failing gate in the 403 details"). **Both have since been reviewed and merged, so `master` now carries them** — see "What replaced the hand-patch" below. The history matters because the stale version of this line is what makes a fork build look unusable: read it, and the only remaining option appears to be a published channel, which is the regression this section exists to prevent.
 
 The gate patch is a **strict improvement** on the released behaviour. The release refuses every write from a task-less run outright, because a run with no source issue in its context snapshot has nothing to attribute the write to; the patched build lets such a run write to the one issue it is actually bound to and counts the rest against the cap. That improvement is why the plane had not been obviously broken — it was quietly running better than its version number claimed, which is what makes this failure mode durable. It is also why the first symptom of it was a *wrong diagnosis* rather than an outage: the instance's refusals did not match anything reproducible from the release, so the cause got attributed to the wrong subsystem.
 
+## What replaced the hand-patch
+
+Both patches are merged on `master` and the installed dist still carries them only as hand-edits, so the instance is now *behind its own fork*: a build of `master` contains the hand-patches **plus** fixes the published releases never carried.
+
+That inverts the usual reinstall advice, so it is worth stating as a measurement rather than a conclusion. Unpacking each published channel and grepping the three subsystems:
+
+| channel | version | malformed-JSON `400` | run-bound cross-issue fallback | database shutdown latch |
+| --- | --- | --- | --- | --- |
+| `latest` | `2026.916.1` | no | **no** | **no** |
+| `beta` | `2026.921.0-beta.1` | yes | **no** | **no** |
+| `canary` | `2026.926.0-canary.4` | yes | **no** | **no** |
+| `nightly` | `2026.926.0-nightly.0` | yes | **no** | **no** |
+| build of this fork's `master` | — | yes | yes | yes |
+
+The two `no` columns under "run-bound fallback" and "shutdown latch" are not an older build of the fix; they are **absent from every published channel**, because both were written here and never released upstream. So on this plane an `npm i -g` of any channel — stable, beta, canary or nightly — is a **regression**: it deletes ten scar files and reinstates a write gate that fails closed for every task-less run. Rule 4 below is about not reinstalling by reflex; this is the case where reinstalling is worse than the shadowing.
+
+`node scripts/check-running-build-drift.mjs` reports all three columns for a given dist, and additionally prints the retained-original files, so "present" and "durably present" are never conflated. Its exit code covers the first column only, on purpose: a hand-edited install is a fact about the plane, not a deploy finding.
+
+```bash
+# What the server is actually running, fix by fix, plus whether a reinstall would undo it.
+node scripts/check-running-build-drift.mjs
+
+# The same question about a build you have not installed yet.
+node -e 'import("./scripts/check-running-build-drift.mjs").then(async m => {
+  const { execFileSync } = await import("node:child_process");
+  process.exit(m.runCheck({
+    distRoot: process.argv[1],
+    git: (a) => execFileSync("git", a, { cwd: process.cwd(), encoding: "utf8" }),
+  }));
+})' /path/to/server/dist
+```
+
+A gap between the two is the deploy decision, and it is a per-channel question, not a per-version one. Measure it; do not infer it from a version number.
+
 ## Rules of thumb
 
-1. **A version string is a claim, not a check.** Before debugging instance behaviour, diff the installed `dist` against the published tarball for that version and look for `.pre-*` / `.bak-*` scars. Ten seconds, and it tells you whether you are reasoning about real code.
+1. **A version string is a claim, not a check.** Before debugging instance behaviour, diff the installed `dist` against the published tarball for that version, look for `.pre-*` / `.bak-*` scars, and run `scripts/check-running-build-drift.mjs` for the fix-by-fix answer. Ten seconds, and it tells you whether you are reasoning about real code.
 2. **Never patch `node_modules`.** If unreleased work must run on a dev plane, build and install a tarball from a named commit so the whole change set is one auditable unit, and record that commit in the instance's notes. Hand-editing a dist makes the change invisible to review, unreproducible, and one `npm install` from gone.
 3. **Back up outside the tree.** A `cp file file.bak-<ts>` inside `dist/` is a useful forensic marker, but it also means the release comparison reports extra files and the patch can be silently reverted by a reinstall. Keep originals in scratch, not in the artifact you are shipping.
-4. **Do not "repair" a shadowed install by reinstalling** before deciding what you are keeping. `npm i -g` reverts the gate to released behaviour — fail-closed for every task-less run, no reason codes — so the instance gets *worse* and the 403s return looking like a regression from the fix. Merge the branch or accept released behaviour; choose deliberately.
+4. **Do not "repair" a shadowed install by reinstalling** before deciding what you are keeping. `npm i -g` reverts the gate to released behaviour — fail-closed for every task-less run, no reason codes — so the instance gets *worse* and the 403s return looking like a regression from the fix. Merge the branch or accept released behaviour; choose deliberately. On a plane whose hand-patches have since merged, the correct move is the other way round: install a build of the fork that already contains them, and measure the channel matrix above before assuming a published channel can.
 5. **Treat new error strings as instance evidence.** When a 403 or 500 carries a `details.reason` or code you cannot find in the release, suspect the instance before you suspect your reading of the bug.
 6. **Ship authorization-path code through review before it runs.** The write gate is the worst place for unreviewed drift: continuously enforced, externally hard to reason about, and reverted globally by any reinstall.
