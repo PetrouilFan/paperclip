@@ -128,12 +128,19 @@ async function main() {
   const author = PR_AUTHOR ?? pr.user.login;
   const branch = PR_BRANCH ?? pr.head.ref;
 
+  // A repository with GitHub issues disabled has no issue to link, so the
+  // linked-issue gate must not advise the author to write `Refs #NNN`. The
+  // pull payload already carries the flag, so this costs no extra API call.
+  // Default to `true` when the field is absent, so the gate keeps the upstream
+  // guidance rather than silently dropping the issue-link route.
+  const repoHasIssues = pr.base?.repo?.has_issues !== false;
+
   // Run all quality gates (pure functions run sync, deps check is async)
   const prTitle = pr.title ?? '';
   const [templateResult, issueResult, dedupResult, testResult, lockfileResult, depsResult, bootstrapResult] =
     await Promise.all([
       Promise.resolve(checkTemplate(prBody)),
-      Promise.resolve(checkLinkedIssue(prBody, prTitle)),
+      Promise.resolve(checkLinkedIssue(prBody, prTitle, { repoHasIssues })),
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
       Promise.resolve(checkTestCoverage(files, prTitle)),
       Promise.resolve(checkLockfile(files, author, branch)),

@@ -2,7 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { checkLinkedIssue, hasInlineIssueDescription } from '../check-pr-linked-issue.mjs';
+import {
+  checkLinkedIssue,
+  hasInlineIssueDescription,
+  scoreInlineDescription,
+  TEMPLATE_FIELDS,
+} from '../check-pr-linked-issue.mjs';
 
 // Existing tests with title parameter added (defaults to no prefix, so still required)
 
@@ -404,3 +409,252 @@ test('fails when the only issue link is inside an HTML comment', () => {
   const body = '<!-- Example: Fixes: #123 -->\n\nSome prose with no real link.';
   assert.equal(checkLinkedIssue(body, 'feat: commented link').passed, false);
 });
+
+// --- "Expected result" is the same field as "Expected behavior" -------------
+//
+// PR #29 described its bug completely and scored 2 of 5 because the body said
+// `**Expected result**`. The template and CONTRIBUTING.md never warn about the
+// spelling, and it is the word the repository's own earlier bug templates used,
+// so the gate rejected a correct report over vocabulary.
+
+const EXPECTED_RESULT_BODY = `
+**What happened**
+
+resolveInstallStorePaths returned six paths under \`paperclipHome\` and one under
+\`homeDir\`. \`shimPath\` was the odd one out.
+
+**Expected result**
+
+One variable names the shim location for every reader and the writer.
+
+**Steps to reproduce**
+
+1. Install normally.
+2. Point \`PAPERCLIP_HOME\` at a directory that was never installed into.
+3. Run \`paperclipai doctor\`.
+`;
+
+test('passes a complete bug report that says "Expected result"', () => {
+  assert.equal(checkLinkedIssue(EXPECTED_RESULT_BODY, 'fix(cli): resolve the shim').passed, true);
+});
+
+test('"Expected result" counts toward the bug score the same as "Expected behavior"', () => {
+  const asBehavior = EXPECTED_RESULT_BODY.replace('Expected result', 'Expected behavior');
+  assert.equal(hasInlineIssueDescription(EXPECTED_RESULT_BODY), hasInlineIssueDescription(asBehavior));
+  assert.equal(scoreInlineDescription(EXPECTED_RESULT_BODY).byTemplate.bug, 3);
+});
+
+test('"Expected result" is still recognised when it is the only expected-behavior label', () => {
+  const body = '## Expected result\n\nIt should work.\n';
+  assert.equal(scoreInlineDescription(body).byTemplate.bug, 1);
+});
+
+// --- "Paperclip version" is optional ---------------------------------------
+//
+// A version is not knowable at PR-authoring time for a change that has not
+// shipped. Requiring it meant the three fields the template exists to collect —
+// what happened, expected behavior, steps to reproduce — could not clear the
+// threshold on their own, which is exactly the body PR #29 wrote.
+
+test('a complete bug report without a version passes', () => {
+  const body = `
+**What happened**
+- The login button does nothing.
+
+**Expected behavior**
+- The login button authenticates the user.
+
+**Steps to reproduce**
+- Open the app, then click login.
+`;
+  assert.equal(checkLinkedIssue(body, 'fix: login').passed, true);
+});
+
+test('a complete bug report with a version still passes', () => {
+  const body = EXPECTED_RESULT_BODY + '\n**Paperclip version**\n\n`master` at `429d14927`.\n';
+  assert.equal(checkLinkedIssue(body, 'fix: login').passed, true);
+});
+
+// A version is not the thing the gate is measuring, so a body that fills only
+// the version cannot reach the threshold on the strength of it.
+test('"Paperclip version" alone does not count toward the threshold', () => {
+  const body = `
+**Paperclip version**
+- \`master\` at \`429d14927\`.
+
+**What happened**
+-
+`;
+  assert.equal(checkLinkedIssue(body, 'fix: login').passed, false);
+});
+
+test('"Paperclip version" is still recognised as a field boundary', () => {
+  // It must keep ending the content scan, or a stacked skeleton would read the
+  // version as the content of the field above it.
+  const body = 'What happened\nPaperclip version\nExpected behavior\n';
+  assert.equal(scoreInlineDescription(body).byTemplate.bug, 0);
+});
+
+// --- A description may span templates --------------------------------------
+//
+// The threshold used to require one single template to clear 3 fields, so a
+// body that substantively covered both a bug and a doc change scored 2 and 2
+// and failed with nothing to fix.
+
+const MIXED_BUG_AND_DOCS_BODY = `
+**What happened**
+
+The install guide documents a shim path the installer no longer writes.
+
+**Expected behavior**
+
+The guide and the installer agree on one path.
+
+**Where is the issue?**
+
+\`doc/INSTALLING.md\`, the "Shim" section.
+
+**What's wrong?**
+
+It still says \`~/.local/bin/paperclipai\` is written directly.
+`;
+
+test('a bug-plus-docs description passes even though neither template reaches 3', () => {
+  const score = scoreInlineDescription(MIXED_BUG_AND_DOCS_BODY);
+  assert.equal(score.byTemplate.bug, 2);
+  assert.equal(score.byTemplate.docs, 2);
+  assert.equal(score.union, 4);
+  assert.equal(checkLinkedIssue(MIXED_BUG_AND_DOCS_BODY, 'fix(docs): correct the shim path').passed, true);
+});
+
+test('the union does not let a body pass on two thin slivers', () => {
+  // One bug field and one docs field is 2 filled fields, still below 3.
+  const body = `
+**What happened**
+
+The guide is wrong.
+
+**What's wrong?**
+
+It documents a path the installer does not write.
+`;
+  const score = scoreInlineDescription(body);
+  assert.equal(score.union, 2);
+  assert.equal(checkLinkedIssue(body, 'fix(docs): correct the shim path').passed, false);
+});
+
+test('the union still requires filled fields, not bare labels', () => {
+  // Three filled fields spread across two templates, none of them real content.
+  const body = `
+What happened
+-
+Expected behavior
+-
+What's wrong
+-
+`;
+  assert.equal(scoreInlineDescription(body).union, 0);
+  assert.equal(checkLinkedIssue(body, 'fix: x').passed, false);
+});
+
+test('canonical field labels are unique across templates', () => {
+  // `union` counts distinct canonical labels, so a label shared by two
+  // templates would be counted once — which is the intent, but only if the
+  // overlap is deliberate rather than accidental.
+  const canonical = new Map();
+  for (const [name, template] of Object.entries(TEMPLATE_FIELDS)) {
+    for (const variants of template.required) {
+      const existing = canonical.get(variants[0]);
+      assert.equal(
+        existing,
+        undefined,
+        `canonical label "${variants[0]}" appears in both ${existing} and ${name}`
+      );
+      canonical.set(variants[0], name);
+    }
+  }
+});
+
+// --- Repository-aware failure message ---------------------------------------
+//
+// A repository with GitHub issues disabled has no issue to reference. The
+// message used to lead with `Fixes #NNN` anyway, and ISSUE_PATTERNS never
+// checks that the number resolves, so the advice could only be satisfied by
+// publishing a link to a number that does not exist.
+
+const NO_LINK_BODY = 'Added a cool feature, no issue linked';
+
+test('with issues enabled the message still offers Fixes #NNN', () => {
+  const { failures } = checkLinkedIssue(NO_LINK_BODY, 'feat: something', { repoHasIssues: true });
+  assert.ok(failures[0].includes('Fixes #NNN'));
+});
+
+test('with issues disabled the message drops the issue-link advice', () => {
+  const { failures } = checkLinkedIssue(NO_LINK_BODY, 'feat: something', { repoHasIssues: false });
+  assert.ok(!failures[0].includes('Fixes #NNN'), failures[0]);
+  assert.ok(!failures[0].includes('Refs #NNN'), failures[0]);
+  assert.ok(!failures[0].includes('Closes #NNN'), failures[0]);
+});
+
+test('with issues disabled the message leads with the inline route', () => {
+  const { failures } = checkLinkedIssue(NO_LINK_BODY, 'feat: something', { repoHasIssues: false });
+  assert.ok(failures[0].includes('has GitHub issues disabled'), failures[0]);
+  assert.ok(failures[0].includes('inline'), failures[0]);
+  // The message must not steer an author into a fabricated link.
+  assert.ok(failures[0].includes('Do not add a `#NNN`'), failures[0]);
+});
+
+test('the message names the three fields a bug report needs', () => {
+  const { failures } = checkLinkedIssue(NO_LINK_BODY, 'feat: something', { repoHasIssues: false });
+  assert.ok(failures[0].includes('what happened'), failures[0]);
+  assert.ok(failures[0].includes('expected behavior'), failures[0]);
+  assert.ok(failures[0].includes('steps to reproduce'), failures[0]);
+});
+
+test('the message reports what the scan actually read', () => {
+  const body = `
+**What happened**
+
+The login button does nothing.
+`;
+  const { failures } = checkLinkedIssue(body, 'fix: login', { repoHasIssues: false });
+  assert.ok(failures[0].includes('bug 1'), failures[0]);
+  assert.ok(failures[0].includes('1 distinct filled, 3 required'), failures[0]);
+});
+
+test('the message reports "no template field was filled" for a prose body', () => {
+  const { failures } = checkLinkedIssue(NO_LINK_BODY, 'feat: something', { repoHasIssues: false });
+  assert.ok(failures[0].includes('no template field was filled'), failures[0]);
+});
+
+test('the message stays a single line, because the gate renders one checkbox per failure', () => {
+  const { failures } = checkLinkedIssue(NO_LINK_BODY, 'feat: something', { repoHasIssues: false });
+  assert.equal(failures.length, 1);
+  assert.ok(!failures[0].includes('\n'), failures[0]);
+});
+
+test('an unknown repository keeps the issue-link advice', () => {
+  // `repoHasIssues` defaults to true, so a caller that does not know the
+  // repository never silently loses the documented route.
+  const { failures } = checkLinkedIssue(NO_LINK_BODY, 'feat: something');
+  assert.ok(failures[0].includes('Fixes #NNN'), failures[0]);
+  assert.ok(!failures[0].includes('has GitHub issues disabled'), failures[0]);
+});
+
+test('the issues-disabled message does not change the verdict', () => {
+  // The message is advice, not policy: a body that satisfies either route still
+  // passes, whatever the repository's issue setting is.
+  assert.equal(checkLinkedIssue(NO_LINK_BODY, 'feat: x', { repoHasIssues: false }).passed, false);
+  assert.equal(checkLinkedIssue('Fixes #1', 'feat: x', { repoHasIssues: false }).passed, true);
+  assert.equal(
+    checkLinkedIssue(BUG_INLINE_BODY, 'feat: x', { repoHasIssues: false }).passed,
+    true
+  );
+});
+
+test('a skip prefix short-circuits before the message is built', () => {
+  const { failures, passed } = checkLinkedIssue('', 'docs: update README', { repoHasIssues: false });
+  assert.equal(passed, true);
+  assert.deepEqual(failures, []);
+});
+
