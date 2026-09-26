@@ -63,10 +63,12 @@ describe("managed install doctor checks", () => {
     // Every way of reaching the "artifacts exist but the manifest is gone"
     // branch must resolve to a non-blocking status, because `commands/run.ts`
     // refuses to bind the server port on any `fail`.
+    //
+    // A *directory* at the shim path is deliberately absent: it is not a managed
+    // artifact at all, so it never reaches this branch. See the test below.
     const shapes: Array<(paths: ReturnType<typeof resolveInstallStorePaths>) => void> = [
       (paths) => fs.writeFileSync(paths.markerPath, MANAGED_STORE_MARKER),
       (paths) => fs.mkdirSync(paths.currentPath, { recursive: true }),
-      (paths) => fs.mkdirSync(paths.shimPath, { recursive: true }),
       (paths) => fs.mkdirSync(path.join(paths.installsRoot, "npm", "1.2.3"), { recursive: true }),
     ];
 
@@ -83,6 +85,25 @@ describe("managed install doctor checks", () => {
       expect(results.filter((result) => result.status === "fail")).toEqual([]);
       expect(results.filter((result) => result.status === "warn")).toHaveLength(1);
     }
+  });
+
+  it("does not treat a directory at the shim path as a managed artifact", () => {
+    // A shim witness has to be a file carrying the managed marker, so a
+    // directory where the command belongs is not one. Nothing in the store
+    // exists either, so there is no half-state to warn about: this is a clean
+    // "not a managed install", and it must not reach the manifest branch at
+    // all. It also must not be escalated to a `fail` for being unrecognised.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-doctor-"));
+    const paths = resolveInstallStorePaths({
+      paperclipHome: path.join(root, ".paperclip"),
+      homeDir: root,
+    });
+    fs.mkdirSync(paths.cliRoot, { recursive: true });
+    fs.mkdirSync(paths.shimPath, { recursive: true });
+
+    expect(managedInstallChecks(paths)).toEqual([
+      expect.objectContaining({ name: "Managed install", status: "pass" }),
+    ]);
   });
 
   it("still fails when the manifest exists but cannot be read", () => {
