@@ -369,7 +369,7 @@ describe("what the parity is for: the guard's exact branch", () => {
 // gives **today**, pinned so that a later change to the identity path cannot
 // land without someone reading a diff that says what flipped. None of them
 // assert what the answer ought to be. Deciding that is a separate question
-// (PET-334 step 2), and it is not a question this suite can answer: the server's
+// (an open follow-up), and it is not a question this suite can answer: the server's
 // own `hot-restart.test.ts` deliberately uses opaque tokens like
 // "server-boot-a" for this field, so normalising it through a date parser would
 // drop a value the rest of the suite treats as legitimate. Whoever decides that

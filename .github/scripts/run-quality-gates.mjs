@@ -18,6 +18,7 @@ import { checkLockfile } from './check-pr-lockfile.mjs';
 import { checkDependencies } from './check-pr-dependencies.mjs';
 import { checkReleaseBootstrap } from './check-pr-release-bootstrap.mjs';
 import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors.mjs';
+import { checkInternalRefs } from './check-pr-internal-refs.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
 
@@ -126,6 +127,17 @@ async function upsertComment(token, repo, prNumber, body, existing) {
   }
 }
 
+/**
+ * Flattens the gates' failures into the one list that decides the exit code.
+ *
+ * Exported so the wiring is testable: a gate that is imported and run but never
+ * added to this list passes every run while appearing in the orchestrator, and
+ * that is the one failure mode a gate cannot detect about itself.
+ */
+export function collectBlockingFailures(results) {
+  return results.flatMap((result) => result?.failures ?? []);
+}
+
 async function main() {
   const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
 
@@ -185,15 +197,29 @@ async function main() {
       checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
       checkReleaseBootstrap(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
     ]);
+  // Kept out of the Promise.all above for the same reason as the co-author
+  // lookup: `commits` is populated by a fetch that is allowed to fail, and a
+  // gate that needs it must see the empty list rather than never run at all.
+  // On an empty list this gate still scans the title, the body, the branch and
+  // the whole diff — the commit-subject leg is the only thing it loses.
+  const internalRefsResult = checkInternalRefs({
+    prTitle,
+    prBody,
+    prBranch: branch,
+    commits,
+    files,
+    prefixes: process.env.INTERNAL_REF_PREFIXES,
+  });
   const coauthorResult = checkCoauthors(commits, author);
 
-  const allFailures = [
-    ...templateResult.failures,
-    ...issueResult.failures,
-    ...dedupResult.failures,
-    ...testResult.failures,
-    ...lockfileResult.failures,
-  ];
+  const allFailures = collectBlockingFailures([
+    templateResult,
+    issueResult,
+    dedupResult,
+    testResult,
+    lockfileResult,
+    internalRefsResult,
+  ]);
   const informational = [
     ...(depsResult.informational ?? []),
     ...(bootstrapResult.informational ?? []),

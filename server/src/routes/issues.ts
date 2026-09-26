@@ -6824,7 +6824,7 @@ export function issueRoutes(
     if (issue.status === "blocked") {
       // Same rule as the resume guards: this readiness read only sees the
       // pre-patch edges, so a request that clears the blocker list must not be
-      // gated on them (PET-392).
+      // gated on them.
       const requestClearsExplicitBlockers =
         Array.isArray(req.body?.blockedByIssueIds) &&
         req.body.blockedByIssueIds.length === 0;
@@ -13312,7 +13312,7 @@ export function issueRoutes(
       // blocker list is declaring the issue no longer waits on other work. The
       // readiness read below only sees the *pre-patch* edges, so guarding on it
       // would refuse the very request that resolves the condition -- leaving the
-      // writer with no way to undo the edge it just wrote (PET-392).
+      // writer with no way to undo the edge it just wrote.
       const requestClearsExplicitBlockers =
         Array.isArray(req.body?.blockedByIssueIds) &&
         req.body.blockedByIssueIds.length === 0;
@@ -17723,7 +17723,7 @@ export function issueRoutes(
           shouldResumeInProgressScheduledRetry);
       // See the sibling guard in the issue PATCH handler: a request that clears
       // the blocker list resolves the condition the readiness read reports, so
-      // it must not be refused against the pre-patch edges (PET-392).
+      // it must not be refused against the pre-patch edges.
       const requestClearsExplicitBlockers =
         Array.isArray(req.body?.blockedByIssueIds) &&
         req.body.blockedByIssueIds.length === 0;

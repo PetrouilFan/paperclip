@@ -746,7 +746,7 @@ describe("reapLostRunProcessTree", () => {
   it(
     "still reaps a real orphan while an unrelated database is live",
     async () => {
-      // The guard must not become a blanket refusal. PET-109's five leaked
+      // The guard must not become a blanket refusal. The five leaked
       // servers are still orphans: nothing about them holds a database, so
       // they remain reapable while this instance's own database is up.
       const { scratch, serverScript, spawnerScript } = await setup();

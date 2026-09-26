@@ -139,7 +139,7 @@ test("a manifest mismatch is reported as a bug in this check, not a deploy state
   assert.match(text, /bug in check-running-build-drift\.mjs/);
 });
 
-test("the shipped sentinels guard the two files PET-227 names", () => {
+test("the shipped sentinels guard the two files the drift check names", () => {
   const sources = RUNNING_BUILD_SENTINELS.map((s) => s.sourcePath);
   assert.ok(sources.includes("server/src/services/cross-issue-influence-limit.ts"));
   assert.ok(sources.includes("server/src/services/issues.ts"));

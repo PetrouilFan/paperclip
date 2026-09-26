@@ -22,7 +22,7 @@ SMOKE_READY_TIMEOUT_SECONDS="${SMOKE_READY_TIMEOUT_SECONDS:-420}"
 # smoke could be pointed at a production server and report a false pass.
 HEALTH_URL="http://127.0.0.1:3100/api/health"
 
-# PET-52: e2e scripts must not address the real service in the real $HOME.
+# e2e scripts must not address the real service in the real $HOME.
 # Run entirely against an isolated home so the smoke can never uninstall a
 # production paperclipai.service.
 SMOKE_ISOHOME="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-smoke-iso.XXXXXX")" || {
@@ -33,13 +33,13 @@ if [[ -z "$SMOKE_ISOHOME" || ! -d "$SMOKE_ISOHOME" ]]; then
   echo "Service smoke failed: isolated HOME was not created (got '${SMOKE_ISOHOME}')" >&2
   exit 1
 fi
-# PET-52: e2e scripts must not address the real service in the real $HOME.
+# e2e scripts must not address the real service in the real $HOME.
 #
 # The isolated home below is DATA isolation only. $HOME and $XDG_CONFIG_HOME
 # are deliberately NOT pointed at it, because doing so makes this script
 # incapable of passing.
 #
-# Measured (PET-259, 2026-09-26) on a host with a live systemd --user manager
+# Measured (2026-09-26) on a host with a live systemd --user manager
 # using a throwaway unit name: `systemctl --user enable <name>` resolves unit
 # files from the MANAGER's search path, captured when the manager started. A
 # unit written under an overridden HOME/XDG_CONFIG_HOME is invisible to it and

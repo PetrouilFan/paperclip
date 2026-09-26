@@ -87,7 +87,7 @@ describe("describeIssueWriteDenial", () => {
   });
 
   it("does not tell a bound-but-unsourced run to resend the run header it already sent", () => {
-    // PET-156. The run id is already in the bearer token and the server already
+    // The run id is already in the bearer token and the server already
     // resolved it; what is missing is a source issue. Telling the agent to send
     // the header is unfollowable and turns one correct refusal into a
     // budget-burning retry loop.

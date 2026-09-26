@@ -240,7 +240,7 @@ describe.skipIf(!support.supported)(
       // The production cadence, not a re-sweep of an already-resolved row: every
       // pass the watchdog mints a fresh action for the same dead run, and that
       // fresh id is what defeated every dedup keyed on the action. 20 passes is
-      // the shape of the 153 settlements measured on PET-351.
+      // the shape of the 153 duplicate settlements measured on a live board.
       for (let i = 0; i < 20; i += 1) {
         await remintAction(seed);
         await settleUnrecoverableExecutions(db, new Date(), { wakeup });

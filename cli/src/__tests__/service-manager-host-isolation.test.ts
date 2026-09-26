@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SystemdServiceManager, systemdServiceName, type CommandRunner } from "../services/service-manager.js";
 
-// PET-52: the e2e service legs end in `service uninstall`. This file pins what
+// The e2e service legs end in `service uninstall`. This file pins what
 // that actually does to a host, because the answer decides whether an isolated
 // HOME is enough.
 //
@@ -80,7 +80,7 @@ function systemctlVerbs(invocations: Invocation[]): string[] {
     });
 }
 
-describe("PET-52 host isolation", () => {
+describe("e2e service leg host isolation", () => {
   it("gives the default instance the production unit name", () => {
     // The premise of the whole hazard: an e2e leg that onboards the default
     // instance installs a unit named exactly like the host's production one.

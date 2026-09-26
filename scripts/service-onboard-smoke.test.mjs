@@ -51,7 +51,7 @@ test("nightly and beta smokes still route through the reusable workflow", () => 
   assert.ok(calls.length >= 2, "smoke_nightly and smoke_beta must call release-smoke.yml so smoke_service gates them");
 });
 
-// PET-52. `onboard --install-service` has no --instance flag, so it resolves the
+// `onboard --install-service` has no --instance flag, so it resolves the
 // instance from PAPERCLIP_INSTANCE_ID and falls back to "default" -- which
 // systemdServiceName maps to paperclipai.service, the production unit name. With
 // the default name, this script's cleanup() ran `systemctl --user stop

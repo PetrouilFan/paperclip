@@ -5998,7 +5998,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 
   it("keeps the assignee when release clears the locks of a parked in_review issue", async () => {
-    // Regression for PET-228. release() cleared assigneeAgentId unconditionally while
+    // Regression: release() cleared assigneeAgentId unconditionally while
     // preserving the status of everything that is not in_progress, so releasing a parked
     // review orphaned it: same status, no owner. An agent holding only that issue then has
     // no way back, because the restoring PATCH nulls checkoutRunId and any later release
@@ -6192,7 +6192,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 
   it("checkout refuses a terminal run and writes no binding, naming the run's real status", async () => {
-    // PET-178 regression. A checkout that names a run which has already
+    // Regression: a checkout that names a run which has already
     // finished used to answer 200 with that run id echoed back as
     // `checkoutRunId`, while every subsequent write from the same run was
     // refused 409 and `GET /issues/{id}` read `checkoutRunId: null` to a live
@@ -6282,7 +6282,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 
   it("checkout still binds a run that has not finished, and still reclaims one whose run has since died", async () => {
-    // The other two legs of the PET-178 matrix, so the new refusal cannot be
+    // The other two legs of the same matrix, so the new refusal cannot be
     // bought by simply breaking checkout: an active run binds and reports the
     // binding, and once that same run turns terminal the reclaim path is what
     // lets the next run take the issue.

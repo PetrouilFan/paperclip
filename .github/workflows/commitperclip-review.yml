@@ -73,17 +73,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout base branch (never PR code)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: master
-
       # Single source of PR context for both triggers. `pull_request_target`
       # carries the pull request in the event payload; `workflow_dispatch`
       # carries only the number, so it is resolved over the API. Every later
       # step reads this step's outputs rather than `github.event.pull_request.*`,
       # which is empty on a dispatch and would silently blank the base/head
       # refs and the PR number.
+      #
+      # This runs *before* the checkout because the checkout needs it. That
+      # ordering is the whole point of the fix below, and the two must not be
+      # swapped back.
       - name: Resolve pull request context
         id: pr
         env:
@@ -105,6 +104,11 @@ jobs:
             exit 1
           fi
 
+          # `base.sha` is the merge base the event was raised against, and it is
+          # the only value here that is a commit rather than a mutable name.
+          # A branch name would let a push to the base change which gate code
+          # this run executes between the moment it starts and the moment the
+          # verdict is published.
           {
             echo "number=${pr_number}"
             printf '%s' "$pr" | jq -r '"author=\(.user.login)"'
@@ -112,6 +116,29 @@ jobs:
             printf '%s' "$pr" | jq -r '"head_sha=\(.head.sha)"'
             printf '%s' "$pr" | jq -r '"base_sha=\(.base.sha)"'
           } >> "$GITHUB_OUTPUT"
+
+      # Still never PR code: this is the base *commit*, resolved over the API
+      # and read out of this run's own outputs, not a ref that PR code can
+      # influence.
+      #
+      # It used to be a hardcoded `ref: master` under this same name. That made
+      # the gates' verdict a function of master's copy of the gates and nothing
+      # else, which is a real defect with two faces:
+      #
+      #   1. A pull request that *adds or changes* a gate is judged by the
+      #      version of that gate already on master. A brand-new gate cannot
+      #      run on the pull request that introduces it, so its first exercise
+      #      is on the pull request after it — and until it merges, never.
+      #   2. For a pull request against a base other than master, the gates ran
+      #      code that was not the base's code at all.
+      #
+      # The `workflow_dispatch` trigger below exists to re-gate a pull request
+      # whose verdict describes nothing. Checking out `master` reintroduced the
+      # same staleness one level down, where the re-gate could not fix it.
+      - name: Checkout base branch (never PR code)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.pr.outputs.base_sha }}
 
       # Left gating on purpose. This step is a real security gate, and this
       # repository carries open Dependabot alerts that it is the thing meant to

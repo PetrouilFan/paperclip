@@ -480,3 +480,33 @@ test('the token step keeps its fall back to the workflow token', async () => {
   assert.match(run, /TOKEN="\$\{GITHUB_TOKEN\}"/, 'the GITHUB_TOKEN fall back must remain');
   assert.match(run, /add-mask/, 'the token must stay masked');
 });
+
+test('the gates run the base commit, not whatever master happens to be', async () => {
+  const { run } = stepByName(await readWorkflow(), 'Checkout base branch (never PR code)');
+
+  assert.ok(
+    run.includes('${{ steps.pr.outputs.base_sha }}'),
+    'the gate code must come from the pull request base commit',
+  );
+  assert.doesNotMatch(
+    run,
+    /^\s*ref:\s*master\s*$/m,
+    'a hardcoded `ref: master` makes the verdict a function of master rather than of the base, ' +
+      'so a pull request that adds a gate can never be the first thing that gate judges',
+  );
+});
+
+test('the base commit is resolved before the checkout that consumes it', async () => {
+  const order = allSteps(await readWorkflow()).map((step) => step.name);
+
+  const resolve = order.indexOf('Resolve pull request context');
+  const checkout = order.indexOf('Checkout base branch (never PR code)');
+
+  assert.notEqual(resolve, -1, 'the workflow must resolve the pull request context');
+  assert.notEqual(checkout, -1, 'the workflow must check the base out');
+  assert.ok(
+    resolve < checkout,
+    'steps.pr.outputs.base_sha does not exist until the resolve step has run, so a checkout ' +
+      'placed first silently falls back to the checked-out default and the fix reads as present but inert',
+  );
+});

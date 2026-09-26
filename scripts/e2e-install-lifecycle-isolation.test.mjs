@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-// PET-52. The service leg of e2e-install-lifecycle.sh ends in `service
+// The service leg of e2e-install-lifecycle.sh ends in `service
 // uninstall`, which on a host whose production paperclipai.service lives under
 // the real $HOME deleted the unit file and took the embedded PostgreSQL and API
 // with it.
@@ -58,7 +58,7 @@ test("every service verb is pinned to the isolated instance", () => {
   // carry `--instance "$SERVICE_INSTANCE"`, and that is what this test exists to
   // enforce. Anchoring on the quoting instead would have let the test go red on a
   // correct script while saying nothing about an unpinned verb, which is the
-  // failure mode PET-255 is about.
+  // failure mode this file exists to catch.
   const shim = '"?\\$SERVICE_SHIM"?';
   for (const verb of ["status", "logs", "stop", "uninstall"]) {
     const uses = [...script.matchAll(new RegExp(`${shim} service ${verb}[^\\n]*`, "g"))].map((m) => m[0]);
@@ -114,7 +114,7 @@ test("the preflight runs before the leg takes its instance id, and the leg asser
   // so PAPERCLIP_INSTANCE_ID is the only thing that renames the unit, and the
   // derived SERVICE_NAME follows from it.
   const isolation = script.indexOf('export PAPERCLIP_INSTANCE_ID="$SERVICE_INSTANCE"');
-  assert.ok(preflight > 0, "could not find the PET-52 preflight in the script");
+  assert.ok(preflight > 0, "could not find the host-unit preflight in the script");
   assert.ok(isolation > 0, "could not find the leg's instance-id export in the script");
   assert.ok(
     preflight < isolation,
@@ -198,7 +198,7 @@ test("an active production unit stops the leg instead of only recording a skip",
   const out = runGuards({ mktempFails: false, unitState: "active" });
   assert.doesNotMatch(out, /LEAKED/, `the leg ran on a host with a live production unit:\n${out}`);
   assert.doesNotMatch(out, /REACHED-END/, `the script continued past the preflight:\n${out}`);
-  assert.match(out, /PET-52 guard/);
+  assert.match(out, /host-unit guard/);
 });
 
 test("a stopped production unit does not read as active", () => {
@@ -207,7 +207,7 @@ test("a stopped production unit does not read as active", () => {
   // host live, skips the leg, and the e2e service leg never runs anywhere.
   // The healthy path must reach the override with a real isolated home.
   const out = runGuards({ mktempFails: false, unitState: "inactive" });
-  assert.doesNotMatch(out, /PET-52 guard/, `an "inactive" host was treated as live:\n${out}`);
+  assert.doesNotMatch(out, /host-unit guard/, `an "inactive" host was treated as live:\n${out}`);
   assert.match(out, /REACHED-END/, `the guards blocked a healthy host:\n${out}`);
   assert.match(out, /isohome-exists=yes/, `the isolated home was not usable:\n${out}`);
   assert.match(out, /HOME=\[\/[^/]/, `HOME was not the isolated home:\n${out}`);
@@ -232,7 +232,7 @@ test("the mktemp template is not quote-escaped", () => {
   }
   // And the line actually runs. A template that only parses is not a template
   // that works.
-  const directory = mkdtempSync(join(tmpdir(), "pet221-template-"));
+  const directory = mkdtempSync(join(tmpdir(), "mktemp-template-"));
   try {
     const out = execFileSync("sh", ["-c", 'S="$(mktemp -d "${TMPDIR:-/tmp}/e2e-service-iso.XXXXXX")" && printf %s "$S"'], { encoding: "utf8" });
     assert.ok(out.length > 0 && out !== "", "mktemp produced no directory");

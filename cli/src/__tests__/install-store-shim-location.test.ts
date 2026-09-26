@@ -19,7 +19,7 @@ let previousShimPath: string | undefined;
 beforeEach(() => {
   previousShimPath = process.env.PAPERCLIP_SHIM_PATH;
   delete process.env.PAPERCLIP_SHIM_PATH;
-  root = fs.mkdtempSync(path.join(os.tmpdir(), "pet292-"));
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "shim-store-"));
   homeDir = path.join(root, "home");
   fs.mkdirSync(homeDir, { recursive: true });
 });
@@ -49,7 +49,7 @@ function seed(p: InstallStorePaths): void {
   fs.symlinkSync(payload, p.currentPath);
 }
 
-describe("PET-292: the shim location is resolvable from the same knob the service uses", () => {
+describe("relocated store: the shim location is resolvable from the same knob the service uses", () => {
   it("defaults to the historical $HOME/.local/bin path", () => {
     const p = store(relocatedHome("default"));
     expect(p.shimPath).toBe(path.join(homeDir, ".local", "bin", "paperclipai"));
@@ -63,7 +63,7 @@ describe("PET-292: the shim location is resolvable from the same knob the servic
     const p = store(relocatedHome("custom"));
     expect(p.shimPath).toBe(custom);
     // The invariant that keeps `service install` from writing an ExecStart at a
-    // shim `install` never writes (PET-40 / 203-EXEC crash-loop).
+    // shim `install` never writes — the crash loop the ExecStart path produced.
     expect(resolveServiceShimPath(homeDir)).toBe(p.shimPath);
   });
 
@@ -72,7 +72,7 @@ describe("PET-292: the shim location is resolvable from the same knob the servic
   });
 });
 
-describe("PET-292: relocating the store no longer produces a self-contradictory finding", () => {
+describe("relocated store: relocating no longer produces a self-contradictory finding", () => {
   it("names the orphan shim and the empty store instead of claiming artifacts exist", () => {
     const originalHome = path.join(root, "original", ".paperclip");
     fs.mkdirSync(originalHome, { recursive: true });
@@ -116,7 +116,7 @@ describe("PET-292: relocating the store no longer produces a self-contradictory 
     expect(shimCheck?.status).toBe("pass");
   });
 
-  // PET-111: this assertion was `fail` and was changed to `warn` deliberately,
+  // This assertion was `fail` and was changed to `warn` deliberately,
   // not as a side effect of a rebase. #29 called the half-torn store a blocking
   // state; this branch calls it the one state the check cannot classify.
   //
@@ -124,7 +124,7 @@ describe("PET-292: relocating the store no longer produces a self-contradictory 
   // store caught mid-update is indistinguishable from one that lost its
   // manifest to something worse. `commands/run.ts` refuses to bind the server
   // port on any `fail`, so treating the unprovable state as provable made the
-  // board unreachable on restart — which is the incident PET-111 documents, and
+  // board unreachable on restart — which is the incident these lines record, and
   // the reason this host sat down for 3m31s with six runs closed.
   //
   // The provable siblings of this state keep their veto and are covered
@@ -148,7 +148,7 @@ describe("PET-292: relocating the store no longer produces a self-contradictory 
   });
 });
 
-describe("PET-292: a relocated shim is written, found and swept", () => {
+describe("relocated store: a relocated shim is written, found and swept", () => {
   it("writes to the configured location without touching unrelated directories", () => {
     const custom = path.join(root, "opt", "pc", "bin", "paperclipai");
     process.env.PAPERCLIP_SHIM_PATH = custom;
@@ -197,7 +197,7 @@ describe("PET-292: a relocated shim is written, found and swept", () => {
   });
 });
 
-describe("PET-292: writing a relocated shim does not widen a home directory", () => {
+describe("relocated store: writing a relocated shim does not widen a home directory", () => {
   it("keeps 0o700 on a home directory it has to create", () => {
     const freshHome = path.join(root, "fresh", "home");
     const p = resolveInstallStorePaths({ paperclipHome: relocatedHome("modes"), homeDir: freshHome });

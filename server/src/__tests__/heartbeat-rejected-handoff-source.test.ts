@@ -62,7 +62,7 @@ describeEmbeddedPostgres("rejected handoff source is not persisted as resume pro
 
   /**
    * `sourceIssueId` is what the cancelled predecessor run's own context snapshot
-   * carries. `null` is the taskless `heartbeat_timer` run PET-307 measured: the
+   * carries. `null` is the taskless `heartbeat_timer` run this measures: the
    * handoff guard rejects it, yet its id was still advertised to the
    * continuation builder, which then failed the successor run during setup.
    */
