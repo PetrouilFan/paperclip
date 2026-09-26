@@ -148,7 +148,19 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
   for (const entry of sourcePackage.files ?? []) {
-    cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
+    const sourcePath = resolve(sourceDir, entry);
+    // Every entry in `files` is a build output, not a checked-in file, so a missing one
+    // means a build step was skipped rather than that the source is incomplete. cpSync
+    // reports that as a bare ENOENT with a lstat frame, which reads as a corrupt
+    // checkout; name the entry and the step that produces it instead.
+    if (!existsSync(sourcePath)) {
+      throw new Error(
+        `${sourcePackage.name} declares "${entry}" in files but ${sourcePath} does not exist. ` +
+          `It is a build output: run the build that produces it (for ui-dist, ` +
+          `scripts/prepare-server-ui-dist.sh) before packaging.`,
+      );
+    }
+    cpSync(sourcePath, resolve(destinationDir, entry), { recursive: true });
   }
   for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
     const sourcePath = resolve(sourceDir, entry);
