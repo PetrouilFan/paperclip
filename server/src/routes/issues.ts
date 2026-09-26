@@ -6822,16 +6822,24 @@ export function issueRoutes(
     }
 
     if (issue.status === "blocked") {
-      const readiness = await svc.getDependencyReadiness(issue.id);
-      if (readiness.unresolvedBlockerCount > 0) {
-        res.status(409).json({
-          error: "Issue follow-up blocked by unresolved blockers",
-          details: {
-            issueId: issue.id,
-            unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
-          },
-        });
-        return false;
+      // Same rule as the resume guards: this readiness read only sees the
+      // pre-patch edges, so a request that clears the blocker list must not be
+      // gated on them (PET-392).
+      const requestClearsExplicitBlockers =
+        Array.isArray(req.body?.blockedByIssueIds) &&
+        req.body.blockedByIssueIds.length === 0;
+      if (!requestClearsExplicitBlockers) {
+        const readiness = await svc.getDependencyReadiness(issue.id);
+        if (readiness.unresolvedBlockerCount > 0) {
+          res.status(409).json({
+            error: "Issue follow-up blocked by unresolved blockers",
+            details: {
+              issueId: issue.id,
+              unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+            },
+          });
+          return false;
+        }
       }
     }
 
@@ -13299,8 +13307,19 @@ export function issueRoutes(
       const updateReferenceSummaryBefore = titleOrDescriptionChanged
         ? await issueReferencesSvc.listIssueReferenceSummary(existing.id)
         : null;
+      // Symmetric counterpart to `requestAddsExplicitBlockers` in
+      // shouldImplicitlyMoveCommentedIssueToTodo: a request that clears the
+      // blocker list is declaring the issue no longer waits on other work. The
+      // readiness read below only sees the *pre-patch* edges, so guarding on it
+      // would refuse the very request that resolves the condition -- leaving the
+      // writer with no way to undo the edge it just wrote (PET-392).
+      const requestClearsExplicitBlockers =
+        Array.isArray(req.body?.blockedByIssueIds) &&
+        req.body.blockedByIssueIds.length === 0;
       const hasUnresolvedFirstClassBlockers =
-        isBlocked && effectiveMoveToTodoRequested
+        isBlocked &&
+        effectiveMoveToTodoRequested &&
+        !requestClearsExplicitBlockers
           ? (await svc.getDependencyReadiness(existing.id))
               .unresolvedBlockerCount > 0
           : false;
@@ -17702,8 +17721,16 @@ export function issueRoutes(
             executionRunId: issue.executionRunId,
           }) ||
           shouldResumeInProgressScheduledRetry);
+      // See the sibling guard in the issue PATCH handler: a request that clears
+      // the blocker list resolves the condition the readiness read reports, so
+      // it must not be refused against the pre-patch edges (PET-392).
+      const requestClearsExplicitBlockers =
+        Array.isArray(req.body?.blockedByIssueIds) &&
+        req.body.blockedByIssueIds.length === 0;
       const hasUnresolvedFirstClassBlockers =
-        isBlocked && effectiveMoveToTodoRequested
+        isBlocked &&
+        effectiveMoveToTodoRequested &&
+        !requestClearsExplicitBlockers
           ? (await svc.getDependencyReadiness(issue.id))
               .unresolvedBlockerCount > 0
           : false;
