@@ -254,6 +254,8 @@ jobs:
             ls -l "$HOME/.config/systemd/user/" 2>&1 || true
             echo "== leftovers from the leg's isolated home =="
             ls -d /tmp/e2e-service-iso.* 2>&1 || echo "(no isolated home left behind)"
+            echo "== leftovers from the leg's instance home =="
+            ls -d "$HOME/.paperclip/instances/e2e" 2>&1 || echo "(no e2e instance home left behind)"
             echo "== the leg's own journal =="
             journalctl --user -u paperclipai-e2e.service --no-pager -n 40 2>&1 || true
           } 2>&1 | tee "$RUNNER_TEMP/after.log"
@@ -418,6 +420,8 @@ jobs:
             ls -l "$HOME/.config/systemd/user/" 2>&1 || true
             echo "== isolated home leftovers =="
             ls -d /tmp/e2e-service-iso.* 2>&1 || echo "(no isolated home left behind)"
+            echo "== leg instance home leftovers =="
+            ls -d "$HOME/.paperclip/instances/e2e" 2>&1 || echo "(no e2e instance home left behind)"
           } 2>&1 | tee -a "$RUNNER_TEMP/after.log"
           # The two fields the issue asks to compare, before vs after.
           for field in ActiveEnterTimestamp MainPID; do
@@ -540,9 +544,9 @@ jobs:
             bad=1
           fi
           # `8 isolation:` is printed immediately after the guards, so its
-          # absence proves control never reached the override.
+          # absence proves control never entered the leg body.
           if grep -q "8 isolation: instance=e2e" "$RUNNER_TEMP/e2e.clean.log"; then
-            echo "CONTROL REACHED THE HOME OVERRIDE"
+            echo "CONTROL GOT PAST THE GUARDS INTO THE LEG BODY"
             bad=1
           fi
           exit "$bad"
@@ -649,7 +653,7 @@ jobs:
             bad=1
           fi
           if grep -q "8 isolation: instance=e2e" "$RUNNER_TEMP/e2e.clean.log"; then
-            echo "CONTROL REACHED THE HOME OVERRIDE"
+            echo "CONTROL GOT PAST THE GUARDS INTO THE LEG BODY"
             bad=1
           fi
           # OVERALL must be FAIL and the script must have exited non-zero: a
