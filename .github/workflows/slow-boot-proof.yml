@@ -1,0 +1,235 @@
+name: Slow Boot Proof
+
+# PET-296 / PET-253 DoD 4. Prove, on a CLEAN host, that a `paperclipai`
+# service boot which takes longer than systemd's 90s default start timeout
+# COMPLETES instead of being SIGTERMed -- and that the budget which lets it
+# complete came from the unit the installer rendered, not from a drop-in
+# somebody hand-wrote on the host.
+#
+# WHY THIS NEEDS A RUNNER
+#
+# The board host cannot produce this evidence and must not be asked to. It
+# runs a live paperclipai.service, and `scripts/slow-boot-proof.sh` refuses to
+# start at all when that unit is active (the same PET-52 guard the e2e legs
+# use). Worse, the host's production unit carries a hand-written
+# 70-start-timeout.conf drop-in supplying TimeoutStartSec=10min, so even a
+# successful boot there would prove nothing about what a fresh onboard inherits.
+# A throwaway GitHub-hosted runner is the only host that has a real systemd
+# user session (linger + XDG_RUNTIME_DIR) and no production unit.
+#
+# WHY A SEPARATE FILE RATHER THAN A JOB IN e2e-service-leg.yml
+#
+# Same reasoning that file gives for separating itself from release-smoke.yml:
+# this is a heavy diagnostic leg, and it must not become a release gate by
+# accident. It also gives this proof its own trigger, so a 40-minute run cannot
+# add to -- or be confused with -- the five unrelated legs in that file.
+#
+# Triggers on push to this branch as well as dispatch, for the reason
+# e2e-service-leg.yml documents: `actions/workflows/<file>` is resolved from
+# the default branch, so a dispatch only works once the file is on master,
+# while a push trigger runs the file as it exists on the pushed commit.
+
+on:
+  push:
+    branches:
+      - pet296/slow-boot-proof
+  workflow_dispatch:
+    inputs:
+      slow_boot_ref:
+        description: Git ref for the bootstrap tarball and the managed install
+        required: false
+        default: master
+        type: string
+      slow_boot_min_boot_seconds:
+        description: The bar the proof boot must clear (systemd's default is 90)
+        required: false
+        default: "90"
+        type: string
+      slow_boot_target_boot_seconds:
+        description: Where to aim the load, comfortably over the bar
+        required: false
+        default: "150"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # The upstream default (paperclipai/paperclip) does not carry this fork's
+  # e2e scripts, so the proof installs from the fork.
+  SLOW_BOOT_REPO: PetrouilFan/paperclip
+
+jobs:
+  slow_boot_proof:
+    name: a >90s boot completes on the unit the installer rendered
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Start a user systemd session
+        # The hosted runner has no login session for the runner user, so
+        # `systemctl --user` cannot reach a user manager until lingering
+        # starts one. Export the session address for the steps below. The
+        # proof script refuses to run without a reachable manager rather than
+        # reporting a false pass, so this step failing is a real red.
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          uid="$(id -u)"
+          for _ in $(seq 1 30); do
+            [[ -S "/run/user/$uid/bus" ]] && break
+            sleep 1
+          done
+          [[ -S "/run/user/$uid/bus" ]]
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+          } >> "$GITHUB_ENV"
+
+      - name: Record the prestate the proof depends on
+        # The script's own preflight aborts on any of this, so a red here is
+        # the same condition reported earlier rather than a mystery failure
+        # twenty minutes into the run. Kept as its own step so the evidence
+        # exists even when the proof aborts at step 0.
+        run: |
+          {
+            echo "== host =="
+            uname -a
+            echo "cores: $(nproc)"
+            systemctl --version | head -1
+            node --version
+            echo "== is-active paperclipai.service (must NOT be active) =="
+            systemctl --user is-active paperclipai.service 2>&1 || true
+            echo "== unit files on disk before the proof =="
+            ls -l "$HOME/.config/systemd/user/" 2>&1 || true
+            echo "== managed shim / store before the proof (must not exist) =="
+            ls -l "$HOME/.local/bin/paperclipai" 2>&1 || echo "(no shim: clean)"
+            ls -ld "$HOME/.paperclip/cli" 2>&1 || echo "(no managed store: clean)"
+            echo "== listeners on 3100 =="
+            ss -ltn '( sport = :3100 )' 2>&1 || true
+          } 2>&1 | tee "$RUNNER_TEMP/prestate.log"
+
+      - name: Run slow-boot-proof.sh
+        env:
+          # The ref under test defaults to the commit that carries the proof,
+          # so the build on disk is the build being certified. DoD 1-3 are
+          # merged to master as d415c4196 and this commit is its descendant.
+          SLOW_BOOT_REF: ${{ inputs.slow_boot_ref || github.sha }}
+          SLOW_BOOT_MIN_BOOT_SECONDS: ${{ inputs.slow_boot_min_boot_seconds || '90' }}
+          SLOW_BOOT_TARGET_BOOT_SECONDS: ${{ inputs.slow_boot_target_boot_seconds || '150' }}
+        run: |
+          set +e
+          ./scripts/slow-boot-proof.sh 2>&1 | tee "$RUNNER_TEMP/slow-boot-proof.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "script_exit=$code" | tee -a "$RUNNER_TEMP/slow-boot-proof.log"
+          exit "$code"
+
+      - name: Require the DoD assertions
+        # The script already exits non-zero on any FAIL, so this is belt and
+        # braces -- and it is deliberately checking for named PASS lines rather
+        # than for the absence of the word FAIL. A script that died before
+        # reaching its summary has no FAIL line either, and treating that as a
+        # pass is how an earlier leg on this fork reported green while the
+        # thing it was cited for was still broken.
+        run: |
+          sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/slow-boot-proof.log" > "$RUNNER_TEMP/proof.clean.log"
+          {
+            echo "== all result lines =="
+            grep -E '^(PASS|FAIL) +[0-9]' "$RUNNER_TEMP/proof.clean.log" || echo "(none: the proof did not reach its results)"
+            echo
+            echo "== RESULTS summary =="
+            sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/proof.clean.log" || true
+          } 2>&1 | tee "$RUNNER_TEMP/assertions.log"
+          missing=0
+          for id in 1e 2a 3a 4a 4b 4c 4d 4e 4f 5a 6a 6b 6c 6d 6e 6f 7a 7b; do
+            if ! grep -qE "^PASS +$id " "$RUNNER_TEMP/proof.clean.log"; then
+              echo "MISSING PASS: $id"
+              missing=1
+            fi
+          done
+          grep -q "^OVERALL: PASS" "$RUNNER_TEMP/proof.clean.log" || {
+            echo "expected OVERALL: PASS"
+            missing=1
+          }
+          exit "$missing"
+
+      - name: Re-derive the headline number independently
+        # Read the boot duration back out of the evidence block rather than
+        # trusting the script's own comparison. Anchored on the field, not on
+        # a bare number: the evidence line also carries the bar
+        # ("152s (... bar >90s)"), so a looser match collects both numbers and
+        # the comparison below is then run against a two-line string.
+        run: |
+          ev="$RUNNER_TEMP/pet296-evidence.txt"
+          test -f "$ev" || { echo "no evidence file at $ev"; exit 1; }
+          bar="${{ inputs.slow_boot_min_boot_seconds || '90' }}"
+          secs="$(sed -n 's/^ *proof boot *: *\([0-9][0-9]*\)s.*/\1/p' "$ev")"
+          test -n "$secs" || { echo "no proof-boot line in the evidence block"; exit 1; }
+          echo "proof boot ${secs}s against a bar of ${bar}s"
+          if [ "$secs" -gt "$bar" ]; then
+            echo "independently confirmed: the boot exceeded the ${bar}s default start timeout and still completed"
+          else
+            echo "the proof boot did not exceed the bar"
+            exit 1
+          fi
+          # The two witness numbers that make ">90s and still alive" true
+          # rather than merely slow. Re-checked here so a truncated evidence
+          # block cannot pass this step.
+          grep -qE '^ +NRestarts +: 0$'    "$ev" || { echo "NRestarts was not 0"; exit 1; }
+          grep -qE '^ +ActiveState +: active$' "$ev" || { echo "ActiveState was not active"; exit 1; }
+          grep -qE '^ +Result +: success$'  "$ev" || { echo "Result was not success"; exit 1; }
+
+      - name: Post the evidence to the run summary
+        # The artifact download is the durable copy; this is what a reviewer
+        # reads without leaving the run page.
+        if: always()
+        run: |
+          {
+            echo "### PET-296 slow-boot proof (clean host)"
+            echo
+            echo '```'
+            sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/slow-boot-proof.log" | tail -60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Inspect the host afterwards
+        if: always()
+        run: |
+          {
+            echo "== unit files on disk after the proof =="
+            ls -l "$HOME/.config/systemd/user/" 2>&1 || true
+            echo "== the proof's unit, gone =="
+            systemctl --user show paperclipai-pet296.service -p LoadState -p ActiveState 2>&1 || true
+            systemctl --user cat paperclipai-pet296.service 2>&1 || true
+            echo "== no drop-in dir was ever created for it =="
+            ls -d "$HOME/.config/systemd/user/paperclipai-pet296.service.d" 2>&1 \
+              || echo "(absent: the renderer's budget is what carried the boot)"
+            echo "== the host never had a production paperclipai.service =="
+            systemctl --user is-active paperclipai.service 2>&1 || true
+            echo "== the proof's own journal, if it survived teardown =="
+            journalctl --user -u paperclipai-pet296.service --no-pager -n 40 2>&1 || true
+          } 2>&1 | tee "$RUNNER_TEMP/poststate.log"
+
+      - name: Upload slow-boot proof evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: slow-boot-proof
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/pet296-evidence.txt
+          retention-days: 30
+          if-no-files-found: error
