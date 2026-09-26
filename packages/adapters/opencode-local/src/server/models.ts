@@ -7,6 +7,7 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isValidOpenCodeModelId } from "../index.js";
+import { readLocallyDeclaredOpenCodeModels } from "./runtime-config.js";
 
 const MODELS_CACHE_TTL_MS = 60_000;
 const MODELS_DISCOVERY_TIMEOUT_MS = 20_000;
@@ -318,6 +319,34 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
   }
 
   if (!models.some((entry) => entry.id === model)) {
+    // A model that a locally configured OpenCode provider declares in its
+    // `models` map is resolvable at run time no matter what the CLI enumerates.
+    // `opencode models` reports the catalog held by the *background* OpenCode
+    // service, which is a different process reading a different config from the
+    // one this run uses; when that service is restarting, was started without
+    // the custom provider in scope, or holds a stale models.dev cache, it
+    // silently omits locally declared providers while still reporting the
+    // built-in ones. Treating that non-empty catalog as authoritative rejected
+    // models the runtime config had just provisioned (prepareOpenCodeRuntimeConfig
+    // registers the configured model on its provider for exactly this reason),
+    // failing every agent at once — and the refresh below cannot recover it,
+    // because OpenCode v2 removed `models --refresh`, so the flag errors out
+    // and the "stale catalog" remedy is dead on the current CLI.
+    //
+    // This is checked before the refresh so the doomed `--refresh` child
+    // processes and their retry backoff are not paid on every run start. Keep
+    // the strict rejection for models no local config declares, so a typo or an
+    // unconfigured provider id is still caught before the run burns its budget.
+    const declared = await readLocallyDeclaredOpenCodeModels({ env });
+    if (declared.models.has(model)) {
+      console.warn(
+        `[opencode-local] \`opencode models\` omitted the configured model "${model}", but it is declared by a locally configured OpenCode provider (${declared.sources.join(
+          ", ",
+        )}); proceeding with the configured model.`,
+      );
+      return models;
+    }
+
     // `opencode models` reads a persistent models.dev cache. Long-lived runner
     // hosts can therefore report a stale non-empty catalog even while the
     // configured provider serves the model. Refresh once before treating a

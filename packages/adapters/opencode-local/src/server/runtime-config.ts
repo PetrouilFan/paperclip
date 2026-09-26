@@ -84,6 +84,62 @@ function parseProviderConfig(
   return Object.keys(providers).length > 0 ? providers : null;
 }
 
+/**
+ * The set of `provider/model` ids that a locally configured OpenCode provider
+ * declares, together with where each declaration was read from.
+ *
+ * OpenCode resolves `--model provider/model` by looking the id up in the
+ * provider's `models` map (see prepareOpenCodeRuntimeConfig below), so a model
+ * declared here is servable regardless of whether the `opencode models` CLI
+ * enumerates it. The CLI enumerates whatever catalog the *background* OpenCode
+ * service happens to hold, which is a different config and a different process
+ * from the one the run actually uses.
+ *
+ * Best-effort by construction: every read is individually guarded, so a missing
+ * or malformed config yields an empty set instead of throwing.
+ */
+export async function readLocallyDeclaredOpenCodeModels(input: {
+  env: Record<string, string>;
+}): Promise<{ models: Set<string>; sources: string[] }> {
+  const models = new Set<string>();
+  const sources = new Set<string>();
+
+  const collect = (providers: unknown, source: string) => {
+    if (!isPlainObject(providers)) return;
+    let added = false;
+    for (const [providerId, providerValue] of Object.entries(providers)) {
+      if (!isPlainObject(providerValue)) continue;
+      const providerModels = providerValue.models;
+      if (!isPlainObject(providerModels)) continue;
+      for (const modelId of Object.keys(providerModels)) {
+        const trimmed = modelId.trim();
+        if (!trimmed) continue;
+        models.add(`${providerId}/${trimmed}`);
+        added = true;
+      }
+    }
+    if (added) sources.add(source);
+  };
+
+  // 1) The OpenCode config the run itself will use. When prepareOpenCodeRuntimeConfig
+  //    injected a per-run config, input.env.XDG_CONFIG_HOME points at exactly that
+  //    directory, so this reads the same file the run will serve the model from.
+  const configPath = path.join(resolveXdgConfigHome(input.env), "opencode", "opencode.json");
+  collect((await readJsonObject(configPath)).provider, configPath);
+
+  // 2) Provider definitions supplied for the run as configuration. Mirrors the
+  //    PAPERCLIP_OPENCODE_PROVIDERS precedence used by prepareOpenCodeRuntimeConfig.
+  const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
+  const gatewayProviders = parseProviderConfig(
+    input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS,
+    resolveEnv,
+    [],
+  );
+  collect(gatewayProviders, "PAPERCLIP_OPENCODE_PROVIDERS");
+
+  return { models, sources: [...sources] };
+}
+
 function parseConfiguredModelRef(raw: unknown): { provider: string; model: string } | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
