@@ -184,6 +184,28 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # OCI references must be lowercase and `github.repository` is `owner/repo`
+      # verbatim, so a fork whose owner login has uppercase letters yields a
+      # mixed-case reference that buildx refuses:
+      #
+      #   failed to configure registry cache exporter: invalid reference
+      #   format: repository name (PetrouilFan/paperclip) must be lowercase
+      #
+      # buildx validates while it *configures* the cache exporter, which is
+      # before the first layer is built, so the run names a cache problem and
+      # dies on every architecture. Resolved once here by a script rather than
+      # lowercased per site: a partial fix that corrected one ref while the
+      # push target beside it kept the raw value still fails the whole build.
+      - name: Resolve image reference
+        id: ref
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="$(node scripts/resolve-image-ref.mjs "$REPOSITORY")"
+          echo "Resolved image reference: ${image}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
       # Deployment tooling reads these labels from the registry to verify an
       # image's schema expectations against a migrator before deploying it,
       # without pulling the image. The server refuses to start when the
@@ -208,7 +230,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.ref.outputs.image }}
           tags: |
             type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
             type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
@@ -237,7 +259,7 @@ jobs:
           # By digest, not by tag: two runners cannot each push the same tag
           # and end up with a manifest list. Each leg publishes an untagged
           # image and `merge` names them together.
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ steps.ref.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           # Registry-backed BuildKit cache instead of type=gha: the Actions
           # cache is capped at 10GB per repo, and two multi-arch mode=max jobs
           # evict each other, so most builds ran effectively cold. The cache
@@ -246,8 +268,8 @@ jobs:
           #
           # Per-arch refs now the legs are separate runners: a shared ref would
           # have each leg overwrite the other's cache on every build.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }},mode=max
+          cache-from: type=registry,ref=${{ steps.ref.outputs.image }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ steps.ref.outputs.image }}:buildcache-${{ matrix.arch }},mode=max
           labels: ${{ steps.meta.outputs.labels }}
 
       # The digest is the only thing `merge` needs from this job. Carried as an
@@ -306,6 +328,21 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
+      # Repeated from the build job rather than passed between them, for the
+      # reason the schema step below repeats: job outputs would have to
+      # survive a matrix. Same script, same reason — this job names the
+      # manifest from the same reference, and `imagetools create` rejects a
+      # mixed-case name exactly as the cache exporter does.
+      - name: Resolve image reference
+        id: ref
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="$(node scripts/resolve-image-ref.mjs "$REPOSITORY")"
+          echo "Resolved image reference: ${image}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
       # Repeated from the build job rather than passed between them: job
       # outputs would have to survive a matrix, and this is two `ls` calls.
       - name: Compute schema migration labels
@@ -326,7 +363,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.ref.outputs.image }}
           tags: |
             type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
             type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
@@ -341,11 +378,29 @@ jobs:
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
+        env:
+          # Through the environment, not interpolated into the script body, so
+          # the reference is data rather than shell.
+          IMAGE: ${{ steps.ref.outputs.image }}
         run: |
           set -euo pipefail
+          # nullglob first, or a directory with no digest files yields the
+          # literal `*` and the reference below would be published as
+          # `...@sha256:*` instead of failing.
+          shopt -s nullglob
+          # One `${IMAGE}@sha256:<digest>` argument per downloaded file. Built
+          # as an array rather than by prefixing printf's format string, because
+          # printf reuses that format for every remaining argument: passing the
+          # reference as a leading value would pair it with the first digest and
+          # leave the last one unprefixed.
+          refs=()
+          for digest in *; do
+            refs+=("${IMAGE}@sha256:${digest}")
+          done
+          test "${#refs[@]}" -gt 0
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+            "${refs[@]}"
 
       # PID 1 must be an init that reaps adopted orphans. With node there, the
       # orphans agent runs leave behind are never wait()ed and pin as zombies
@@ -417,6 +472,18 @@ jobs:
       group: docker-canary-channel-promotion
       cancel-in-progress: false
     steps:
+      # This job runs a fixed promotion script and needs no repository content,
+      # but it does need the reference resolver so the reference it retags is
+      # the same one the other two jobs publish under. Checked out for that one
+      # string rather than inlining a `tr` here: a third copy of the casing
+      # rule is how the two others drifted apart in the first place.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # One tracked script, and nothing here writes to the repository, so
+          # do not leave a usable token behind in the local git config.
+          persist-credentials: false
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -424,9 +491,19 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve image reference
+        id: ref
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="$(node scripts/resolve-image-ref.mjs "$REPOSITORY")"
+          echo "Resolved image reference: ${image}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
       - name: Converge the channel tags onto the current npm canary
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ steps.ref.outputs.image }}
           GH_TOKEN: ${{ github.token }}
         run: |
           current="$(curl -fsS "https://registry.npmjs.org/-/package/@paperclipai%2Fdb/dist-tags" | jq -er .canary)"
