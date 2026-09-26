@@ -22,7 +22,16 @@ function asDateString(value: string | null | undefined): string | null {
 }
 
 const defaultRunCommand: ProcessCommandRunner = async (file, args) => {
-  const { stdout } = await execFileAsync(file, args, { timeout: 5_000 });
+  // Same options as the server's `runProcessCommand` (hot-restart.ts). The
+  // value is unaffected -- `promisify(execFile)` already defaults to a utf8
+  // string -- but `windowsHide` is the difference between a console flash on
+  // every Windows restart and none, and an unexplained 3.3x timeout is not
+  // something a file whose purpose is faithful duplication should carry.
+  const { stdout } = await execFileAsync(file, args, {
+    encoding: "utf8",
+    timeout: 1_500,
+    windowsHide: true,
+  });
   return { stdout };
 };
 
@@ -37,10 +46,18 @@ const defaultRunCommand: ProcessCommandRunner = async (file, args) => {
  * whole server into the CLI bundle; the shared extraction is tracked as
  * follow-up work.
  *
+ * That agreement is asserted, not assumed: `cli/src/__tests__/process-identity.test.ts`
+ * imports the server's reader across the workspace boundary and runs both over
+ * the same pid. Editing either side without the other turns that suite red.
+ * `isObservedHotRestartTargetAlive` compares the two values with `===`, so even
+ * a 1 ms drift silently degrades the hot-restart guard to its coarse ordering
+ * heuristic rather than failing anything on its own.
+ *
  * It returns `null` instead of throwing, because every caller here is a
  * best-effort fallback for a value the health probe may already have supplied.
  * A caller that cannot do without an identity must refuse rather than proceed
- * without one -- see `writeHotRestartIntent`.
+ * without one -- see `writeHotRestartIntent`. That one difference from the
+ * server, which throws, is pinned by the same suite.
  */
 export async function readProcessStartedAt(
   pid: number,

@@ -211,7 +211,12 @@ export async function writeHotRestartIntent(
       + "replaces. A pid alone cannot distinguish the running server from an unrelated process that "
       + "inherited the number, which is how a restart misclassifies another instance's runs. The server's "
       + "own intent writer refuses the same record, so the CLI must not be the path that produces one. "
-      + "Retry once /api/health reports serverInfo, or restart the unit directly with systemctl.",
+      + "The operating-system reading is the intended source here and is what the health probe cannot "
+      + "supply, so re-running this command is the remedy when the read was transient. If it is not "
+      + "transient, the supervisor's pid is not visible to this process -- a different pid namespace or "
+      + "container boundary -- and that is the thing to fix. Restarting the unit directly is not a "
+      + "workaround: that writes no intent at all, so the preflight run set is never recorded and the "
+      + "server cannot report adopted-versus-lost runs after the restart.",
     );
   }
   const preflightActiveRunIds = drainRequired
