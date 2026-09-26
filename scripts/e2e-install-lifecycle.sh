@@ -234,17 +234,47 @@ else
     export PAPERCLIP_INSTANCE_ID="$SERVICE_INSTANCE"   # what `onboard` reads
     echo "8 isolation: instance=$SERVICE_INSTANCE unit=$SERVICE_NAME home=$SERVICE_ISOHOME"
 
-    # Save the caller's environment; steps 9-10 run after this block and use $HOME.
-    REAL_HOME="$HOME"
-    REAL_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}"
-    export HOME="$SERVICE_ISOHOME"
-    export XDG_CONFIG_HOME="$SERVICE_ISOHOME/.config"
-    SERVICE_SHIM="$SERVICE_ISOHOME/.local/bin/paperclipai"
+    # Baseline for 8f, taken before the leg runs. On a host that has no
+    # paperclipai.service at all both fields are empty and 8f holds trivially --
+    # there is nothing to protect. The case that matters (a real, loaded unit that
+    # is merely stopped) yields a non-empty identity, and the preflight above has
+    # already refused to run when it is active.
+    HOST_UNIT_BEFORE="MainPID=$(systemctl --user show paperclipai.service -p MainPID --value 2>/dev/null) ActiveEnterTimestamp=$(systemctl --user show paperclipai.service -p ActiveEnterTimestamp --value 2>/dev/null)"
+    echo "8 host unit baseline: $HOST_UNIT_BEFORE"
+
+    # DATA isolation only. $HOME and $XDG_CONFIG_HOME are deliberately NOT
+    # overridden, because overriding them makes this leg unable to pass at all.
+    #
+    # Measured (PET-259, 2026-09-26) with a throwaway unit name on a host with a
+    # live systemd --user manager: `systemctl --user enable <name>` resolves unit
+    # files from the MANAGER's search path, which was captured when the manager
+    # started. A unit file written under an overridden HOME/XDG_CONFIG_HOME is
+    # invisible to it, and the enable fails with
+    #   "Failed to enable unit: Unit <name> does not exist."
+    # The client's environment makes no difference in either direction. So the
+    # previous override guaranteed 8a failed on every host that has a running
+    # user manager -- which is every host this leg is allowed to run on.
+    #
+    # That also means no product change can rescue it: honouring XDG_CONFIG_HOME
+    # in SystemdServiceManager.definitionPath would not help, because the manager
+    # still would not search there. The manager's own path has to contain the file.
+    #
+    # Isolation therefore rests on what actually works: a distinct instance id, so
+    # the unit is `paperclipai-e2e.service` and by-name verbs cannot reach the
+    # host's `paperclipai.service`. The PET-52 preflight above refuses to run the
+    # leg at all when the host's unit is active, and 8f below proves afterwards
+    # that the host unit's MainPID and ActiveEnterTimestamp did not move.
+    #
+    # PAPERCLIP_HOME still moves, so the e2e instance's own state (config, .env,
+    # secrets, logs) is created inside the mktemp'd dir and removed with it, and
+    # the mktemp/abort_ guards above stay load-bearing.
+    export PAPERCLIP_HOME="$SERVICE_ISOHOME/.paperclip"
+    # The shim lives at $HOME/.local/bin/paperclipai (resolveServiceShimPath is
+    # keyed to os.homedir()), i.e. the one step 2 already installed and step 10
+    # uninstalls. $SERVICE_SHIM was a distinct path that nothing ever creates.
+    SERVICE_SHIM="$SHIM"
 
     # Real quickstart path: onboard with defaults, then install + start the service.
-    # Onboard runs through the REAL shim ($SHIM, an absolute path in the original
-    # $HOME, captured before the override) because $SERVICE_SHIM does not exist yet
-    # -- it is what this very step creates. Calling "$SERVICE_SHIM" here exits 127.
     if shim onboard --yes --install-service; then
       pass "8a onboard --yes --install-service exits 0"
     else
@@ -253,7 +283,7 @@ else
     DEADLINE=$(( $(date +%s) + E2E_SERVICE_TIMEOUT_SECS ))
     ACTIVE=0
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-      STATUS_JSON="$(SERVICE_SHIM service status --json --instance "$SERVICE_INSTANCE" 2>/dev/null || true)"
+      STATUS_JSON="$("$SERVICE_SHIM" service status --json --instance "$SERVICE_INSTANCE" 2>/dev/null || true)"
       if echo "$STATUS_JSON" | grep -q '"active"[[:space:]]*:[[:space:]]*true'; then ACTIVE=1; break; fi
       sleep 5
     done
@@ -261,24 +291,35 @@ else
       pass "8b service reached active within ${E2E_SERVICE_TIMEOUT_SECS}s"
     else
       echo "last status: ${STATUS_JSON:-<none>}"
-      SERVICE_SHIM service logs -n 60 --instance "$SERVICE_INSTANCE" || true
+      "$SERVICE_SHIM" service logs -n 60 --instance "$SERVICE_INSTANCE" || true
       fail_ "8b service reached active"
     fi
-    SERVICE_SHIM service logs -n 20 --instance "$SERVICE_INSTANCE" >/dev/null 2>&1 \
+    "$SERVICE_SHIM" service logs -n 20 --instance "$SERVICE_INSTANCE" >/dev/null 2>&1 \
       && pass "8c service logs readable" || fail_ "8c service logs readable"
-    if SERVICE_SHIM service stop --instance "$SERVICE_INSTANCE"; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
-    if SERVICE_SHIM service uninstall --instance "$SERVICE_INSTANCE"; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
-    # The leg must not have touched the production unit: it is still addressable
-    # by name and must still be stopped, because a name collision would be fatal.
-    if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
-      fail_ "8f isolation held: host paperclipai.service never activated by this leg"
+    if "$SERVICE_SHIM" service stop --instance "$SERVICE_INSTANCE"; then pass "8d service stop exits 0"; else fail_ "8d service stop exits 0"; fi
+    if "$SERVICE_SHIM" service uninstall --instance "$SERVICE_INSTANCE"; then pass "8e service uninstall exits 0"; else fail_ "8e service uninstall exits 0"; fi
+    # The leg must not have touched the production unit. `is-active` alone is a
+    # weak witness: it cannot tell "never activated" from "activated and stopped
+    # again", and it passes vacuously on a host with no such unit at all. Compare
+    # the identity of the host unit before and after instead -- MainPID and
+    # ActiveEnterTimestamp both move if and only if it was (re)started.
+    HOST_UNIT_IDENTITY="MainPID=$(systemctl --user show paperclipai.service -p MainPID --value 2>/dev/null) ActiveEnterTimestamp=$(systemctl --user show paperclipai.service -p ActiveEnterTimestamp --value 2>/dev/null)"
+    if [ "$HOST_UNIT_IDENTITY" = "$HOST_UNIT_BEFORE" ]; then
+      pass "8f isolation held: host paperclipai.service untouched ($HOST_UNIT_IDENTITY)"
     else
-      pass "8f isolation held: host paperclipai.service untouched"
+      echo "  host unit before: $HOST_UNIT_BEFORE"
+      echo "  host unit after:  $HOST_UNIT_IDENTITY"
+      fail_ "8f isolation held: host paperclipai.service never activated by this leg"
+    fi
+    # And the leg's own unit must be gone, so the next run starts clean.
+    if systemctl --user show "$SERVICE_NAME" -p LoadState --value 2>/dev/null | grep -qx "not-found"; then
+      pass "8g leg unit $SERVICE_NAME removed"
+    else
+      fail_ "8g leg unit $SERVICE_NAME removed"
     fi
 
-    # Restore the caller's environment (do not unset: steps 9-10 use $HOME).
-    if [ -n "$REAL_XDG_CONFIG_HOME" ]; then export XDG_CONFIG_HOME="$REAL_XDG_CONFIG_HOME"; else unset XDG_CONFIG_HOME; fi
-    export HOME="$REAL_HOME"
+    # PAPERCLIP_HOME only (see above): steps 9-10 use the real $HOME.
+    unset PAPERCLIP_HOME
     unset PAPERCLIP_INSTANCE_ID
     rm -rf "$SERVICE_ISOHOME"
   fi

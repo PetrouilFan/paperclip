@@ -230,7 +230,7 @@ jobs:
             sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/e2e.clean.log" || true
           } 2>&1 | tee "$RUNNER_TEMP/leg-8a-8f.log"
           missing=0
-          for leg in 8a 8b 8c 8d 8e 8f; do
+          for leg in 8a 8b 8c 8d 8e 8f 8g; do
             if ! grep -qE "^PASS +$leg " "$RUNNER_TEMP/e2e.clean.log"; then
               echo "MISSING PASS: $leg"
               missing=1
@@ -391,7 +391,7 @@ jobs:
             sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/e2e.clean.log" || true
           } 2>&1 | tee "$RUNNER_TEMP/leg-8a-8f.log"
           missing=0
-          for leg in 8a 8b 8c 8d 8e 8f; do
+          for leg in 8a 8b 8c 8d 8e 8f 8g; do
             if ! grep -qE "^PASS +$leg " "$RUNNER_TEMP/e2e.clean.log"; then
               echo "MISSING PASS: $leg"
               missing=1
