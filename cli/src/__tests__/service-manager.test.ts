@@ -55,6 +55,22 @@ describe("service definition generation", () => {
     expect(unit).not.toMatch(/^KillMode=control-group$/m);
   });
 
+  it("gives a Type=notify boot a budget past systemd's 90s default", () => {
+    const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
+    // A Type=notify unit cannot report readiness until the embedded postmaster
+    // accepts connections and migrations have run, because that postmaster lives
+    // in this unit's cgroup. Under systemd's 90s default the supervisor SIGTERMs
+    // the cgroup mid-boot, destroying the database and every detached
+    // local-agent run it had already started.
+    const startTimeout = Number(unit.match(/^TimeoutStartSec=(\d+)$/m)?.[1]);
+    expect(startTimeout).toBeGreaterThan(90);
+    expect(unit).toContain("TimeoutStartSec=600");
+    // The budget only protects those in-flight runs if the same unit also keeps
+    // systemd from signalling the whole cgroup on the way to READY=1. Neither
+    // directive reaches a fresh host without the other, so assert them together.
+    expect(unit).toContain("KillMode=process");
+  });
+
   it("escapes systemd variable and specifier expansion in configured values", () => {
     const unit = renderSystemdUnit({
       instanceId: "team-$USER-%i",
