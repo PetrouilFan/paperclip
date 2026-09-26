@@ -617,7 +617,14 @@ run context fails closed before mutation. A run may attempt at most 20 cross-iss
 updates, or issue-thread interaction resolutions across one shared counter. The
 server records each attempt with its source issue, target issue, run, count, and
 rollout mode, and fails closed with the cap in the error once enforcement is
-active. Writes to the run's own source issue are not counted. Assignee self-comments do not
+active. Writes to the run's own source issue are not counted. Neither are writes
+to an issue the authenticated agent is itself the assignee of: the cross-issue
+budget exists to stop one agent writing across another agent's board, so the
+assignee's own ticket is never charged against it, and a run with no source
+issue is not refused there. This exemption is narrower than the cap — it applies
+only in the fail-closed branch, so a run that does have a source issue still
+spends its 20-write budget on any other target, and an unassigned target still
+fails closed. Assignee self-comments do not
 wake the assignee, and a non-assignee comment cannot mint a mention grant.
 
 Agent-authored issue comments persist the responsible user derived from the

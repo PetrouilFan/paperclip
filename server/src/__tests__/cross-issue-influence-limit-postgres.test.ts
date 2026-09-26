@@ -121,6 +121,114 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     });
   });
 
+  it("exempts the target's own assignee, and only that agent, on the real SQL path", async () => {
+    const companyId = randomUUID();
+    const actorAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const unboundRunId = randomUUID();
+    const assignedTargetId = randomUUID();
+    const otherTargetId = randomUUID();
+    const unassignedTargetId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: actorAgentId,
+        companyId,
+        name: "Assignee",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Peer",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    // The fleet-wide shape: a `heartbeat_timer` run with no issue in its context
+    // and no checkout stamp, held by the agent the target is assigned to.
+    await db.insert(heartbeatRuns).values({
+      id: unboundRunId,
+      companyId,
+      agentId: actorAgentId,
+      status: "running",
+      responsibleUserId: "board-user",
+      contextSnapshot: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: assignedTargetId,
+        companyId,
+        title: "Mine",
+        identifier: "SELF-1",
+        status: "in_progress",
+        assigneeAgentId: actorAgentId,
+      },
+      {
+        id: otherTargetId,
+        companyId,
+        title: "Theirs",
+        identifier: "SELF-2",
+        status: "todo",
+        assigneeAgentId: otherAgentId,
+      },
+      {
+        id: unassignedTargetId,
+        companyId,
+        title: "Nobody's",
+        identifier: "SELF-3",
+        status: "todo",
+      },
+    ]);
+
+    const base = {
+      companyId,
+      runId: unboundRunId,
+      agentId: actorAgentId,
+      kind: "comment" as const,
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    };
+
+    // PET-273: the run holds nothing, yet the target is the run agent's own
+    // assigned ticket. Exempt, and it costs the run no budget.
+    await expect(observeCrossIssueInfluence(db, { ...base, targetIssueId: assignedTargetId }))
+      .resolves.toBeNull();
+
+    // Same run, same state, a peer's ticket: still fails closed. The exemption
+    // is the assignee relation, not the absence of run context.
+    await expect(observeCrossIssueInfluence(db, { ...base, targetIssueId: otherTargetId })).rejects.toMatchObject({
+      status: 403,
+      details: { reason: "no_context_source_and_target_unbound" },
+    });
+
+    // Unassigned target: nobody owns it, so there is still no attribution.
+    await expect(observeCrossIssueInfluence(db, { ...base, targetIssueId: unassignedTargetId })).rejects.toMatchObject({
+      status: 403,
+      details: { reason: "no_context_source_and_target_unbound" },
+    });
+
+    const recorded = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, unboundRunId)));
+    // The exemption writes no observation row: nothing was attributed across
+    // issues, so there is nothing to count against the cap.
+    expect(recorded).toEqual([]);
+  });
+
   it("ignores a terminal run's stale issue-side binding", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

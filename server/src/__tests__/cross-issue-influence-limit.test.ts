@@ -12,6 +12,11 @@ function counterDb(
   runOverrides: Record<string, unknown> | null = {},
   /** Issues whose `checkout_run_id` / `execution_run_id` points at this run. */
   boundIssueIds: string[] = [],
+  /**
+   * `assignee_agent_id` per issue id, for the target-assignee read that backs
+   * the self-write exemption. Absent ids resolve to `null` (unassigned).
+   */
+  assigneeByIssueId: Record<string, string | null> = {},
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -22,6 +27,17 @@ function counterDb(
           if (Object.keys(selection).includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
+            };
+          }
+          // The target-assignee read: one company-scoped row, no ordering, and
+          // awaited directly off `where`.
+          if (Object.keys(selection).includes("assigneeAgentId")) {
+            const rows = Object.entries(assigneeByIssueId).map(([id, assigneeAgentId]) => ({
+              id,
+              assigneeAgentId,
+            }));
+            return {
+              then: (resolve: (rows: unknown[]) => unknown) => resolve(rows),
             };
           }
           // The issue-side binding lookup: the same chain shape the run read
@@ -351,6 +367,119 @@ describe("cross-issue influence: run-side binding is bidirectional", () => {
         details: expect.objectContaining({ sourceIssueId: "44444444-4444-4444-8444-444444444444" }),
       }),
     ]);
+    expect(fake.inserted).toEqual([]);
+  });
+});
+
+/**
+ * PET-273. `authorization.ts` allows `issue:comment` / `issue:mutate` on the
+ * caller's own assigned ticket (`reason: "allow_self"`), but this cap layer
+ * derived attribution only from run context or an issue-side checkout stamp. An
+ * agent bound to nothing was therefore refused on the issue it was *assigned*.
+ *
+ * That refusal is not cross-issue influence, and it is not a harmless one: an
+ * agent that cannot record a finding on the ticket it holds cannot converge
+ * with whoever filed it, so it opens a second ticket. Seven duplicate pairs
+ * (five minutes apart), and every `blocked` issue — which can never check out,
+ * and so can never reach a binding — permanently unwritable.
+ */
+describe("cross-issue influence: the target's own assignee is not cross-issue influence", () => {
+  const ACTOR = "33333333-3333-4333-8333-333333333333";
+  const OTHER_AGENT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const TARGET = "55555555-5555-4555-8555-555555555555";
+  const base = {
+    companyId: "22222222-2222-4222-8222-222222222222",
+    runId: "11111111-1111-4111-8111-111111111111",
+    agentId: ACTOR,
+    targetIssueId: TARGET,
+    now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+  } as const;
+  // A `heartbeat_timer` run: no issue in its context, and — the fleet-wide
+  // shape — no checkout stamp it can attribute a write to.
+  const contextless = { contextSnapshot: {}, status: "running" } as const;
+
+  it.each(["comment", "update", "interaction_resolution"] as const)(
+    "lets a bound-to-nothing run write to the issue it is assigned via %s",
+    async (kind) => {
+      const fake = counterDb(0, contextless, [], { [TARGET]: ACTOR });
+
+      // Exempt, exactly like the same-issue short-circuit: no counter, no
+      // activity row, so it costs the run nothing.
+      await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind })).resolves.toBeNull();
+      expect(fake.inserted).toEqual([]);
+      expect(fake.observedCount).toBe(0);
+    },
+  );
+
+  it("does not spend the run's budget, so the exemption survives a spent counter", async () => {
+    const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, contextless, [], { [TARGET]: ACTOR });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("still refuses the same run on an issue assigned to somebody else", async () => {
+    // The guard this change must not weaken. The exemption is the assignee
+    // relation, not "the run holds no context": a run with no source writing to
+    // another agent's board has nothing to attribute and still fails closed.
+    const fake = counterDb(0, contextless, [], { [TARGET]: OTHER_AGENT });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" })).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "cross_issue_influence_run_context_required",
+        reason: "no_context_source_and_target_unbound",
+      },
+    });
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("still refuses an unassigned target", async () => {
+    const fake = counterDb(0, contextless, [], { [TARGET]: null });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "update" })).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "cross_issue_influence_run_context_required",
+        reason: "no_context_source_and_target_unbound",
+      },
+    });
+  });
+
+  it("keeps the cap authoritative once the run does have a source", async () => {
+    // Narrowness check. The exemption lives in the fail-closed branch only, so
+    // a run that holds a source still spends its 20-write budget writing to a
+    // second issue assigned to it. Otherwise an agent could reassign work to
+    // itself and then write to it uncapped.
+    const fake = counterDb(
+      CROSS_ISSUE_INFLUENCE_LIMIT,
+      { contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" } },
+      [],
+      { [TARGET]: ACTOR },
+    );
+
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" })).resolves.toMatchObject({
+      allowed: false,
+      mode: "enforce",
+      count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+    });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
+    ]);
+  });
+
+  it("does not let a terminal run's stale stamp buy the exemption", async () => {
+    // `checkout_run_id` lingers after a run finishes, so the live-run guard has
+    // to keep running ahead of the assignee read.
+    const fake = counterDb(0, { contextSnapshot: {}, status: "succeeded" }, [], { [TARGET]: ACTOR });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" })).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "cross_issue_influence_run_context_required",
+        reason: "terminal_status",
+      },
+    });
     expect(fake.inserted).toEqual([]);
   });
 });
