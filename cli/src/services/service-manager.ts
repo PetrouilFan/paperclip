@@ -201,6 +201,14 @@ Environment="PAPERCLIP_HOME=${escapeSystemd(input.homeDir)}"
 WorkingDirectory=%h
 Restart=always
 RestartSec=5
+# Type=notify cannot send READY=1 until the embedded postmaster is accepting
+# connections and migrations have run, because the postmaster lives inside this
+# unit's cgroup and the server owns its shutdown. systemd's 90s default therefore
+# SIGTERMs the whole cgroup mid-boot on a loaded host, killing the database and
+# every detached local-agent run it had just started. 10 minutes is well above
+# a measured boot on this host; boot duration is not the control plane's to
+# police, so the budget is generous rather than tuned.
+TimeoutStartSec=600
 TimeoutStopSec=300
 # Only the server itself is signalled: the default KillMode=control-group
 # would SIGTERM detached local-agent runs and embedded PostgreSQL in the same
