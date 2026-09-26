@@ -121,12 +121,23 @@ export function managedInstallChecks(
         },
       ];
     }
+
+    // Artifacts present with the manifest gone, and no orphan shim to explain
+    // it, is the one state this check cannot classify: `hasManagedArtifacts` is
+    // a heuristic that any single existing path trips, so a store caught
+    // mid-update looks the same as one that lost its manifest.
+    // `commands/run.ts` refuses to bind the server port on any `fail`, which
+    // made that ambiguity able to take the instance offline on restart. The
+    // provable states -- unreadable manifest above, dangling `current` below,
+    // and the relocated-root shim just handled -- still fail; only the
+    // unprovable one is downgraded.
     return [
       {
         name: "Managed install manifest",
-        status: "fail",
+        status: "warn",
         message: `Managed install artifacts exist but ${paths.manifestPath} is missing`,
-        repairHint: "Re-run `paperclipai install`",
+        repairHint:
+          "Re-run `paperclipai install` to rebuild the managed install metadata. This does not block startup; the server starts without it.",
       },
     ];
   }

@@ -5,6 +5,7 @@ export interface CheckResult {
   canRepair?: boolean;
   repair?: () => void | Promise<void>;
   repairHint?: string;
+  blocking?: boolean;
 }
 
 export { agentJwtSecretCheck } from "./agent-jwt-secret-check.js";
