@@ -31,10 +31,24 @@ function hasStoreArtifacts(paths: InstallStorePaths): boolean {
 }
 
 /** The shim a reader would actually invoke: the current path, else the one a
- *  previous install location left behind. */
+ *  previous install location left behind.
+ *
+ *  A file at either path is only a witness if it carries the managed marker.
+ *  `npm install -g` puts its own command at `$HOME/.local/bin/paperclipai`, and
+ *  that command `exec`s into npm's tree, never into a Paperclip store -- so its
+ *  presence says nothing about whether a store exists, and treating it as one
+ *  blocks the startup of a perfectly healthy global-npm install. That was
+ *  measured taking `paperclipai.service` down for 3m31s via start-limit-hit while
+ *  6 in-flight runs were reaped. `removeManagedShim` already gates on the same
+ *  marker so it never deletes a foreign command; this keeps the doctor and the
+ *  uninstaller in agreement about what is at that path. */
 function findManagedShim(paths: InstallStorePaths): string | null {
   for (const candidate of new Set([paths.shimPath, paths.legacyShimPath])) {
-    if (fs.existsSync(candidate)) return candidate;
+    try {
+      if (fs.readFileSync(candidate, "utf8").includes(MANAGED_SHIM_MARKER)) return candidate;
+    } catch {
+      // Missing, unreadable, or a directory: try the next location.
+    }
   }
   return null;
 }
@@ -147,24 +161,13 @@ export function managedInstallChecks(
         },
   );
 
-  let shimValid = false;
   // Prefer the configured path, fall back to one a previous install location
   // left behind: reporting a relocated-away shim as "missing" would tell the
   // operator to re-run `install` while the command they actually invoke is
-  // sitting on their PATH.
-  const shimCandidates = [...new Set([paths.shimPath, paths.legacyShimPath])];
-  let resolvedShim: string | null = null;
-  for (const candidate of shimCandidates) {
-    try {
-      if (fs.readFileSync(candidate, "utf8").includes(MANAGED_SHIM_MARKER)) {
-        shimValid = true;
-        resolvedShim = candidate;
-        break;
-      }
-    } catch {
-      // Try the next location.
-    }
-  }
+  // sitting on their PATH. Same marker gate as `findManagedShim`, and for the
+  // same reason -- one predicate, so the two cannot drift apart.
+  const resolvedShim = findManagedShim(paths);
+  const shimValid = resolvedShim !== null;
   const shimDisplayPath = resolvedShim ?? paths.shimPath;
   const shimElsewhere = resolvedShim !== null && resolvedShim !== paths.shimPath;
   results.push(
