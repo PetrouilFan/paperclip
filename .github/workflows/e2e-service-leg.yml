@@ -17,14 +17,32 @@ name: E2E Service Leg
 # 404s). Keeping the heavy diagnostic leg separate also means it cannot
 # become a release gate by accident.
 #
-# Triggers on push to this branch as well as dispatch: the push trigger is
-# the only one that can run at all until a workflow file lands on master and
-# GitHub indexes it, and `actions/workflows/<file>` is resolved from the
-# default branch.
+# Triggers on push to master, push to the development branch, and dispatch.
+#
+# The master push trigger is what keeps steps 3/5/6 covered. Those steps are
+# the git-install channel -- `install --ref`, `update --rollback`, `reinstall`
+# -- and the clean-host job below gates on all of them precisely because they
+# sat outside every gate for the whole time the channel was broken. Gating them
+# on a branch that has since been merged would have left that gate dark: the
+# workflow would never have started again, which is the same "cannot report
+# red" shape, one level up.
+#
+# `E2E_REF` is the commit under test, not a branch name. Hardcoding a branch
+# here is what made the run meaningless on master -- the leg would have
+# re-tested pet-259-service-leg while master moved on -- and `install --ref`
+# takes a sha, which is also what step 3b asserts on (`installs/git/<sha>`).
+#
+# There is deliberately no `pull_request` trigger. A path filter would be the
+# cheap way to gate packaging changes pre-merge, but any list of paths is
+# incomplete -- bumping a workspace package's version is enough to re-break
+# the staged manifests, and that touches no path a filter would list. An
+# incomplete filter is worse than no filter, because it reads as coverage.
+# Post-merge on master is the honest, complete gate.
 
 on:
   push:
     branches:
+      - master
       - pet-259-service-leg
   workflow_dispatch:
     inputs:
@@ -46,7 +64,11 @@ env:
   # The upstream default (paperclipai/paperclip) does not carry this fork's
   # e2e scripts, so the legs have to install from the fork.
   E2E_REPO: PetrouilFan/paperclip
-  E2E_REF: ${{ inputs.e2e_ref || 'pet-259-service-leg' }}
+  # The commit under test. `inputs.e2e_ref` only exists for workflow_dispatch,
+  # so on a push this falls through to the pushed sha. Note that this is a
+  # workflow-level `env`, so it overrides the script's own `E2E_REF:-master`
+  # default -- which is why it has to be right here rather than left implicit.
+  E2E_REF: ${{ inputs.e2e_ref || github.sha }}
   # Poll budget for step 8b. The default is 300s; the runner is slower than a
   # laptop so give it room rather than report a false 8b failure.
   E2E_SERVICE_TIMEOUT_SECS: "600"
