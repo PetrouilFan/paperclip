@@ -157,3 +157,23 @@ test('the internal-refs gate is wired into the blocking failure list', () => {
   assert.match(source, /const internalRefsResult = checkInternalRefs\(\{/);
   assert.match(source, /internalRefsResult,/);
 });
+
+test('an internal-refs failure reaches the list that decides the exit code', () => {
+  // A fictional instance prefix, configured on the call, so this fixture does
+  // not carry this repository's own namespace — that is what the gate it lives
+  // next to refuses, and it refuses its own neighbours before it refuses
+  // strangers.
+  const internalRefs = checkInternalRefs({
+    prTitle: 'fix(issues): refuse a checkout (TICKET-392)',
+    prBranch: 'fix/blocker-edge',
+    prefixes: ['TICKET'],
+  });
+  const clean = { failures: [] };
+  const failures = collectBlockingFailures([clean, clean, internalRefs, clean]);
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /TICKET-392/);
+});
+
+test('collectBlockingFailures tolerates a gate that returned nothing', () => {
+  assert.deepEqual(collectBlockingFailures([undefined, null, { failures: undefined }, { failures: ['x'] }]), ['x']);
+});
