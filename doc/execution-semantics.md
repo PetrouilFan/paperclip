@@ -525,6 +525,18 @@ When newer source activity restores a valid live or waiting path, the recovery a
 
 Plain comments alone do not make a recovery action stale. A comment can provide evidence, but the recovery action should remain visible when the source issue is still stalled and the comment does not create a valid action-path primitive such as a wake, monitor, interaction, approval, blocker, human owner, execution participant, terminal disposition, or delegated follow-up.
 
+#### Recovery settlement identity
+
+The identity of an automatic recovery settlement is the pair of the run and the source issue. It is not the recovery action row. A recovery action is a per-attempt receipt, and a sweep that revisits a still-stranded run opens a fresh action for it, so an identity taken from the action row is new on every comparison and recognises nothing. Keying settlement dedup on the action row therefore settles the same run once per sweep, indefinitely.
+
+A settlement is recorded in two durable places, and both sides of a revisit read them: the run's own result, and the settled action's recovery evidence. A revisit that finds a settlement recorded for the same pair resolves the newly opened action as a duplicate of the decision that was already made, and records which action made it. It does not re-apply the outcome.
+
+A settlement that computes the same source issue state as the recorded one changes nothing, and must write nothing: no source issue update, no activity row, and no re-broadcast of the run's terminal status. The receipt and the action row are the record. Reporting a transition that did not happen is not a weaker record of a real transition, it is a false one.
+
+Drift in the fields a settlement decision is a function of — source issue status, assignee, execution binding, and checkout binding — makes the recorded decision stale, and the pair is decided again. A re-assigned or resumed issue must not be suppressed by a receipt written for its previous owner. The recorded observation is the state the settlement leaves behind, not the state it was handed, because the decision is about where the issue ends up.
+
+A settlement that does not replay work does not repeat. Recovery that is not authorized to replay records that fact, and the next sweep must honour it rather than selecting the run again.
+
 ### Agent-assigned `todo`
 
 This is dispatch state: ready to start, not yet actively claimed.
