@@ -69,7 +69,7 @@ on:
       slow_boot_levers:
         description: probe mode only - the levers to measure, in order
         required: false
-        default: "idle cpu:x8 cpu:x32 io:64m io:8m io:1m swap:2048"
+        default: "idle cpu:x8 cpuset:1 mem:768 mem:512+2048 io:8m swap:6144"
         type: string
       slow_boot_lever:
         description: proof mode only - the lever that gets boot 2 over the bar
@@ -128,14 +128,34 @@ jobs:
         # The swap:MB lever reports itself SKIP when there is no swapfile, so
         # without this that row is missing from the probe table for a reason
         # that has nothing to do with whether the lever works. GitHub runners
-        # ship with none. 4G so swap:2048 fits, and so the boot's own
-        # allocations have somewhere to be pushed to.
+        # ship with none.
+        #
+        # Never fatal. /swapfile is the obvious path and it is the one that
+        # fails: on ubuntu-latest it is already mapped, so `fallocate` on it
+        # returns ETXTBSY -- measured on run 36252377603, which went red in
+        # fifteen seconds on this step and never reached the script. So try
+        # several paths, report which one took, and let the run continue: the
+        # lever degrades to a reported SKIP, which is a result, whereas a red
+        # step here is only a fact about the runner image.
         run: |
-          sudo fallocate -l 4G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          set +e
+          for f in /mnt/pet296-swap /var/tmp/pet296-swap /tmp/pet296-swap /swapfile; do
+            sudo rm -f "$f" 2>/dev/null
+            if sudo fallocate -l 4G "$f" 2>/dev/null \
+              && sudo chmod 600 "$f" \
+              && sudo mkswap "$f" >/dev/null 2>&1 \
+              && sudo swapon "$f" 2>/dev/null; then
+              echo "swapfile: $f"
+              break
+            fi
+            echo "swapfile: $f unusable"
+            sudo swapoff "$f" 2>/dev/null
+          done
+          echo "== swapon --show =="
           swapon --show
+          echo "== free -m =="
+          free -m
+          exit 0
 
       - name: Record the prestate the proof depends on
         # The script's own preflight aborts on any of this, so a red here is

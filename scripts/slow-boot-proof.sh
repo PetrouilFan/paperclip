@@ -47,13 +47,32 @@ set -euo pipefail
 #   cpu:N    N CPU spinners outside the unit's cgroup. Absolute count.
 #   cpu:xN   N * nproc spinners, so the same oversubscription on any runner.
 #   io:RATE  cgroup v2 `io.max` on the unit's cgroup: RATE bytes/sec of
-#            read+write, e.g. `io:8m`. This is the lever that speaks to the
-#            bottleneck, and it is also the closest stand-in for the real
-#            cause -- outage #4 was a host whose disk could not keep up, on a
-#            box where swap was exhausted and the postmaster was thrashing.
+#            read+write, e.g. `io:8m`. The lever that speaks directly to a
+#            disk-bound boot, and the closest stand-in for the real cause --
+#            outage #4 was a host whose disk could not keep up, on a box where
+#            swap was exhausted and the postmaster was thrashing.
+#   mem:MB   cgroup v2 `memory.max` on the unit's cgroup. A ceiling below what
+#            the boot wants does not fail it: it puts the kernel on the direct
+#            reclaim path for every allocation past the ceiling, and inside a
+#            cgroup the only pages available to reclaim are that cgroup's own,
+#            so the boot re-reads the bundle it is executing, at disk speed.
+#   mem:MB+SWAPMB
+#            the same ceiling with a swapfile already full, so the boot's
+#            anonymous pages go to disk too. Outage #4 whole.
+#   cpuset:N the boot's own threads confined to N CPUs. Not more spinners:
+#            oversubscription outside the cgroup asks whether the scheduler is
+#            contended, this asks whether the boot is short of CPU, and only
+#            the second question is the one worth asking.
 #   swap:MB  hold MB resident to push the boot's own allocations onto a
 #            swapfile. Requires a swapfile; the workflow creates one and the
 #            lever reports itself skipped when there is none.
+#
+# Every one of these reports itself SKIP when the host cannot provide it, rather
+# than passing vacuously -- io needs the `io` controller delegated down to the
+# unit's cgroup, memory and cpuset need theirs, swap needs a swapfile. Run
+# 36252377603 is the reason the workflow's swapfile step is not allowed to go
+# red: it returned ETXTBSY on the runner's own /swapfile and took the run out
+# in fifteen seconds, which is a fact about the runner image and not a result.
 #
 # DoD 4 is intact under all of them. `io.max` and swap are properties of the
 # machine, applied from outside: no drop-in is created, no unit property is
@@ -124,7 +143,7 @@ set -euo pipefail
 #   SLOW_BOOT_KEEP_LEVER        1 = leave the lever applied for inspection
 
 SLOW_BOOT_MODE="${SLOW_BOOT_MODE:-proof}"
-SLOW_BOOT_LEVERS="${SLOW_BOOT_LEVERS:-idle cpu:x8 cpu:x32 cpu:x64 io:64m io:8m io:1m swap:2048}"
+SLOW_BOOT_LEVERS="${SLOW_BOOT_LEVERS:-idle cpu:x8 cpuset:1 mem:768 mem:512+2048 io:8m swap:6144}"
 SLOW_BOOT_LEVER="${SLOW_BOOT_LEVER:-io:8m}"
 SLOW_BOOT_REPO="${SLOW_BOOT_REPO:-PetrouilFan/paperclip}"
 SLOW_BOOT_REF="${SLOW_BOOT_REF:-}"
@@ -293,14 +312,16 @@ cg_write() {
   return 2
 }
 
-# cgroup v2 only creates io.max in a cgroup once `io` is in its PARENT's
-# cgroup.subtree_control, so the controller has to be switched on at every
-# level from the root down to the unit's parent. Enabling it needs the cgroup
-# to hold no processes directly (the "no internal process" rule), so failures
-# here are expected on some hosts and are reported, never assumed either way.
-io_enable() {
-  local target="$1" chain=() cur c rc
-  [ -d "/sys/fs/cgroup$target" ] || { info "io: no cgroup at $target"; return 1; }
+# cgroup v2 only creates a controller's files in a cgroup once that controller
+# is in its PARENT's cgroup.subtree_control, so it has to be switched on at
+# every level from the root down to the unit's parent. Enabling one needs the
+# cgroup to hold no processes directly (the "no internal process" rule), so
+# failures here are expected on some hosts and are reported, never assumed
+# either way. $1 controller, $2 target cgroup, $3 the file the controller must
+# then create in the target (io.max, memory.max, cpuset.cpus).
+cg_enable() {
+  local controller="$1" target="$2" probe_file="$3" chain=() cur c
+  [ -d "/sys/fs/cgroup$target" ] || { info "$controller: no cgroup at $target"; return 1; }
   cur="$target"
   while [ "$cur" != "/" ] && [ -d "/sys/fs/cgroup$cur" ]; do
     chain=("$cur" "${chain[@]+"${chain[@]}"}")
@@ -309,14 +330,14 @@ io_enable() {
   for c in "${chain[@]+"${chain[@]}"}"; do
     local sc="/sys/fs/cgroup$c/cgroup.subtree_control"
     [ -f "$sc" ] || continue
-    grep -qw io "$sc" 2>/dev/null && continue
-    cg_write "$sc" "+io" || true
+    grep -qw "$controller" "$sc" 2>/dev/null && continue
+    cg_write "$sc" "+$controller" || true
   done
-  [ -f "/sys/fs/cgroup$target/io.max" ] || {
-    info "io: the io controller is not available for $target on this host"
-    info "io: (a cgroup holding processes directly cannot enable it for its children)"
+  if [ ! -f "/sys/fs/cgroup$target/$probe_file" ]; then
+    info "$controller: the $controller controller is not available for $target on this host"
+    info "$controller: (a cgroup holding processes directly cannot enable it for its children)"
     return 1
-  }
+  fi
   return 0
 }
 
@@ -355,11 +376,78 @@ io_release() {
   return 0
 }
 
+# memory.max. A ceiling below what the boot wants does not fail it, it makes
+# the kernel's direct reclaim path run on every allocation the boot makes past
+# the ceiling -- and inside a cgroup the only pages available to reclaim are
+# that cgroup's own, so the boot re-reads the bundle it is executing, over and
+# over, at disk speed. That is the mechanism behind outage #4 in miniature.
+MEM_PREV=""
+mem_apply() {
+  local mb="$1" file="/sys/fs/cgroup$IO_CG/memory.max"
+  MEM_PREV="$(cat "$file" 2>/dev/null || true)"
+  if ! printf '%s\n' "$(( mb * 1024 * 1024 ))" | sudo tee "$file" >/dev/null 2>&1; then
+    info "mem: could not write $file"
+    return 1
+  fi
+  local now
+  now="$(cat "$file" 2>/dev/null || true)"
+  if [ "$now" != "$(( mb * 1024 * 1024 ))" ]; then
+    info "mem: kernel did not accept the ceiling; read-back is: $now"
+    return 1
+  fi
+  info "mem: $file = ${mb}M (was ${MEM_PREV:-?})"
+  return 0
+}
+
+mem_release() {
+  [ -n "$IO_CG" ] || return 0
+  local file="/sys/fs/cgroup$IO_CG/memory.max"
+  if [ -f "$file" ] && [ -n "$MEM_PREV" ]; then
+    printf '%s\n' "$MEM_PREV" | sudo tee "$file" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# cpuset. Not more spinners -- the boot's own threads moved onto fewer CPUs.
+# Oversubscription outside the cgroup tests "is the whole scheduler contended";
+# this tests "is the boot itself short of CPU", which is the question, and it
+# cannot be answered by adding processes that are not the boot.
+CPUSET_PREV=""
+cpuset_apply() {
+  local n="$1" file="/sys/fs/cgroup$IO_CG/cpuset.cpus"
+  CPUSET_PREV="$(cat "$file" 2>/dev/null || true)"
+  local list
+  list="$(seq -s, 0 $(( n - 1 )) 2>/dev/null)" || { info "cpuset: could not build a cpu list"; return 1; }
+  if ! printf '%s\n' "$list" | sudo tee "$file" >/dev/null 2>&1; then
+    info "cpuset: could not write $file"
+    return 1
+  fi
+  local now
+  now="$(cat "$file" 2>/dev/null || true)"
+  if [ "$now" != "$list" ]; then
+    info "cpuset: kernel did not accept $list; read-back is: $now"
+    return 1
+  fi
+  info "cpuset: $file = $now (was ${CPUSET_PREV:-?})"
+  return 0
+}
+
+cpuset_release() {
+  [ -n "$IO_CG" ] || return 0
+  local file="/sys/fs/cgroup$IO_CG/cpuset.cpus"
+  if [ -f "$file" ] && [ -n "$CPUSET_PREV" ]; then
+    printf '%s\n' "$CPUSET_PREV" | sudo tee "$file" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 lever_release() {
   if [ "$SLOW_BOOT_KEEP_LEVER" = "1" ]; then return 0; fi
   load_stop
   swap_stop
   io_release
+  mem_release
+  cpuset_release
   return 0
 }
 
@@ -409,13 +497,41 @@ lever_apply() {
       ;;
     io:*)
       n="${spec#io:}"
-      if ! io_enable "$IO_CG"; then return 1; fi
+      if ! cg_enable io "$IO_CG" io.max; then return 1; fi
       IO_DEV="$(io_device "$HOME/.paperclip/instances/$SLOW_BOOT_INSTANCE")"
       if [ -z "$IO_DEV" ]; then
         info "io: could not resolve the block device for the instance data dir"
         return 1
       fi
       if ! io_apply "$IO_DEV" "$n"; then return 1; fi
+      return 0
+      ;;
+    mem:*)
+      # mem:MB          a memory ceiling on the unit's own cgroup
+      # mem:MB+SWAPMB   the same ceiling, plus a swapfile already full, so the
+      #                 boot's anonymous pages have to go to disk as well as
+      #                 its file pages. This is outage #4 whole: a postmaster
+      #                 booting inside a memory ceiling on a box whose swap is
+      #                 exhausted.
+      n="${spec#mem:}"
+      local cap="${n%%+*}" fill="${n#*+}"
+      if ! cg_enable memory "$IO_CG" memory.max; then return 1; fi
+      mem_apply "$cap" || return 1
+      if [ "$fill" != "$n" ] && [ -n "$fill" ]; then
+        if swapon --show 2>/dev/null | grep -q .; then
+          swap_add 2 $(( fill * 1024 * 1024 ))
+          sleep 5
+          info "mem: ${#SWAP_PIDS[@]} processes holding ${fill} MB each, swap: $(free -m | awk '/^Swap:/{print $3"/"$2" MB used"}')"
+        else
+          info "mem: no swapfile, so the anonymous half of the pressure is not available"
+        fi
+      fi
+      return 0
+      ;;
+    cpuset:*)
+      n="${spec#cpuset:}"
+      cg_enable cpuset "$IO_CG" cpuset.cpus || return 1
+      cpuset_apply "$n" || return 1
       return 0
       ;;
     *) info "lever: unknown spec '$spec'"; return 1 ;;
