@@ -103,6 +103,29 @@ describe("never-dispatched queued run predicate", () => {
       now.getTime() - NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS,
     );
   });
+
+  it("leaves alone a run that waited as long as the slowest run ever observed to wait", () => {
+    // Measured on the reporting deployment: over the 2645 runs carrying both
+    // `createdAt` and `startedAt`, `startedAt - createdAt` peaked at 25531 s
+    // (7.09 h). That run was slow, not stranded -- it started normally. The window
+    // has to sit above that figure, so this test fails if anyone shortens the
+    // constant back toward a "reasonable looking" hour and starts cancelling work
+    // that was only ever going to be slow.
+    const slowestObservedDispatchMs = 25_531_000;
+    expect(NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS).toBeGreaterThan(
+      slowestObservedDispatchMs,
+    );
+    expect(
+      isNeverDispatchedQueuedRun(
+        {
+          status: "queued",
+          startedAt: null,
+          createdAt: new Date(now.getTime() - slowestObservedDispatchMs),
+        },
+        now,
+      ),
+    ).toBe(false);
+  });
 });
 
 describeEmbeddedPostgres("never-dispatched queued run SQL", () => {

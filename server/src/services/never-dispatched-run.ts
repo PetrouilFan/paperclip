@@ -16,12 +16,38 @@ import { heartbeatRuns } from "@paperclipai/db";
  * the only escape is a board-only force release.
  *
  * `queued` is still a legitimate live path for a bounded admission window, so this
- * predicate only excludes runs that have sat unclaimed past that window. One hour
- * matches `ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS`; measured queue drain on the
- * reporting deployment is well under two minutes, so the window is deliberately far
- * longer than normal contention.
+ * predicate only excludes runs that have sat unclaimed past that window.
+ *
+ * The window is measured, not guessed. Recipe, reproducible in one request against
+ * the reporting instance: `GET /api/companies/{companyId}/heartbeat-runs`, keep the
+ * rows carrying both `createdAt` and `startedAt`, and difference the two. Over the
+ * 2645 such runs on 2026-09-26 the queue wait `startedAt - createdAt` is 0.04 s at
+ * p50 and 370 s at p90, but the tail is long: 4059 s at p99 and 25531 s (7.09 h) at
+ * the observed maximum. A one-hour window -- the obvious choice, and the value this
+ * constant originally shipped with -- would have cancelled 33 of those 2645 runs
+ * (1.25%), every one of which went on to start normally, and each of which had an
+ * issue execution lock bound to it. That is real work destroyed to fix a rarer
+ * fault, so the window is set above the observed maximum with margin: 12 h clears
+ * the 7.09 h maximum with ~69% headroom and produced zero false positives over the
+ * sample. 8 h would also have produced zero, but with only 12.8% headroom, so it is
+ * not a margin anyone should trust.
+ *
+ * The cost of the conservative window is a slower un-strand: an issue locked by a
+ * stranded run stays locked for up to `NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS`
+ * after the fault, rather than being cleared within the hour. That is a bounded,
+ * measured delay bought against destroying running work, and the motivating case
+ * is not delayed by it: the run behind the original report sat unclaimed for
+ * 17.5 h, so a 12 h window still clears it. Recovering faster means giving the
+ * dispatch attempt priority over the age-out -- `resumeQueuedRuns` currently ages
+ * a run out and only afterwards re-drives every queued run, so a
+ * slow-but-dispatchable run is cancelled before the sweep ever offers it a slot.
+ * Reordering those two blocks would let the sweep dispatch first and reserve the
+ * age-out for runs the attempt could not start, which is evidence rather than age.
+ * Tracked separately; it changes sweep ordering and its tests, so it does not
+ * belong in this fix. Safety wins here: this constant must never cancel a run that
+ * would have run.
  */
-export const NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS = 60 * 60 * 1000;
+export const NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 /** `createdAt` at or before which an unclaimed `queued` run counts as stranded. */
 export function neverDispatchedRunCutoff(
