@@ -311,38 +311,61 @@ jobs:
       - name: Plant a stopped paperclipai.service sentinel
         run: |
           mkdir -p "$HOME/.config/systemd/user"
-          cat > "$HOME/.config/systemd/user/paperclipai.service" <<'UNIT'
+          # ExecStart appends to a marker file, so "was the host unit ever
+          # executed" is answerable by counting lines -- independently of the
+          # timestamp properties, which are useless as a witness here.
+          # Measured on this host with a throwaway sentinel unit: after
+          # start+stop, `ActiveEnterTimestamp=` and `InactiveEnterTimestamp=` are
+          # BOTH empty and MainPID=0, so for a stopped unit the timestamp
+          # comparison is empty-vs-empty whether or not the leg activated it.
+          # The marker count is the only non-vacuous witness for this case.
+          rm -f "$RUNNER_TEMP/sentinel-activations"
+          cat > "$HOME/.config/systemd/user/paperclipai.service" <<UNIT
           [Unit]
           Description=Planted paperclipai.service sentinel (PET-259)
 
           [Service]
           Type=simple
-          ExecStart=/bin/sleep infinity
+          ExecStart=/bin/sh -c 'echo activated >> $RUNNER_TEMP/sentinel-activations; exec /bin/sleep infinity'
 
           [Install]
           WantedBy=default.target
           UNIT
           systemctl --user daemon-reload
-          # Start it once and stop it again, so the baseline is non-trivial:
-          # a never-started unit has an empty ActiveEnterTimestamp and
-          # MainPID=0, and "still empty" would be satisfied by the leg simply
-          # never having looked. With a real prior activation recorded, any
-          # activation by the leg moves the timestamp and the PID.
+          # Start it once and stop it again, so the sentinel has a real recorded
+          # prior activation and the unit is in the `inactive` state that
+          # contains the substring `active`.
           systemctl --user start paperclipai.service
+          # Wait for the witness, not for the state. `Type=simple` reports
+          # `active` as soon as the process is forked, which is *before*
+          # ExecStart's first command runs -- measured on this host: `is-active`
+          # returns `active` while the marker file still does not exist. A
+          # start/is-active/stop without this wait kills the shell before it
+          # appends, and the line count is then 0, not 1.
+          for _ in $(seq 1 30); do
+            [ -f "$RUNNER_TEMP/sentinel-activations" ] && break
+            sleep 1
+          done
           systemctl --user is-active paperclipai.service | grep -qx active
           systemctl --user stop paperclipai.service
-          systemctl --user reset-failed paperclipai.service || true
           systemctl --user show paperclipai.service \
             -p LoadState -p ActiveState -p MainPID -p ActiveEnterTimestamp \
             -p InactiveEnterTimestamp -p FragmentPath 2>&1 | tee "$RUNNER_TEMP/sentinel-before.txt"
-          # The whole point: `inactive` contains the substring `active`, so a
-          # preflight written as `grep -q active` would call this host live.
+          # The whole point of this job: `inactive` contains the substring
+          # `active`, so a preflight written as `grep -q active` would call this
+          # host live and skip the leg everywhere.
           if systemctl --user is-active paperclipai.service 2>/dev/null | grep -qx active; then
             echo "sentinel is active; this job needs it stopped"
             exit 1
           fi
-          grep -qE "ActiveEnterTimestamp=.+" "$RUNNER_TEMP/sentinel-before.txt" || {
-            echo "sentinel has no recorded activation; the before/after comparison would be vacuous"
+          lines="$(wc -l < "$RUNNER_TEMP/sentinel-activations")"
+          echo "sentinel_activations_before=$lines"
+          [ "$lines" = "1" ] || {
+            echo "expected exactly one recorded activation, got $lines"
+            exit 1
+          }
+          grep -q "^LoadState=loaded" "$RUNNER_TEMP/sentinel-before.txt" || {
+            echo "the sentinel unit is not loaded; 8f would be judging an absent unit"
             exit 1
           }
 
@@ -413,6 +436,16 @@ jobs:
             echo "the host unit is active after the leg"
             exit 1
           }
+          # The load-bearing assertion for this job: the sentinel's ExecStart
+          # only ever runs if systemd starts the unit, so an unchanged line
+          # count is proof the leg never activated the host unit. Without it
+          # the two timestamp comparisons above can both pass vacuously.
+          after_lines="$(wc -l < "$RUNNER_TEMP/sentinel-activations")"
+          echo "sentinel_activations_after=$after_lines"
+          if [ "$after_lines" != "1" ]; then
+            echo "the sentinel was activated $after_lines times; the leg started the host unit"
+            exit 1
+          fi
 
       - name: Upload stopped-sentinel evidence
         if: always()
