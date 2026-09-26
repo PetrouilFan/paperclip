@@ -1478,6 +1478,66 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it("states the payload well-formedness clause at every run shape, ahead of the two-failure rule", () => {
+    // The clause qualifies the two-failure rule, so it has to sit immediately
+    // before it on every surface that carries the rule. Patching one anchor and
+    // not the others leaves an agent reading the incomplete rule.
+    const CLAUSE =
+      "Before treating a `5xx` from a control-plane write as transient, confirm the request payload is well-formed: parse the exact bytes you send before you spend a retry. A serialization error in the request is a client fault, not a server fault, and is not covered by the two-failure rule \u2014 it does not consume a retry, and a corrected payload is a new attempt rather than a repeat of the failed one. A `5xx` whose body is only a generic error such as `{\"error\":\"Internal server error\"}` names no field, no offset, and no parser message, so it is not evidence of a server fault: fix the payload and resend instead of spending retries or abandoning the deliverable.";
+    const TWO_FAILURE_RULE =
+      "After 2 consecutive failures of the same control-plane write";
+
+    // 1. heartbeat agent prompt template
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(CLAUSE);
+    expect(
+      DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.indexOf(CLAUSE),
+    ).toBeLessThan(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE.indexOf(TWO_FAILURE_RULE));
+    // Reading order within a bullet list, not a substring of one line.
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
+      `- ${CLAUSE}\n- ${TWO_FAILURE_RULE}`,
+    );
+
+    // 2. conversation prompt template
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(CLAUSE);
+    expect(
+      DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE.indexOf(CLAUSE),
+    ).toBeLessThan(
+      DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE.indexOf(TWO_FAILURE_RULE),
+    );
+    expect(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE).toContain(
+      `${CLAUSE}\n${TWO_FAILURE_RULE}`,
+    );
+
+    // 3. server task-context markdown, rendered into the wake prompt
+    const wakePrompt = renderPaperclipWakePrompt(
+      {
+        reason: "issue_assigned",
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-1",
+          title: "Update prompts",
+          status: "in_progress",
+        },
+        commentWindow: {
+          requestedCount: 0,
+          includedCount: 0,
+          missingCount: 0,
+        },
+        comments: [],
+        fallbackFetchNeeded: false,
+      },
+      { includeExecutionContract: true },
+    );
+    expect(wakePrompt).toContain(CLAUSE);
+    expect(wakePrompt.indexOf(CLAUSE)).toBeLessThan(
+      wakePrompt.indexOf(TWO_FAILURE_RULE),
+    );
+    // Same rendered paragraph, so the clause reads as part of the contract.
+    expect(wakePrompt).toContain(
+      `do not end the run. ${CLAUSE} ${TWO_FAILURE_RULE}`,
+    );
+  });
+
   it("leaves the execution contract to the heartbeat template on fresh scoped wake prompts", () => {
     const prompt = renderPaperclipWakePrompt({
       reason: "issue_assigned",
