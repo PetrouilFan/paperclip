@@ -543,6 +543,25 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   };
 }
 
+// Each rejection reason names the one thing that changed and the one action the
+// caller can take, instead of collapsing every cause into a single sentence that
+// ends in "refresh the source state" — which is not actionable in any of them.
+// A mutable state (`stopped` / `already_reviewed`) only reaches here when its
+// fingerprint drifted, so the fingerprint is the cause worth naming; the other
+// states are rejected on the state itself and never carry a fingerprint.
+function staleWatchdogMutationReason(state: TaskWatchdogClassifierResult["state"]) {
+  if (state === "live") {
+    return "Task-watchdog review is stale because the watched subtree now has a live execution path; another run owns that work, so stop mutating the watched subtree and close the review with that finding.";
+  }
+  if (state === "pending_first_run") {
+    return "Task-watchdog review is stale because the watched subtree is still waiting on its first run; let that run settle before mutating the watched subtree.";
+  }
+  if (state === "not_applicable") {
+    return "Task-watchdog review is stale because the watched subtree no longer holds stopped work this review can act on; refresh the source state to see what is left in it.";
+  }
+  return "Task-watchdog review is stale because the watched subtree stop fingerprint changed since this run was woken; re-read the watched subtree and finish the review against its current state instead of this run's snapshot.";
+}
+
 async function assertWatchedIssue(dbOrTx: any, companyId: string, issueId: string) {
   const issue = await dbOrTx
     .select({ id: issues.id, companyId: issues.companyId })
@@ -1644,15 +1663,25 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
 
     const input = await collectClassifierInput(watchdog.companyId, watchdog);
     const classification = classifyTaskWatchdogSubtree(input);
-    if (classification.state === "stopped" && classification.stopFingerprint === scope.stopFingerprint) {
+    // `already_reviewed` is a trigger-suppression signal, not a staleness signal.
+    // It suppresses *creating* a redundant run for a fingerprint an earlier run
+    // already adjudicated; it says nothing about whether a run already woken for
+    // that same fingerprint may finish adjudicating it. Refusing writes here
+    // deadlocks the subtree: the fingerprint can only change through a write, and
+    // every write is gated on the fingerprint, while the scheduler never creates
+    // a fresh run for an `already_reviewed` fingerprint. Admit the write whenever
+    // nothing has changed since this run was woken.
+    const currentFingerprint = "stopFingerprint" in classification
+      ? classification.stopFingerprint
+      : null;
+    const mutatable = classification.state === "stopped" || classification.state === "already_reviewed";
+    if (currentFingerprint !== null && currentFingerprint === scope.stopFingerprint && mutatable) {
       return { allowed: true as const, classification };
     }
 
     return {
       allowed: false as const,
-      reason: classification.state === "stopped"
-        ? "Task-watchdog review is stale because the watched subtree stop fingerprint changed; refresh the source state before mutating it."
-        : "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
+      reason: staleWatchdogMutationReason(classification.state),
       classification,
     };
   }
