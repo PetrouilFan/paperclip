@@ -140,7 +140,10 @@ describeEmbeddedPostgres("cross-issue assignee exemption (postgres)", () => {
 
   // `issues` references both `agents` and `heartbeatRuns`, so it has to go
   // before them. Every assertion is scoped to its own seeded run rather than
-  // relying on the table being empty.
+  // relying on the table being empty. A failed delete is not swallowed: the
+  // order above is the only order the foreign keys allow, so a delete that
+  // throws is the real reason a later seed failed, and hiding it would turn
+  // fixture isolation into a mystery.
   afterEach(async () => {
     const cleanups = [
       () => db.delete(activityLog),
@@ -149,7 +152,7 @@ describeEmbeddedPostgres("cross-issue assignee exemption (postgres)", () => {
       () => db.delete(agents),
       () => db.delete(companies),
     ];
-    for (const cleanup of cleanups) await cleanup().catch(() => undefined);
+    for (const cleanup of cleanups) await cleanup();
   });
 
   afterAll(async () => {
