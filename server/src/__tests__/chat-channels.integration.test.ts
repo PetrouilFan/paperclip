@@ -58380,7 +58380,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           sourceRunId: questionRun.runId,
           payload: {
             version: 1,
-            prompt: "Choose a color",
             questions: [
               {
                 id: "color",
@@ -58542,7 +58541,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               sourceRunId: run.runId,
               payload: {
                 version: 1,
-                prompt: "Choose a color",
                 questions: [
                   {
                     id: "color",
@@ -59460,7 +59458,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         status: "pending",
         payload: {
           version: 1,
-          prompt: "Choose one",
           questions: [
             {
               id: "choice",
