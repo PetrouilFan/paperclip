@@ -86,6 +86,54 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
   });
 
+  // The test above passes no `runContextReason`, so it takes the *else* branch —
+  // the one case where the run header really is the missing piece. A defect
+  // report on the other branch therefore needed no test, and the corrected
+  // advice could be reverted silently. These cases tie the message to its
+  // effect, which is the obligation plan §6 sets for every denial.
+  it("tells a resolved run to check out a task, not to resend the run header", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "no_context_source_and_target_unbound",
+      issueIdentifier: "TASK-482",
+      actorLabel: "Fable",
+    });
+    // The step named has to be one that actually succeeds.
+    expect(copy.sanctionedPath).toContain("POST /api/issues/<id>/checkout");
+    // And the step that provably does nothing must not be named as a fix.
+    expect(copy.sanctionedPath).not.toContain("`X-Paperclip-Run-Id` header with your current run");
+    expect(copy.sanctionedPath).toContain("Do not resend `X-Paperclip-Run-Id`");
+    expect(copy.description).toContain("TASK-482");
+  });
+
+  it("routes an actor away from a task it does not hold", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "no_context_source_and_target_unbound",
+      issueIdentifier: "TASK-482",
+      actorLabel: "Fable",
+      assigneeLabel: "Hephaestus",
+      targetAssignedToOtherActor: true,
+    });
+    // `checkout` is a 409 for anyone but the assignee, so the rejection must not
+    // send this actor there. That second dead end is the whole point of this
+    // case.
+    expect(copy.sanctionedPath).not.toContain("POST /api/issues/<id>/checkout");
+    expect(copy.sanctionedPath).toContain("child issue");
+    expect(copy.sanctionedPath).toContain("reassignment");
+    // It must name who actually holds the issue, not just "someone".
+    expect(copy.whoCanAct).toContain("Hephaestus");
+    expect(copy.whoCanAct).toContain("TASK-482");
+  });
+
+  it("keeps the header advice for the two reasons where it is the real fix", () => {
+    for (const reason of ["malformed_run_id", "run_not_found"] as const) {
+      const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+        runContextReason: reason,
+      });
+      expect(copy.sanctionedPath, reason).toContain("X-Paperclip-Run-Id");
+      expect(copy.sanctionedPath, reason).toContain("PAPERCLIP_RUN_ID");
+    }
+  });
+
   it("does not tell a bound-but-unsourced run to resend the run header it already sent", () => {
     // The run id is already in the bearer token and the server already
     // resolved it; what is missing is a source issue. Telling the agent to send

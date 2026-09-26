@@ -1,6 +1,6 @@
 import { and, asc, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
+import { activityLog, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   isUuidLike,
   issueWriteDenialResponse,
@@ -47,13 +47,26 @@ export type CrossIssueInfluenceDecision = {
 
 export function crossIssueInfluenceRunContextError(
   reason: CrossIssueRunContextReason = "run_not_found",
+  labels: {
+    /** Target issue identifier, so copy names the task instead of "this task". */
+    issueIdentifier?: string | null;
+    /** Display name of whoever holds the target, so copy can name them. */
+    assigneeLabel?: string | null;
+    /** The target's assignee is a different principal than the actor. */
+    targetAssignedToOtherActor?: boolean | null;
+  } = {},
 ) {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal. The
   // `reason` picks the advice: "send the run header" is correct when the run is
-  // missing, and unfollowable when only the source issue is missing.
+  // missing, and unfollowable when only the source issue is missing. The
+  // other-actor flag picks a third variant, because checkout is a 409 on a
+  // task this run does not hold.
   const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required", {
     runContextReason: reason,
+    issueIdentifier: labels.issueIdentifier ?? null,
+    assigneeLabel: labels.assigneeLabel ?? null,
+    targetAssignedToOtherActor: labels.targetAssignedToOtherActor ?? null,
   });
   return forbidden(body.error, { ...body.details, reason });
 }
@@ -279,8 +292,12 @@ export async function observeCrossIssueInfluence(
       // run that *does* have a source still spends its 20-write budget on any
       // target that is not its own.
       const targetAssignee = await tx
-        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .select({
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeName: agents.name,
+        })
         .from(issues)
+        .leftJoin(agents, eq(agents.id, issues.assigneeAgentId))
         .where(and(
           eq(issues.id, input.targetIssueId),
           eq(issues.companyId, input.companyId),
@@ -289,7 +306,15 @@ export async function observeCrossIssueInfluence(
       if (targetAssignee?.assigneeAgentId && targetAssignee.assigneeAgentId === input.agentId) {
         return null;
       }
-      throw crossIssueInfluenceRunContextError("no_context_source_and_target_unbound");
+      // The read above already knows who holds the target, so hand the copy
+      // that fact. Without it the rejection tells the actor to check out this
+      // issue, which is a 409 `Issue checkout conflict` for anyone who is not
+      // the assignee — a correct refusal converted into a second, worse one.
+      throw crossIssueInfluenceRunContextError("no_context_source_and_target_unbound", {
+        issueIdentifier: input.targetIssueIdentifier ?? null,
+        assigneeLabel: targetAssignee?.assigneeName ?? null,
+        targetAssignedToOtherActor: Boolean(targetAssignee?.assigneeAgentId),
+      });
     }
 
     const priorCount = await tx

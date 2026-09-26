@@ -22,12 +22,21 @@ function counterDb(
    * assignee and status are what the gate re-validates before trusting it.
    */
   standingWatchHost: { id: string; assigneeAgentId: string | null; status: string } | null = null,
+  /**
+   * Display name per issue id, for the `agents` left-join the target-assignee
+   * read uses to name the holder in the 403 copy.
+   */
+  assigneeNameByIssueId: Record<string, string | null> = {},
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
   const tx = {
-    select: (selection: Record<string, unknown>) => ({
-      from: () => ({
+    select: (selection: Record<string, unknown>) => {
+      // The target-assignee read left-joins `agents` to name the holder in the
+      // 403 copy. The fake dispatches on selection keys, so a join is a
+      // pass-through that keeps the `where` chain intact.
+      const fromChain = {
+        leftJoin: () => fromChain,
         where: () => {
           if (Object.keys(selection).includes("count")) {
             return {
@@ -54,6 +63,7 @@ function counterDb(
             const rows = Object.entries(assigneeByIssueId).map(([id, assigneeAgentId]) => ({
               id,
               assigneeAgentId,
+              assigneeName: assigneeNameByIssueId[id] ?? null,
             }));
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve(rows),
@@ -81,8 +91,9 @@ function counterDb(
             }),
           };
         },
-      }),
-    }),
+      };
+      return { from: () => fromChain };
+    },
     insert: () => ({
       values: async (value: Record<string, unknown>) => {
         inserted.push(value);
@@ -652,6 +663,41 @@ describe("cross-issue influence: a standing watch gives a task-less run a source
         reason: "no_context_source_and_target_unbound",
       },
     });
+  });
+
+  it("names the holder and the two real routes when the target belongs to another agent", async () => {
+    // The copy for this refusal used to tell the actor to check out the target,
+    // which is a 409 `Issue checkout conflict` for anyone but the assignee —
+    // a correct refusal converted into a second, worse one. The read that
+    // backs the self-write exemption already knows the holder, so the 403
+    // must use it.
+    const fake = counterDb(
+      0,
+      watching(),
+      [],
+      { [TARGET]: OTHER_AGENT },
+      host({ assigneeAgentId: OTHER_AGENT }),
+      { [TARGET]: "Hephaestus" },
+    );
+
+    const error = await observeCrossIssueInfluence(fake.db as never, {
+      ...base,
+      targetIssueIdentifier: "TASK-482",
+    }).then(
+      () => { throw new Error("expected the write to be refused"); },
+      (err: { message: string; details: Record<string, unknown> }) => err,
+    );
+
+    expect(error.details).toMatchObject({
+      code: "cross_issue_influence_run_context_required",
+      reason: "no_context_source_and_target_unbound",
+    });
+    expect(error.message).toContain("child issue");
+    expect(error.message).toContain("reassignment");
+    expect(error.message).toContain("Hephaestus");
+    expect(error.message).toContain("TASK-482");
+    // The step that is a 409 here must not be offered as the fix.
+    expect(error.message).not.toContain("POST /api/issues/<id>/checkout");
   });
 
   it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"])(
