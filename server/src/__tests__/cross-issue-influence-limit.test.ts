@@ -6,6 +6,7 @@ import {
   evaluateCrossIssueInfluenceLimit,
   observeCrossIssueInfluence,
 } from "../services/cross-issue-influence-limit.ts";
+import { enrichWakeContextSnapshot } from "../services/heartbeat.ts";
 
 function counterDb(
   initialCount = 0,
@@ -323,7 +324,35 @@ describe("cross-issue run-context refusal copy", () => {
     // A checkout with your own run does not: it writes the issue row, and the
     // wake it might otherwise trigger is suppressed for a self-checkout. So the
     // run-side binding is the step that clears the refusal here.
-    const bound = counterDb(0, { contextSnapshot: { issueId: target, taskId: target } });
+    //
+    // Build the run context through the wake path rather than hand-writing one.
+    // A hand-built `{ issueId, taskId }` only proves the gate accepts a context
+    // shaped like the wake's output, so if `enrichWakeContextSnapshot` stopped
+    // folding the payload, the copy would go on naming a step that no longer
+    // clears the refusal and this test would stay green. The arguments below are
+    // the ones that route forwards to `heartbeat.wakeup` for an agent caller
+    // posting `{ source: "on_demand", payload: { issueId } }`: the actor fields
+    // the handler seeds, and the request payload verbatim. That seed carries no
+    // `issueId`, so the binding this gate depends on can only come from the fold.
+    const routeSeed = {
+      triggeredBy: "agent",
+      originIdentityContextId: null,
+      responsibleUserId: null,
+      actorId: "33333333-3333-4333-8333-333333333333",
+      forceFreshSession: false,
+    };
+    expect(routeSeed).not.toHaveProperty("issueId");
+
+    const { contextSnapshot: wokenContextSnapshot } = enrichWakeContextSnapshot({
+      contextSnapshot: { ...routeSeed },
+      reason: null,
+      source: "on_demand",
+      triggerDetail: "manual",
+      payload: { issueId: target },
+    });
+    expect(wokenContextSnapshot.issueId).toBe(target);
+
+    const bound = counterDb(0, { contextSnapshot: wokenContextSnapshot });
     await expect(observeCrossIssueInfluence(bound.db as never, {
       ...unboundTarget,
       targetIssueIdentifier: "TASK-482",
