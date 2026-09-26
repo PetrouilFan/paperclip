@@ -2,12 +2,17 @@ import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import {
+  hasSettledExecutionRecoveryAction,
+  isExecutionRecoveryAlreadySettled,
+  readExecutionRecoveryDisposition,
+} from "./execution-recovery-identity.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
@@ -121,21 +126,25 @@ export async function terminalizeLegacyExecution(input: {
       // Periodic stranded-work checks may revisit this terminal run before its
       // reconciled continuation is dispatched. Preserve the recorded decision
       // and an existing unsafe-workspace hold instead of creating another one.
-      const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
-        .from(issueRecoveryActions).where(and(
-          eq(issueRecoveryActions.companyId, run.companyId),
-          eq(issueRecoveryActions.sourceIssueId, task.id),
-          eq(issueRecoveryActions.status, "resolved"),
-          or(
-            sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
-            and(
-              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
-              sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
-              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
-            ),
-          ),
-        )).limit(1);
-      if (reconciled) return updated;
+      //
+      // The dedup key is `(runId, issueId)`. Keying on the recovery action's id
+      // cannot work: that id is re-minted on every sweep, so it never matches
+      // anything and every visit inserts a brand new action. A settled receipt
+      // for the same run — whatever cause minted it — is the decision.
+      if (
+        isExecutionRecoveryAlreadySettled({
+          disposition: readExecutionRecoveryDisposition(updated.resultJson),
+          runId: run.id,
+          issueId: task.id,
+          issue: task,
+        }) ||
+        (await hasSettledExecutionRecoveryAction(tx as unknown as Db, {
+          companyId: run.companyId,
+          issueId: task.id,
+          runId: run.id,
+        }))
+      )
+        return updated;
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
         sourceIssueId: task.id,
