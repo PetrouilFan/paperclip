@@ -41,7 +41,8 @@
     "clean": "rm -rf dist",
     "start": "node dist/index.js",
     "prepare:runner-vendor": "pnpm --filter @paperclipai/paperclip-runner build",
-    "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
+    "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit",
+    "typecheck:tests": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc -p tsconfig.tests.json"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1122.0",
