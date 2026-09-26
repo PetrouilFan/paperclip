@@ -4,16 +4,12 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, not, notEq, or, sql } from "drizzle-orm";
 import {
-  approvals,
   chatActions,
   environmentLeases,
   heartbeatRuns,
-  issueApprovals,
   issueRecoveryActions,
-  issueRelations,
-  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -30,6 +26,7 @@ import {
   deliverAgentUnblockNotification,
   strandedRunUnblockDescriptor,
 } from "./routable-blocked.js";
+import { hasFirstClassIssueHold } from "./stranded-blocked-backfill.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -478,6 +475,46 @@ export async function settleUnrecoverableExecutions(
           )
         )
           return;
+        // A run's recovery outcome is recorded once. The reconciler keeps
+        // re-surfacing a dead run under a fresh watchdog action, so the sweep
+        // sees the same dead run again minutes later. PR #47 made the *write*
+        // converge; this makes the *settle* a no-op: the duplicate action is
+        // retired so it does not sit in the attention queue forever, and the
+        // issue is neither re-blocked nor re-logged. Filtering this out of the
+        // candidate query instead would leave the duplicate `active` and
+        // invisible, which is the failure this issue exists to end.
+        const [alreadyRecorded] = await tx
+          .select({ id: issueRecoveryActions.id })
+          .from(issueRecoveryActions)
+          .where(
+            and(
+              eq(issueRecoveryActions.companyId, candidate.companyId),
+              eq(issueRecoveryActions.sourceIssueId, action.sourceIssueId),
+              notEq(issueRecoveryActions.id, action.id),
+              eq(issueRecoveryActions.status, "resolved"),
+              eq(issueRecoveryActions.kind, "active_run_watchdog"),
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${runId}`,
+            ),
+          )
+          .limit(1);
+        if (alreadyRecorded) {
+          await tx
+            .update(issueRecoveryActions)
+            .set({
+              status: "resolved",
+              outcome: "cancelled",
+              resolvedAt: now,
+              updatedAt: now,
+              nextAction: "This run's recovery outcome is already recorded.",
+              resolutionNote:
+                "A prior sweep already settled this run. The duplicate action was retired without re-blocking the issue.",
+              wakePolicy: null,
+              monitorPolicy: null,
+            })
+            .where(eq(issueRecoveryActions.id, action.id));
+          return;
+        }
         // Give durable native recovery its chance; never preempt a resume,
         // replacement, result finalizer, or still-owned execution.
         if (
@@ -507,57 +544,18 @@ export async function settleUnrecoverableExecutions(
           // A dead run is not a hold. Before blocking, check whether the issue
           // already has a first-class reason to be blocked; if it does not, the
           // settle has to leave an exit behind, or `blocked` strands the ticket
-          // permanently. Same disjunction the issue route enforces.
-          const [existingHold] = await tx
-            .select({ held: sql<boolean>`true` })
-            .from(issueRelations)
-            .innerJoin(
-              issues,
-              and(
-                eq(issues.companyId, issueRelations.companyId),
-                eq(issues.id, issueRelations.issueId),
-              ),
-            )
-            .where(
-              and(
-                eq(issueRelations.companyId, task.companyId),
-                eq(issueRelations.relatedIssueId, task.id),
-                eq(issueRelations.type, "blocks"),
-                notInArray(issues.status, ["done", "cancelled"]),
-              ),
-            )
-            .limit(1);
-          const [pendingInteraction] = await tx
-            .select({ id: issueThreadInteractions.id })
-            .from(issueThreadInteractions)
-            .where(
-              and(
-                eq(issueThreadInteractions.companyId, task.companyId),
-                eq(issueThreadInteractions.issueId, task.id),
-                eq(issueThreadInteractions.status, "pending"),
-              ),
-            )
-            .limit(1);
-          const [pendingApproval] = await tx
-            .select({ id: approvals.id })
-            .from(issueApprovals)
-            .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
-            .where(
-              and(
-                eq(issueApprovals.companyId, task.companyId),
-                eq(issueApprovals.issueId, task.id),
-                eq(approvals.status, "pending"),
-              ),
-            )
-            .limit(1);
+          // permanently. Same predicate the issue route and the stranded
+          // backfill use, so a descriptor never lands on a real hold.
+          const strandedHold = !(await hasFirstClassIssueHold(
+            tx as unknown as Db,
+            { companyId: task.companyId, issueId: task.id },
+          ));
           const enteringBlocked = task.status !== "blocked";
           // Nothing else is holding this issue and no exit was ever written, so
           // this settle owns the block: it stamps the transition and names who
           // releases it. An issue that already carries a descriptor keeps that
           // separate hold's exit, and a repeat settle of the same dead run
           // rewrites nothing.
-          const strandedHold =
-            !existingHold && !pendingInteraction && !pendingApproval;
           const unblockDescriptor = strandedHold
             ? strandedRunUnblockDescriptor({
                 existing: task.unblockDescriptor,

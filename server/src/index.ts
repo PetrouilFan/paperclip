@@ -10,6 +10,10 @@ import { verifyStoppedNativeSessionForReplacement } from "./services/native-runt
 import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
 import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
+import {
+  backfillStrandedBlockedIssues,
+  STRANDED_BLOCKED_BACKFILL_INTERVAL_MS,
+} from "./services/stranded-blocked-backfill.js";
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
@@ -1161,12 +1165,27 @@ async function startServerWithDatabaseTeardown(
     }
   };
   const executionControlSweepsInFlight = new Set<string>();
+  let strandedBlockedBackfillLastRunAt: number | null = null;
   const executionControlSweeps = [
     ["finalization", () => reconcileAbandonedExecutionControl(db)],
     ["replacement", () => heartbeat ? reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }) : undefined],
     ["reconciliation_delivery", () => heartbeat ? deliverReconciledExecutions(db, heartbeat.wakeup) : undefined],
     ["status_delivery", () => deliverExecutionStatuses(db)],
     ["automatic_disposition", () => settleUnrecoverableExecutions(db, new Date(), { wakeup: heartbeat?.wakeup })],
+    // The historical stranded-blocked backfill is a one-off repair, not a
+    // queue: PR #47's writers keep new strands from forming, and this pass
+    // costs one indexed query once the board reads clean. The 15s control sweep
+    // would otherwise re-scan the issues table forever, so it is throttled to
+    // a periodic safety net that also catches a strand left by any writer that
+    // regresses. First run happens on the boot sweep below.
+    ["stranded_blocked_backfill", () => {
+      const last = strandedBlockedBackfillLastRunAt;
+      if (last !== null && Date.now() - last < STRANDED_BLOCKED_BACKFILL_INTERVAL_MS) {
+        return undefined;
+      }
+      strandedBlockedBackfillLastRunAt = Date.now();
+      return backfillStrandedBlockedIssues(db, new Date());
+    }],
     ["local_ai_login_cleanup", () => localAiLoginService(db).reapExpired()],
   ] as const;
   const sweepExecutionControl = () => {
