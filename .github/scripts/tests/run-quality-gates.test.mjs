@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findExistingComment } from '../run-quality-gates.mjs';
+import { COMMITPERCLIP_LOGINS, findExistingComment } from '../run-quality-gates.mjs';
 
 test('findExistingComment: paginates until it finds the commitperclip comment', async () => {
   const seenPaths = [];
@@ -38,6 +38,48 @@ test('findExistingComment: returns null when no signed comment exists', async ()
       body: 'Unsigned status update',
     },
   ]), 'token', 'paperclipai/paperclip', 6469);
+
+  assert.equal(comment, null);
+});
+
+test('findExistingComment: a non-app commenter is not adopted by default', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 7,
+      user: { login: 'github-actions[bot]' },
+      body: 'Gate output\n\n— commitperclip',
+    },
+  ]), 'token', 'PetrouilFan/paperclip', 32);
+
+  assert.equal(comment, null);
+});
+
+test('findExistingComment: adopts the fallback commenter when it is named', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 7,
+      user: { login: 'github-actions[bot]' },
+      body: 'Gate output\n\n— commitperclip',
+    },
+  ]), 'token', 'PetrouilFan/paperclip', 32, [
+    ...COMMITPERCLIP_LOGINS,
+    'github-actions[bot]',
+  ]);
+
+  assert.equal(comment.id, 7);
+});
+
+test('findExistingComment: still ignores a signed comment from a bystander', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 8,
+      user: { login: 'some-human-reviewer' },
+      body: 'Quoting the gate: — commitperclip',
+    },
+  ]), 'token', 'PetrouilFan/paperclip', 32, [
+    ...COMMITPERCLIP_LOGINS,
+    'github-actions[bot]',
+  ]);
 
   assert.equal(comment, null);
 });
