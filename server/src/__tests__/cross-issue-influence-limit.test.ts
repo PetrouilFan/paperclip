@@ -17,6 +17,11 @@ function counterDb(
    * the self-write exemption. Absent ids resolve to `null` (unassigned).
    */
   assigneeByIssueId: Record<string, string | null> = {},
+  /**
+   * The `standingWatchIssueId` host row, or `null` for "no such issue". Its
+   * assignee and status are what the gate re-validates before trusting it.
+   */
+  standingWatchHost: { id: string; assigneeAgentId: string | null; status: string } | null = null,
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -27,6 +32,20 @@ function counterDb(
           if (Object.keys(selection).includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
+            };
+          }
+          // The standing-watch host read: one company-scoped row, selected by
+          // id. The run read also carries a `status`, so this arm is keyed on
+          // the assignee column it shares with the target-assignee read plus
+          // the absence of the run's own `contextSnapshot`.
+          if (
+            Object.keys(selection).includes("status") &&
+            Object.keys(selection).includes("assigneeAgentId") &&
+            !Object.keys(selection).includes("contextSnapshot")
+          ) {
+            return {
+              then: (resolve: (rows: unknown[]) => unknown) =>
+                resolve(standingWatchHost ? [standingWatchHost] : []),
             };
           }
           // The target-assignee read: one company-scoped row, no ordering, and
@@ -478,6 +497,221 @@ describe("cross-issue influence: the target's own assignee is not cross-issue in
       details: {
         code: "cross_issue_influence_run_context_required",
         reason: "terminal_status",
+      },
+    });
+    expect(fake.inserted).toEqual([]);
+  });
+});
+
+/**
+ * A watch role holds no issue: its whole job is writing to issues assigned to
+ * a human or to another agent (its staleness rules and its daily report). On a
+ * bare `heartbeat_timer` wake that left the mandate structurally mute, and
+ * mute silently — a run that computed a correct sweep and could not record it
+ * is indistinguishable from one that never ran.
+ *
+ * The host is frequently the one issue a watch *cannot* check out: a watch is
+ * often pointed at a `blocked` issue precisely because that is where the
+ * staleness lives, and `checkout` refuses a blocked issue, so the
+ * checkout-derived source can never resolve for it.
+ *
+ * `standingWatchIssueId` is a third source, re-validated at the gate. It buys
+ * attribution, not capacity: the 20-write per-run cap still applies to every
+ * write the watch makes.
+ */
+describe("cross-issue influence: a standing watch gives a task-less run a source", () => {
+  const ACTOR = "33333333-3333-4333-8333-333333333333";
+  const OTHER_AGENT = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const HOST = "44444444-4444-4444-8444-444444444444";
+  const TARGET = "55555555-5555-4555-8555-555555555555";
+  const base = {
+    companyId: "22222222-2222-4222-8222-222222222222",
+    runId: "11111111-1111-4111-8111-111111111111",
+    agentId: ACTOR,
+    targetIssueId: TARGET,
+    kind: "comment",
+    now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+  } as const;
+  const watching = (extra: Record<string, unknown> = {}) => ({
+    contextSnapshot: { standingWatchIssueId: HOST, ...extra },
+    status: "running",
+  });
+  const host = (overrides: Partial<{ assigneeAgentId: string | null; status: string }> = {}) => ({
+    id: HOST,
+    assigneeAgentId: ACTOR,
+    // The status that matters: a blocked host can never be checked out, so this
+    // is exactly the watch the checkout fallback cannot serve.
+    status: "blocked",
+    ...overrides,
+  });
+
+  it.each(["comment", "update", "interaction_resolution"] as const)(
+    "charges a %s on another agent's board to the watch host and allows it",
+    async (kind) => {
+      const fake = counterDb(0, watching(), [], { [TARGET]: OTHER_AGENT }, host());
+
+      const decision = await observeCrossIssueInfluence(fake.db as never, { ...base, kind });
+      expect(decision).toMatchObject({ allowed: true, mode: "enforce", count: 1 });
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({
+          action: "issue.cross_issue_influence_observed",
+          details: expect.objectContaining({
+            sourceIssueId: HOST,
+            targetIssueId: TARGET,
+          }),
+        }),
+      ]);
+    },
+  );
+
+  it("exempts the host itself, so the watch can record on its own issue", async () => {
+    const fake = counterDb(0, watching(), [], { [HOST]: ACTOR }, host());
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      ...base,
+      targetIssueId: HOST,
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("still spends the run's budget: a host buys attribution, not capacity", async () => {
+    const fake = counterDb(
+      CROSS_ISSUE_INFLUENCE_LIMIT,
+      watching(),
+      [],
+      { [TARGET]: OTHER_AGENT },
+      host(),
+    );
+
+    const decision = await observeCrossIssueInfluence(fake.db as never, base);
+    expect(decision).toMatchObject({ allowed: false, count: CROSS_ISSUE_INFLUENCE_LIMIT + 1 });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
+    ]);
+  });
+
+  it("prefers the issue the run actually holds over the watch host", async () => {
+    const HELD = "77777777-7777-4777-8777-777777777777";
+    const fake = counterDb(0, watching(), [HELD], {}, host());
+
+    // The run holds a task of its own and is writing somewhere else: the audit
+    // row must name the claim it actually made, not the standing mandate.
+    await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toMatchObject({
+      allowed: true,
+      count: 1,
+    });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        details: expect.objectContaining({ sourceIssueId: HELD }),
+      }),
+    ]);
+  });
+
+  it("exempts a target the run holds even when a watch host is also configured", async () => {
+    const fake = counterDb(0, watching(), [TARGET], {}, host());
+
+    await expect(observeCrossIssueInfluence(fake.db as never, base)).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("ignores a host that is not assigned to this agent", async () => {
+    // A stale or hand-edited config must not widen somebody else's write
+    // surface: the snapshot names an issue, the gate checks the assignee.
+    const fake = counterDb(0, watching(), [], { [TARGET]: OTHER_AGENT }, host({ assigneeAgentId: OTHER_AGENT }));
+
+    await expect(observeCrossIssueInfluence(fake.db as never, base)).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "cross_issue_influence_run_context_required",
+        reason: "no_context_source_and_target_unbound",
+      },
+    });
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it.each(["done", "cancelled"])("ignores a %s host", async (status) => {
+    // The watch is over; a config left behind must not keep authorising writes.
+    const fake = counterDb(0, watching(), [], { [TARGET]: OTHER_AGENT }, host({ status }));
+
+    await expect(observeCrossIssueInfluence(fake.db as never, base)).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "cross_issue_influence_run_context_required",
+        reason: "no_context_source_and_target_unbound",
+      },
+    });
+  });
+
+  it("ignores a host that no longer exists", async () => {
+    const fake = counterDb(0, watching(), [], { [TARGET]: OTHER_AGENT }, null);
+
+    await expect(observeCrossIssueInfluence(fake.db as never, base)).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "cross_issue_influence_run_context_required",
+        reason: "no_context_source_and_target_unbound",
+      },
+    });
+  });
+
+  it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"])(
+    "does not let a %s run's watch host buy a write",
+    async (status) => {
+      // The live-run guard is unchanged: a finished run's writes are refused
+      // whichever source it names, because nothing can spend its budget after
+      // it has ended.
+      const fake = counterDb(0, { ...watching(), status }, [], { [TARGET]: OTHER_AGENT }, host());
+
+      await expect(observeCrossIssueInfluence(fake.db as never, base)).rejects.toMatchObject({
+        status: 403,
+        details: {
+          code: "cross_issue_influence_run_context_required",
+          reason: "terminal_status",
+        },
+      });
+      expect(fake.inserted).toEqual([]);
+    },
+  );
+
+  it("keeps a run with a real context source on master semantics", async () => {
+    // A run dispatched on a task must not gain a second, broader source from
+    // the watch config: its own issue stays exempt, everything else is capped
+    // against that issue, and the host is never read.
+    const contextful = counterDb(
+      0,
+      {
+        contextSnapshot: {
+          issueId: "66666666-6666-4666-8666-666666666666",
+          standingWatchIssueId: HOST,
+        },
+        status: "running",
+      },
+      [TARGET],
+      {},
+      host(),
+    );
+
+    await expect(observeCrossIssueInfluence(contextful.db as never, base)).resolves.toMatchObject({
+      allowed: true,
+      count: 1,
+    });
+    expect(contextful.inserted).toEqual([
+      expect.objectContaining({
+        details: expect.objectContaining({
+          sourceIssueId: "66666666-6666-4666-8666-666666666666",
+        }),
+      }),
+    ]);
+  });
+
+  it("leaves an unwatched task-less run exactly as strict as before", async () => {
+    const fake = counterDb(0, { contextSnapshot: {}, status: "running" }, [], { [TARGET]: OTHER_AGENT });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, base)).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "cross_issue_influence_run_context_required",
+        reason: "no_context_source_and_target_unbound",
       },
     });
     expect(fake.inserted).toEqual([]);

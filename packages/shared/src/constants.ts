@@ -207,6 +207,28 @@ export const INBOX_MINE_ISSUE_STATUSES = [
 ] as const;
 export const INBOX_MINE_ISSUE_STATUS_FILTER = INBOX_MINE_ISSUE_STATUSES.join(",");
 
+/**
+ * Statuses that can still host a standing watch
+ * (`runtimeConfig.heartbeat.standingWatchIssueId`).
+ *
+ * `blocked` is deliberately included and is the case that matters: a blocked
+ * issue can never be checked out, so a watch hosted on one can never reach the
+ * issue-side binding that otherwise gives a task-less run a write source.
+ * `done` / `cancelled` are excluded — a terminal host means the watch is over,
+ * and a stale config must not keep attributing writes to a finished mandate.
+ */
+export const STANDING_WATCH_HOST_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+] as const satisfies readonly IssueStatus[];
+export type StandingWatchHostIssueStatus =
+  (typeof STANDING_WATCH_HOST_ISSUE_STATUSES)[number];
+export const STANDING_WATCH_HOST_ISSUE_STATUS_SET: ReadonlySet<string> =
+  new Set(STANDING_WATCH_HOST_ISSUE_STATUSES);
+
 export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
 export const ISSUE_REVIEW_POLICIES = ["anyone", "not_creator", "human_only"] as const;

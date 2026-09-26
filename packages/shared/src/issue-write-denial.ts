@@ -284,13 +284,19 @@ export function describeIssueWriteDenial(
           description:
             `The run itself is valid and attributed — the *source* is what is missing. ` +
             `A cross-issue write must be charged to a task, and this run is bound to ` +
-            `none, so ${issue} could not be counted against the per-run budget.`,
+            `none, so ${issue} could not be counted against the per-run budget. A timer ` +
+            `wake arrives with no task by construction, so a run whose whole job is ` +
+            `cross-issue cannot make this write at all until it has one.`,
           whoCanAct: `${actor}, once the run is working on a task.`,
           sanctionedPath:
-            `Check out the task this run is working on (\`POST /api/issues/<id>/checkout\`) ` +
-            `and post the comment there; a cross-issue write then counts against the ` +
-            `per-run cap like any other. Do not resend \`X-Paperclip-Run-Id\` — this run ` +
-            `already carried it.`,
+            `Give the run a task, then post here. Check one out (` +
+            `\`POST /api/issues/<id>/checkout\`) and the write counts against the ` +
+            `per-run cap like any other, or record the finding on the issue you checked ` +
+            `out. If this run is a scheduled watch that owns no task at all, it needs a ` +
+            `standing host issue: set \`runtimeConfig.heartbeat.standingWatchIssueId\` on ` +
+            `the agent to the issue that holds the watch, and every timer wake carries ` +
+            `that issue as its write source. Do not resend \`X-Paperclip-Run-Id\` — this ` +
+            `run already carried it.`,
         };
       }
       return {

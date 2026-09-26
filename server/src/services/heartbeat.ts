@@ -93,6 +93,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  STANDING_WATCH_HOST_ISSUE_STATUS_SET,
   envBindingSchema,
   isEnvironmentDriverSupportedForAdapter,
   isToolConnectionAttentionHealth,
@@ -16754,6 +16755,12 @@ export function heartbeatService(
           heartbeat.dailySpendCentsLimit ??
           heartbeat.dailyBudgetCents,
       ),
+      // The issue a bare `heartbeat_timer` wake is charged to. Accepts an issue
+      // UUID or an issue identifier such as `PROJ-123`; `tickTimers` resolves
+      // and re-validates it on every wake, and `cross-issue-influence-limit.ts`
+      // re-validates again at write time, so a stale value can never widen a
+      // run's write surface.
+      standingWatchIssueId: readNonEmptyString(heartbeat.standingWatchIssueId),
     };
   }
 
@@ -16922,6 +16929,58 @@ export function heartbeatService(
       .limit(1)
       .then((rows) => rows[0] ?? null);
     return Boolean(row);
+  }
+
+  /**
+   * Resolve the issue a bare `heartbeat_timer` wake is charged to.
+   *
+   * A watch role's job is cross-issue by definition: its staleness rules comment
+   * on issues assigned to a human or to another agent, and its report goes to
+   * the board owner. A timer wake carries no task, so every one of those writes
+   * is refused with `no_context_source_and_target_unbound` unless the run first
+   * manufactures a source — by checking out an issue it owns, or by opening a
+   * new one. A watch can do neither: it owns no task, and opening filler
+   * tickets to unlock its own writes is the exact failure mode the cap exists
+   * to prevent. The host is often the one issue it *cannot* check out, because
+   * `checkout` refuses a blocked issue, which is precisely why a watch is often
+   * hosted on one, so the checkout-derived source can never resolve.
+   *
+   * Naming the host in `runtimeConfig.heartbeat.standingWatchIssueId` gives the
+   * wake a source to attribute cross-issue writes to. The 20-write per-run cap
+   * still applies to all of them: this buys attribution, not capacity.
+   *
+   * Returns the reason for a miss so `tickTimers` can report a misconfigured
+   * watch instead of silently waking a mute one.
+   */
+  async function resolveStandingWatchHost(
+    agent: typeof agents.$inferSelect,
+    raw: string,
+  ): Promise<{ issueId: string; identifier: string | null } | { issueId: null; reason: string }> {
+    const candidate = raw.trim();
+    if (!candidate) return { issueId: null, reason: "empty" };
+    if (!isUuidLike(candidate) && !/^[A-Za-z][A-Za-z0-9]*-\d+$/.test(candidate)) {
+      return { issueId: null, reason: "not_an_issue_reference" };
+    }
+    const idMatch = isUuidLike(candidate)
+      ? or(eq(issues.id, candidate), eq(issues.identifier, candidate.toUpperCase()))
+      : eq(issues.identifier, candidate.toUpperCase());
+    const host = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        assigneeAgentId: issues.assigneeAgentId,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, agent.companyId), idMatch))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!host) return { issueId: null, reason: "issue_not_found" };
+    if (host.assigneeAgentId !== agent.id) return { issueId: null, reason: "not_assigned_to_agent" };
+    if (!STANDING_WATCH_HOST_ISSUE_STATUS_SET.has(host.status)) {
+      return { issueId: null, reason: `issue_status_${host.status}` };
+    }
+    return { issueId: host.id, identifier: host.identifier ?? null };
   }
 
   async function markTimerHeartbeatChecked(
@@ -29833,6 +29892,7 @@ export function heartbeatService(
           checked: 0,
           enqueued: 0,
           skipped: 0,
+          standingWatchUnresolved: 0,
         };
       }
       const cutoff = await getWorktreeExecutionCutoff();
@@ -29848,6 +29908,7 @@ export function heartbeatService(
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+      let standingWatchUnresolved = 0;
 
       for (const agent of allAgents) {
         const invokability = evaluateAgentInvokability(
@@ -29888,6 +29949,34 @@ export function heartbeatService(
         );
         if (!timerClaim) continue;
 
+        // A watch role's timer wake is cross-issue work with no task to charge
+        // it to, so the host issue is resolved here and stamped on the run.
+        // Resolution failures are counted, never thrown: a misconfigured watch
+        // must not stop the scheduler, and the count is what makes the mute
+        // visible instead of silent.
+        let standingWatch: { issueId: string; identifier: string | null } | null = null;
+        if (policy.standingWatchIssueId) {
+          const resolved = await resolveStandingWatchHost(
+            agent,
+            policy.standingWatchIssueId,
+          );
+          if (resolved.issueId !== null) {
+            standingWatch = { issueId: resolved.issueId, identifier: resolved.identifier };
+          } else {
+            standingWatchUnresolved += 1;
+            logger.warn(
+              {
+                event: "standing_watch_host_unresolved",
+                agentId: agent.id,
+                companyId: agent.companyId,
+                configured: policy.standingWatchIssueId,
+                reason: resolved.reason,
+              },
+              "standing watch host is not usable; timer wake will have no write source",
+            );
+          }
+        }
+
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
@@ -29899,6 +29988,15 @@ export function heartbeatService(
             reason: "interval_elapsed",
             now: now.toISOString(),
             timerClaimWasFirstHeartbeat: timerClaim.wasFirstHeartbeat,
+            ...(standingWatch
+              ? {
+                  // The attribution key the cross-issue gate reads. It is
+                  // deliberately not `issueId`: this names where the watch's
+                  // authority comes from, not the issue the run is working on.
+                  standingWatchIssueId: standingWatch.issueId,
+                  standingWatchIdentifier: standingWatch.identifier,
+                }
+              : {}),
           },
         });
         if (run) enqueued += 1;
@@ -29911,6 +30009,7 @@ export function heartbeatService(
         checked: checked + issueMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
         skipped: skipped + issueMonitors.skipped,
+        standingWatchUnresolved,
       };
     },
 
