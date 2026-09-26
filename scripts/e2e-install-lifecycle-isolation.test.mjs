@@ -50,8 +50,18 @@ test("the leg never adopts the production unit name as its own", () => {
 test("every service verb is pinned to the isolated instance", () => {
   // Anchored on the real invocation form so the pass/fail message strings
   // ("8d service stop exits 0") are not mistaken for commands.
+  //
+  // The shim path is matched with the optional quoting spelled out, because the
+  // script quotes it -- `"$SERVICE_SHIM" service stop` -- and a bare
+  // `SERVICE_SHIM service stop` pattern matches nothing there. That is a
+  // technicality, not a safety property: every verb in the shipped script does
+  // carry `--instance "$SERVICE_INSTANCE"`, and that is what this test exists to
+  // enforce. Anchoring on the quoting instead would have let the test go red on a
+  // correct script while saying nothing about an unpinned verb, which is the
+  // failure mode PET-255 is about.
+  const shim = '"?\\$SERVICE_SHIM"?';
   for (const verb of ["status", "logs", "stop", "uninstall"]) {
-    const uses = [...script.matchAll(new RegExp(`SERVICE_SHIM service ${verb}[^\\n]*`, "g"))].map((m) => m[0]);
+    const uses = [...script.matchAll(new RegExp(`${shim} service ${verb}[^\\n]*`, "g"))].map((m) => m[0]);
     assert.ok(uses.length > 0, `expected at least one \`SERVICE_SHIM service ${verb}\` call`);
     for (const use of uses) {
       assert.match(use, /--instance "\$SERVICE_INSTANCE"/, `\`service ${verb}\` must name the isolated instance: ${use}`);
@@ -67,22 +77,49 @@ test("onboard runs through the real shim, not the isolated one", () => {
   assert.doesNotMatch(script, /"\$SERVICE_SHIM" onboard/);
 });
 
-test("the isolated home is created under a guard, and the caller env is restored", () => {
-  // A failed mktemp leaves the variable empty, and `export HOME=""` then defeats
-  // the guard it was meant to install while the script keeps going.
+test("the isolated home is created under a guard, and no env var is moved", () => {
+  // A failed mktemp leaves the variable empty, and any consumer of it would then
+  // defeat the guard it was meant to install while the script keeps going.
   assert.match(script, /SERVICE_ISOHOME="\$\(mktemp -d "\$\{TMPDIR:-\/tmp\}\/e2e-service-iso\.XXXXXX"\)"/);
   assert.match(script, /if \[ -z "\$SERVICE_ISOHOME" \] \|\| \[ ! -d "\$SERVICE_ISOHOME" \]; then/);
-  // Steps 9 and 10 run after the leg and use $HOME, so the value must come back
-  // rather than being unset out from under them.
-  assert.match(script, /export HOME="\$REAL_HOME"/);
-  assert.doesNotMatch(script, /^\s*unset HOME XDG_CONFIG_HOME$/m);
+
+  // The leg does NOT move HOME. It used to: it exported HOME="$SERVICE_ISOHOME"
+  // and then exported HOME="$REAL_HOME" again for steps 9 and 10. That override
+  // was removed, for two measured reasons recorded at the call site in
+  // e2e-install-lifecycle.sh:
+  //
+  //   1. systemd's unit search path is captured when the *manager* starts, so a
+  //      unit file written under an overridden HOME/XDG_CONFIG_HOME is invisible
+  //      to `systemctl --user enable <name>` -- 8a failed on every host with a
+  //      running user manager, and no product change can rescue it.
+  //   2. install-store.ts keys cliRoot to PAPERCLIP_HOME but shimPath to $HOME,
+  //      so moving one of them produces exactly the split-root state that
+  //      managed-install-check.ts reports as blocking.
+  //
+  // Isolation is now the distinct instance id (below), and the mktemp'd dir is
+  // still load-bearing as the log capture path. So these assertions are the
+  // regression guard in the direction that matters: HOME must come back
+  // untouched, and must not be unset either. A future edit that reintroduces the
+  // override -- in any spelling, including the bare `unset HOME` it replaced --
+  // fails here instead of breaking 8a on every real host.
+  assert.doesNotMatch(script, /^\s*export HOME=/m, "the leg must not move HOME; isolate by instance id instead");
+  assert.doesNotMatch(script, /^\s*export XDG_CONFIG_HOME=/m, "the leg must not move XDG_CONFIG_HOME either");
+  assert.doesNotMatch(script, /^\s*unset HOME/m, "the leg must leave HOME set for steps 9 and 10");
+  assert.doesNotMatch(script, /REAL_HOME/, "REAL_HOME only existed to undo the removed override");
 });
 
-test("the preflight runs before the override, and the leg asserts it held", () => {
+test("the preflight runs before the leg takes its instance id, and the leg asserts it held", () => {
   const preflight = script.indexOf("is-active paperclipai.service");
-  const override = script.indexOf('export HOME="$SERVICE_ISOHOME"');
-  assert.ok(preflight > 0 && override > 0);
-  assert.ok(preflight < override, "the preflight must judge the host before the override moves HOME");
+  // The isolation lever, not an env override: `onboard` has no --instance flag,
+  // so PAPERCLIP_INSTANCE_ID is the only thing that renames the unit, and the
+  // derived SERVICE_NAME follows from it.
+  const isolation = script.indexOf('export PAPERCLIP_INSTANCE_ID="$SERVICE_INSTANCE"');
+  assert.ok(preflight > 0, "could not find the PET-52 preflight in the script");
+  assert.ok(isolation > 0, "could not find the leg's instance-id export in the script");
+  assert.ok(
+    preflight < isolation,
+    "the preflight must judge the host's own unit before the leg takes an instance id",
+  );
   // Post-condition: the production unit must not have been activated by the leg.
   assert.match(script, /8f isolation held/);
 });
