@@ -91,7 +91,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "GET /api/issues/{}/diagnostics/blockers": {
     "section": "Issues (Tasks)",
-    "description": "Read-only blocker diagnostic with `diagnosis`, readiness, and bounded anomaly flags"
+    "description": "Read-only blocker diagnostic with `diagnosis`, readiness, and bounded anomaly flags. Readiness is null whenever the answer would be partial, including when `unprojectedHold` reports a hold the first-class projection cannot name"
   },
   "GET /api/issues/{}/diagnostics/wakes": {
     "section": "Issues (Tasks)",

@@ -112,11 +112,13 @@ import {
   type CompanySearchQuery,
   type CompanySearchResponse,
   type ExecutionWorkspace,
+  type IssueBlockerAttentionReason,
   type IssueBlockerDiagnosticFlag,
   type IssueBlockerDiagnosticIssueSummary,
   type IssueBlockerDiagnosticNode,
   type IssueBlockerDiagnosticsReadiness,
   type IssueBlockerDiagnosticsResponse,
+  type IssueBlockerDiagnosticsUnprojectedHold,
   type IssueSubtreeDiagnosticEdge,
   type IssueSubtreeDiagnosticNode,
   type IssueSubtreeDiagnosticsResponse,
@@ -1498,6 +1500,16 @@ function buildIssueBlockerDiagnosticsResponse(input: {
     pendingFinalizeBlockerIssueIds: string[];
   };
   truncated: boolean;
+  /**
+   * The blocker aggregate, which counts more edge kinds than `blockers` does.
+   * `null` when it is unavailable, in which case no unprojected hold is
+   * claimed and the route behaves as it did before.
+   */
+  attention?: {
+    unresolvedBlockerCount: number;
+    reason: IssueBlockerAttentionReason;
+    sampleBlockerIdentifier: string | null;
+  } | null;
   maxBlockers?: number;
 }): IssueBlockerDiagnosticsResponse {
   const issue = toIssueBlockerDiagnosticSummary(input.issue);
@@ -1513,6 +1525,39 @@ function buildIssueBlockerDiagnosticsResponse(input: {
   const pendingFinalizeIds = new Set(
     input.readiness.pendingFinalizeBlockerIssueIds,
   );
+
+  // The aggregate counts every hold the server enforces; the list above
+  // projects first-class dependency edges only. The difference is the number of
+  // holds a reader would otherwise be told do not exist. Clamped at zero
+  // because the two are computed by different walks and the aggregate is the
+  // one that has seen a hold this projection cannot name — never the other way.
+  const unprojectedHoldCount = input.attention
+    ? Math.max(
+        0,
+        input.attention.unresolvedBlockerCount - unresolvedIds.size,
+      )
+    : 0;
+  // The aggregate's sample is an identifier this route has not authorized. It
+  // can name a blocker reached through an edge kind the projection does not
+  // model, so it is echoed only when it matches a blocker already cleared for
+  // this actor. Anything else would put a coordinate in the response that the
+  // same response says is outside the actor's boundary.
+  const sampleBlockerIdentifier =
+    input.attention?.sampleBlockerIdentifier &&
+    input.visibleBlockers.some(
+      (blocker) => blocker.identifier === input.attention?.sampleBlockerIdentifier,
+    )
+      ? input.attention.sampleBlockerIdentifier
+      : null;
+  const unprojectedHold: IssueBlockerDiagnosticsUnprojectedHold | null =
+    input.truncated || !input.attention
+      ? null
+      : {
+          count: unprojectedHoldCount,
+          reason: input.attention.reason,
+          sampleBlockerIdentifier,
+        };
+  const hasUnprojectedHold = unprojectedHold !== null && unprojectedHold.count > 0;
 
   const blockers: IssueBlockerDiagnosticNode[] = input.visibleBlockers.map(
     (blockerRow) => {
@@ -1536,16 +1581,23 @@ function buildIssueBlockerDiagnosticsResponse(input: {
     },
   );
 
-  const readiness: IssueBlockerDiagnosticsReadiness | null = completeVisibleSet
-    ? {
-        allBlockersDone: input.readiness.allBlockersDone,
-        isDependencyReady: input.readiness.isDependencyReady,
-        unresolvedBlockerCount:
-          input.readiness.unresolvedBlockerIssueIds.length,
-        pendingFinalizeBlockerCount:
-          input.readiness.pendingFinalizeBlockerIssueIds.length,
-      }
-    : null;
+  // An unprojected hold makes the readiness answer partial, exactly as a
+  // truncated set or an authorization boundary does. Reporting
+  // `isDependencyReady: true` here is the specific defect: the write path
+  // refuses the move on the strength of a hold this object says does not
+  // exist, so the route is telling a reader to attempt something the server
+  // will reject.
+  const readiness: IssueBlockerDiagnosticsReadiness | null =
+    completeVisibleSet && !hasUnprojectedHold
+      ? {
+          allBlockersDone: input.readiness.allBlockersDone,
+          isDependencyReady: input.readiness.isDependencyReady,
+          unresolvedBlockerCount:
+            input.readiness.unresolvedBlockerIssueIds.length,
+          pendingFinalizeBlockerCount:
+            input.readiness.pendingFinalizeBlockerIssueIds.length,
+        }
+      : null;
   const reportedOmittedUnauthorizedBlockerCount = input.truncated
     ? null
     : omittedUnauthorizedBlockerCount;
@@ -1557,12 +1609,14 @@ function buildIssueBlockerDiagnosticsResponse(input: {
       blockers,
       readiness,
       omittedUnauthorizedBlockerCount: reportedOmittedUnauthorizedBlockerCount,
+      unprojectedHold,
       truncated: input.truncated,
       maxBlockers: input.maxBlockers ?? ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
     }),
     readiness,
     blockers,
     omittedUnauthorizedBlockerCount: reportedOmittedUnauthorizedBlockerCount,
+    unprojectedHold,
     truncated: input.truncated,
     caps: {
       maxBlockers: input.maxBlockers ?? ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
@@ -1575,6 +1629,7 @@ function buildIssueBlockerDiagnosis(input: {
   blockers: IssueBlockerDiagnosticNode[];
   readiness: IssueBlockerDiagnosticsReadiness | null;
   omittedUnauthorizedBlockerCount: number | null;
+  unprojectedHold: IssueBlockerDiagnosticsUnprojectedHold | null;
   truncated: boolean;
   maxBlockers: number;
 }) {
@@ -1589,6 +1644,21 @@ function buildIssueBlockerDiagnosis(input: {
     return `One or more blockers for ${blockerDiagnosticLabel(
       input.issue,
     )} are outside this actor's authorization boundary, so this diagnosis only covers visible blockers.`;
+  }
+  // Checked before the empty-list sentence below, because that sentence is a
+  // negative and this is the case that makes it false. `blockers` is empty
+  // here precisely because the hold is not a first-class dependency edge.
+  if (input.unprojectedHold && input.unprojectedHold.count > 0) {
+    const sample = input.unprojectedHold.sampleBlockerIdentifier
+      ? ` One of them is ${input.unprojectedHold.sampleBlockerIdentifier}.`
+      : "";
+    return `${blockerDiagnosticLabel(
+      input.issue,
+    )} is blocked by ${input.unprojectedHold.count} hold${
+      input.unprojectedHold.count === 1 ? "" : "s"
+    } that ${
+      input.unprojectedHold.count === 1 ? "is" : "are"
+    } not first-class dependency edges, so they do not appear in the blocker list and readiness is not reported.${sample}`;
   }
   if (input.blockers.length === 0) {
     return input.issue.status === "blocked"
@@ -2136,6 +2206,12 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
   for (const node of input.visibleNodes) {
     const rawBlockers = input.blockersByIssueId.get(node.id) ?? [];
     const visibleBlockers = visibleBlockerIdsByIssueId.get(node.id) ?? [];
+    // `attention` is deliberately absent here. This is the bulk path over a
+    // whole subtree, and the aggregate is a per-issue walk; running it for
+    // every node would make a list endpoint cost what a single-issue read
+    // costs. The consequence is that a node held by a non-dependency edge is
+    // still reported here as having no first-class blocker relations. The
+    // single-issue blockers and wakes routes do not have that gap.
     const blockerResponse = buildIssueBlockerDiagnosticsResponse({
       issue: node,
       blockers: rawBlockers,
@@ -9036,6 +9112,7 @@ export function issueRoutes(
       visibleBlockers,
       readiness: diagnostic.readiness,
       truncated: diagnostic.truncated,
+      attention: diagnostic.attention,
     });
 
     logger.info(
@@ -9081,6 +9158,7 @@ export function issueRoutes(
       visibleBlockers,
       readiness: blockerDiagnostic.readiness,
       truncated: blockerDiagnostic.truncated,
+      attention: blockerDiagnostic.attention,
     });
     const response = buildIssueWakeDiagnosticsResponse({
       issue,

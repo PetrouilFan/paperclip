@@ -251,12 +251,40 @@ export interface IssueBlockerDiagnosticsReadiness {
   pendingFinalizeBlockerCount: number;
 }
 
+/**
+ * A hold that `blockerAttention` counts and this projection does not model.
+ *
+ * `blockers` lists first-class dependency edges only. `blockerAttention`
+ * aggregates more than that — tree holds and attention/watchdog relations
+ * among them — so an issue can be held, refused every status change, and
+ * still come back from this route with an empty `blockers` array. That is the
+ * case this type exists to make visible.
+ */
+export interface IssueBlockerDiagnosticsUnprojectedHold {
+  /** Holds the server is enforcing that this projection does not model. */
+  count: number;
+  /** Why the hold exists, from the aggregate that found it. */
+  reason: IssueBlockerAttentionReason;
+  /** One identifier a reader can look up, so the hold is not just a number. */
+  sampleBlockerIdentifier: string | null;
+}
+
 export interface IssueBlockerDiagnosticsResponse {
   issue: IssueBlockerDiagnosticIssueSummary;
   diagnosis: string | null;
+  /**
+   * `null` when the answer would be partial — truncated, partly outside the
+   * actor's authorization, or carrying an unprojected hold. It is never
+   * `isDependencyReady: true` for an issue the write path refuses to move.
+   */
   readiness: IssueBlockerDiagnosticsReadiness | null;
   blockers: IssueBlockerDiagnosticNode[];
   omittedUnauthorizedBlockerCount: number | null;
+  /**
+   * Holds this route cannot project. `null` when the count is unknowable
+   * (truncated). Zero is a real answer and means the aggregate agrees.
+   */
+  unprojectedHold: IssueBlockerDiagnosticsUnprojectedHold | null;
   truncated: boolean;
   caps: {
     maxBlockers: number;

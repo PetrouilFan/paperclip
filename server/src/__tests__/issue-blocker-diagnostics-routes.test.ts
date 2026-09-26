@@ -388,4 +388,111 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.diagnosis).toContain("truncated at 100 blockers");
     expect(res.body.caps).toEqual({ maxBlockers: 100 });
   });
+  it("does not report a tree-held issue as having no blockers, and withholds readiness", async () => {
+    // The measured defect: an issue held by a live child, with no first-class
+    // dependency edge, came back as `isDependencyReady: true` and the sentence
+    // "is blocked but has no first-class blocker relations" — while the write
+    // path refused the move. The sentence is a negative, and the aggregate the
+    // server enforces with contradicts it.
+    const company = await seedCompany(db, "TreeHold");
+    const project = await seedProject(db, company.id, "Tree hold project");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Root held by its child",
+      status: "blocked",
+    });
+    await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live child",
+      status: "in_progress",
+      parentId: root.id,
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.blockers).toEqual([]);
+    // The negative sentence is gone.
+    expect(res.body.diagnosis).not.toContain("no first-class blocker relations");
+    expect(res.body.diagnosis).toContain("not first-class dependency edges");
+    // And the answer that invited the refused write is withheld.
+    expect(res.body.readiness).toBeNull();
+    expect(res.body.unprojectedHold.count).toBe(1);
+  });
+
+  it("keeps readiness for a correctly blocked issue whose blockers are all projected", async () => {
+    // The negative control. Without this, "withhold readiness" would be
+    // indistinguishable from "never report readiness".
+    const company = await seedCompany(db, "ProjectedHold");
+    const project = await seedProject(db, company.id, "Projected project");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Root held by a dependency edge",
+      status: "blocked",
+    });
+    const blocker = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Real blocker",
+      status: "in_progress",
+    });
+    await blockIssue(db, company.id, blocker.id, root.id);
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.blockers).toHaveLength(1);
+    expect(res.body.readiness).not.toBeNull();
+    expect(res.body.readiness.isDependencyReady).toBe(false);
+    expect(res.body.unprojectedHold.count).toBe(0);
+  });
+
+  it("never names an unprojected hold the actor cannot see", async () => {
+    // The aggregate's sample identifier has not been authorized by this route.
+    // Echoing it would put a coordinate in a response that simultaneously
+    // reports a boundary.
+    const company = await seedCompany(db, "UnauthorisedSample");
+    const project = await seedProject(db, company.id, "Boundary project");
+    const agent = await seedAgent(db, company.id);
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Scoped root",
+      status: "blocked",
+    });
+    const hiddenChild = await seedIssue(db, {
+      companyId: company.id,
+      projectId: null,
+      title: "Child outside the boundary",
+      status: "in_progress",
+      parentId: root.id,
+    });
+    const visibleBlocker = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Visible blocker",
+      status: "in_progress",
+    });
+    await blockIssue(db, company.id, visibleBlocker.id, root.id);
+    await attachLowTrustRun(db, {
+      company,
+      agent,
+      allowedProject: project,
+      root,
+      visibleBlocker,
+    });
+
+    const res = await request(createApp(db, agentActor(company, agent, randomUUID())))
+      .get(`/api/issues/${root.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain(hiddenChild.id);
+    expect(res.body.unprojectedHold.sampleBlockerIdentifier).toBeNull();
+  });
 });

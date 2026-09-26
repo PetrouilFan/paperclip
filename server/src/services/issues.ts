@@ -3690,6 +3690,37 @@ async function terminalExplicitBlockersByRoot(
   return terminalByRoot;
 }
 
+/**
+ * The blocker aggregate for one issue, or null when the issue does not exist.
+ *
+ * The blocker diagnostics route projects first-class dependency edges. This
+ * aggregate counts more edge kinds than that, so it is the only thing that can
+ * say "the issue is held, and not by anything in the list you are about to
+ * read". Returns null for a missing issue so the route can keep its own 404.
+ */
+async function getBlockerAttentionForDiagnostics(
+  issueId: string,
+  db: Db,
+): Promise<IssueBlockerAttention | null> {
+  const row = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      parentId: issues.parentId,
+      identifier: issues.identifier,
+      title: issues.title,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+    })
+    .from(issues)
+    .where(eq(issues.id, issueId))
+    .then((rows) => rows[0] ?? null);
+  if (!row) return null;
+  const map = await listIssueBlockerAttentionMap(db, row.companyId, [row]);
+  return map.get(row.id) ?? null;
+}
+
 async function listIssueBlockerAttentionMap(
   dbOrTx: any,
   companyId: string,
@@ -8586,6 +8617,7 @@ export function issueService(db: Db) {
         readiness:
           readiness.get(issue.id) ?? createIssueDependencyReadiness(issue.id),
         truncated: blockerRows.length > cappedMax,
+        attention: await getBlockerAttentionForDiagnostics(issueId, db),
       };
     },
 
