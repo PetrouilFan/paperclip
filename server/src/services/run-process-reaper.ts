@@ -5,6 +5,10 @@ import {
   isPidAlive,
   isProcessGroupAlive,
 } from "./local-service-supervisor.js";
+import {
+  resolveInstanceDatabaseGuard,
+  type InstanceDatabaseGuard,
+} from "./instance-database-guard.js";
 
 /**
  * A run that dies by process loss can leave its own descendant tree running.
@@ -35,6 +39,11 @@ import {
  *    A pgid is a recyclable number and the run's group is already known dead
  *    when the process-loss path gets here, so "the group is alive" is not
  *    evidence of anything.
+ *  - It never signals the instance's live embedded PostgreSQL, or anything that
+ *    supervises it. See `instance-database-guard.ts`: a leaked-tree heuristic
+ *    cannot tell a healthy database owner from an orphan, so ownership of the
+ *    database is checked directly and the group kill is refused outright when
+ *    it would reach it.
  *  - Re-running it after a successful reap finds nothing and is a no-op.
  */
 
@@ -63,6 +72,19 @@ export interface RunProcessReapResult {
    * scratch sweep still runs and still reaps anything it can prove.
    */
   refusedUnverifiedGroup: boolean;
+  /**
+   * Set when the run's recorded group contains the instance's live embedded
+   * PostgreSQL, or a process that supervises it. `process.kill(-pgid)` cannot
+   * exempt one member, so the whole group is left alone and only the
+   * scratch-directory sweep runs.
+   */
+  refusedProtectedGroup: boolean;
+  /**
+   * The postmaster and its ancestor chain, as protected for this call. Empty
+   * when no database was found to protect, which is the normal case for a test
+   * or a server that is not using an embedded database.
+   */
+  protectedPids: number[];
   skippedReason: "not_linux" | "no_anchor" | null;
   errors: string[];
 }
@@ -176,8 +198,8 @@ function processReferencesDir(pid: number, dir: string): boolean {
   return false;
 }
 
-function collectSelfProtectedPids(): Set<number> {
-  const protectedPids = new Set<number>([process.pid, process.ppid]);
+function collectSelfProtectedPids(extra: number[] = []): Set<number> {
+  const protectedPids = new Set<number>([process.pid, process.ppid, ...extra]);
   const ownGroup = readProcessGroupId(process.pid);
   if (ownGroup === null) return protectedPids;
   for (const pid of readProcNumericEntries()) {
@@ -215,6 +237,7 @@ function signalPid(pid: number, signal: NodeJS.Signals) {
 }
 
 /**
+/**
  * Does a live member of `processGroupId` still prove the group belongs to the
  * run, by naming the run's scratch directory?
  *
@@ -234,6 +257,20 @@ function groupHasAnchoredMember(
     if (processReferencesDir(pid, dir)) return true;
   }
   return false;
+}
+
+/**
+ * True when any protected pid is a member of `groupId`.
+ *
+ * Membership is read from /proc rather than assumed from ancestry, because the
+ * protected set is exactly the ancestry of the postmaster and the question is
+ * whether the kernel put any of it in the group the run recorded.
+ */
+function groupContainsProtected(
+  groupId: number,
+  protectedPids: number[],
+): boolean {
+  return protectedPids.some((pid) => readProcessGroupId(pid) === groupId);
 }
 
 /**
@@ -257,46 +294,68 @@ async function reapRunProcessGroup(
   dir: string | null,
   uid: number | null,
   graceMs: number,
+  guard: InstanceDatabaseGuard | null,
 ): Promise<{
   signalled: boolean;
   refusedOwnGroup: boolean;
   refusedUnverifiedGroup: boolean;
+  refusedProtectedGroup: boolean;
 }> {
-  const refused = { signalled: false, refusedOwnGroup: false, refusedUnverifiedGroup: false };
+  const notSignalled = {
+    signalled: false,
+    refusedOwnGroup: false,
+    refusedUnverifiedGroup: false,
+    refusedProtectedGroup: false,
+  };
   if (
     process.platform === "win32" ||
     processGroupId === null ||
     !Number.isInteger(processGroupId) ||
     processGroupId <= 0
   ) {
-    return refused;
+    // No usable group recorded: the scratch sweep is the only remaining anchor.
+    return notSignalled;
   }
   // Never signal our own group: that is the server, and a run that inherited
   // it must be handled by the directory sweep instead.
   if (readProcessGroupId(process.pid) === processGroupId) {
-    refused.refusedOwnGroup = true;
-    return refused;
+    return { ...notSignalled, refusedOwnGroup: true };
+  }
+  // A group signal is all-or-nothing. If the instance's database, or the
+  // process supervising it, sits in this group, killing the group is exactly
+  // the outage this guard exists to prevent, so nothing in it is signalled.
+  // This is checked before the anchoring gate because a group can be both
+  // anchored to the run and hold the database — the anchoring evidence proves
+  // the group is the run's, which is precisely when signalling it would be
+  // fatal.
+  if (guard && groupContainsProtected(processGroupId, guard.protectedPids)) {
+    return { ...notSignalled, refusedProtectedGroup: true };
   }
   if (!isProcessGroupAlive(processGroupId)) {
-    return { signalled: true, refusedOwnGroup: false, refusedUnverifiedGroup: false };
+    return { ...notSignalled, signalled: true };
   }
   if (dir === null || !groupHasAnchoredMember(processGroupId, dir, uid)) {
-    return { signalled: false, refusedOwnGroup: false, refusedUnverifiedGroup: true };
+    return { ...notSignalled, refusedUnverifiedGroup: true };
   }
+  const signalled = (): {
+    signalled: boolean;
+    refusedOwnGroup: false;
+    refusedUnverifiedGroup: false;
+    refusedProtectedGroup: false;
+  } => ({
+    signalled: !isProcessGroupAlive(processGroupId as number),
+    refusedOwnGroup: false,
+    refusedUnverifiedGroup: false,
+    refusedProtectedGroup: false,
+  });
   try {
     process.kill(-processGroupId, "SIGTERM");
   } catch {
-    return {
-      signalled: !isProcessGroupAlive(processGroupId),
-      refusedOwnGroup: false,
-      refusedUnverifiedGroup: false,
-    };
+    return signalled();
   }
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!isProcessGroupAlive(processGroupId)) {
-      return { signalled: true, refusedOwnGroup: false, refusedUnverifiedGroup: false };
-    }
+    if (!isProcessGroupAlive(processGroupId)) return signalled();
     await delay(100);
   }
   try {
@@ -304,11 +363,7 @@ async function reapRunProcessGroup(
   } catch {
     // Group already gone; fall through to the verification sweep.
   }
-  return {
-    signalled: !isProcessGroupAlive(processGroupId),
-    refusedOwnGroup: false,
-    refusedUnverifiedGroup: false,
-  };
+  return signalled();
 }
 
 /**
@@ -329,8 +384,13 @@ async function reapScratchAnchoredProcesses(
   graceMs: number,
   uid: number | null,
   result: RunProcessReapResult,
+  guard: InstanceDatabaseGuard | null,
 ): Promise<void> {
-  const protect = collectSelfProtectedPids();
+  // The postmaster is not expected to match the scratch directory -- it is
+  // spawned with a scrubbed environment -- but that is a property of
+  // @embedded-postgres rather than a guarantee this module should rely on, so
+  // the database and its supervisors are excluded by pid.
+  const protect = collectSelfProtectedPids(guard?.protectedPids ?? []);
   const matched = new Set<number>();
   const signalled = new Set<number>();
   const killed = new Set<number>();
@@ -399,10 +459,17 @@ async function reapScratchAnchoredProcesses(
  * Bounded: it only ever considers same-uid processes that name the run's
  * scratch directory, or a recorded process group whose ownership it can still
  * verify. Idempotent: a second call after a successful reap matches nothing.
+ *
+ * `databaseDataDir` is the instance's embedded PostgreSQL data directory. When
+ * the instance is using an embedded database, pass it: the database and
+ * anything supervising it are then never signalled, and a recorded group that
+ * contains them is refused whole. Omitting it is safe only where no live
+ * database can be at risk.
  */
 export async function reapLostRunProcessTree(input: {
   processGroupId?: number | null;
   scratchDir?: string | null;
+  databaseDataDir?: string | null;
   graceMs?: number;
 }): Promise<RunProcessReapResult> {
   const result: RunProcessReapResult = {
@@ -414,6 +481,8 @@ export async function reapLostRunProcessTree(input: {
     killedPids: [],
     refusedOwnGroup: false,
     refusedUnverifiedGroup: false,
+    refusedProtectedGroup: false,
+    protectedPids: [],
     skippedReason: null,
     errors: [],
   };
@@ -422,6 +491,9 @@ export async function reapLostRunProcessTree(input: {
     result.skippedReason = "not_linux";
     return result;
   }
+
+  const guard = resolveInstanceDatabaseGuard(input.databaseDataDir);
+  result.protectedPids = guard?.protectedPids ?? [];
 
   const groupId = input.processGroupId ?? null;
   if (groupId !== null) {
@@ -442,13 +514,14 @@ export async function reapLostRunProcessTree(input: {
   const graceMs = input.graceMs ?? SIGTERM_GRACE_MS;
   try {
     if (groupId !== null) {
-      const group = await reapRunProcessGroup(groupId, dir, uid, graceMs);
+      const group = await reapRunProcessGroup(groupId, dir, uid, graceMs, guard);
       result.groupSignalled = group.signalled;
       result.refusedOwnGroup = group.refusedOwnGroup;
       result.refusedUnverifiedGroup = group.refusedUnverifiedGroup;
+      result.refusedProtectedGroup = group.refusedProtectedGroup;
     }
     if (dir) {
-      await reapScratchAnchoredProcesses(dir, graceMs, uid, result);
+      await reapScratchAnchoredProcesses(dir, graceMs, uid, result, guard);
     }
   } catch (error) {
     result.errors.push(error instanceof Error ? error.message : String(error));
