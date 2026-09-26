@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 // green through any divergence whatsoever.
 import {
   isObservedHotRestartTargetAlive,
+  parseHotRestartIntent,
   readProcessStartedAt as readServerProcessStartedAt,
 } from "../../../server/src/services/hot-restart.js";
 import type { HotRestartIntent } from "../../../server/src/services/hot-restart.js";
@@ -356,5 +357,173 @@ describe("what the parity is for: the guard's exact branch", () => {
       alive: true,
       startedAt: respelled,
     })).toBe(true);
+  });
+});
+
+// The block above characterises `previousServerStartedAt`, and it concludes that
+// the guard needs the *instant*, not the spelling -- because that field is
+// normalised on the way in and parsed on the way out. This block characterises
+// its sibling, `previousServerIdentity`, and the conclusion is the opposite.
+//
+// These are characterisation tests. Every `false` below is the answer the code
+// gives **today**, pinned so that a later change to the identity path cannot
+// land without someone reading a diff that says what flipped. None of them
+// assert what the answer ought to be. Deciding that is a separate question
+// (PET-334 step 2), and it is not a question this suite can answer: the server's
+// own `hot-restart.test.ts` deliberately uses opaque tokens like
+// "server-boot-a" for this field, so normalising it through a date parser would
+// drop a value the rest of the suite treats as legitimate. Whoever decides that
+// has to reconcile those fixtures too, and these tests will be the before-shot.
+describe("characterisation: previousServerIdentity is compared byte-for-byte", () => {
+  const CANONICAL = "2026-08-01T01:00:00.123Z";
+  // The same respelling the block above uses, so the two blocks differ only in
+  // what it is compared against.
+  const RESPELLED = "2026-08-01T01:00:00.123+00:00";
+  // Two different `requestedAt` values, because the branches that fall back to
+  // the pid-recycling heuristic ask "did the process start after the intent was
+  // requested?" and therefore answer from this field alone. REQUESTED_AFTER
+  // makes those branches answer false; REQUESTED_BEFORE makes them answer true.
+  // Holding both fixed is what lets each test below name the branch it means.
+  const REQUESTED_AFTER = "2026-08-01T01:05:00.000Z";
+  const REQUESTED_BEFORE = "2026-08-01T00:59:00.000Z";
+
+  function intentWith(fields: {
+    requestedAt?: string;
+    identity?: string | null;
+    startedAt?: string | null;
+  }): HotRestartIntent {
+    return {
+      version: 1,
+      requestedAt: fields.requestedAt ?? REQUESTED_AFTER,
+      previousServerPid: 4242,
+      previousServerIdentity: fields.identity ?? null,
+      previousServerStartedAt: fields.startedAt ?? null,
+      previousServerVersion: "1.0.0",
+      drainRequired: false,
+      requestedByRunId: null,
+      preflightActiveRunIds: [],
+    };
+  }
+
+  // The pid-collision block is only entered when the observation is for the
+  // same numeric pid, which is the realistic shape: `isOriginalServerProcessAlive`
+  // passes the replacement intent it found on disk. So every case that is
+  // about the identity path has to supply a `replacement` carrying that pid.
+  function observe(replacementIdentity: string | null, startedAt: string | null = CANONICAL) {
+    return {
+      alive: true,
+      startedAt: CANONICAL,
+      replacement: {
+        previousServerPid: 4242,
+        previousServerIdentity: replacementIdentity,
+        previousServerStartedAt: startedAt,
+      },
+    };
+  }
+
+  it("matches on the identity field when both sides are byte-identical", () => {
+    // The non-vacuous half. Without it, every `false` below would also follow
+    // from an `isObservedHotRestartTargetAlive` that answered false outright.
+    expect(Date.parse(RESPELLED)).toBe(Date.parse(CANONICAL));
+    expect(RESPELLED).not.toBe(CANONICAL);
+
+    expect(isObservedHotRestartTargetAlive(
+      intentWith({ identity: CANONICAL }),
+      observe(CANONICAL),
+    )).toBe(true);
+  });
+
+  it("answers false when the identity field is the same instant respelled", () => {
+    // Characterising. Both sides denote one instant and `Date.parse` agrees, but
+    // this branch is `===` on the raw strings, so the guard reports "not the same
+    // process". One re-spelling between the writer and the reader is enough, and
+    // the answer is wrong in the direction that strands a legitimate restart.
+    expect(isObservedHotRestartTargetAlive(
+      intentWith({ identity: RESPELLED }),
+      observe(CANONICAL),
+    )).toBe(false);
+
+    // The mirror, so this cannot pass merely because the observer was built with
+    // the identity on the wrong side.
+    expect(isObservedHotRestartTargetAlive(
+      intentWith({ identity: CANONICAL }),
+      observe(RESPELLED),
+    )).toBe(false);
+  });
+
+  it("absorbs that same value when the adjacent branch parses it instead", () => {
+    // The finding, in one function and two adjacent branches. The observation,
+    // the replacement's identity value and `requestedAt` are identical in both
+    // assertions below -- the only thing that changes is whether the intent
+    // carries an identity, and that is what decides which branch runs. With one,
+    // the comparison is `===` on the bytes and a re-spelling fails it. Without
+    // one, the very same string is handed to `Date.parse` and accepted, because
+    // `CANONICAL <= REQUESTED_AFTER`. So the field's spelling hazard is a
+    // property of how the intent is populated, not of the value.
+    expect(isObservedHotRestartTargetAlive(
+      intentWith({ identity: CANONICAL }),
+      observe(RESPELLED),
+    )).toBe(false);
+
+    expect(isObservedHotRestartTargetAlive(
+      intentWith({ identity: null }),
+      observe(RESPELLED),
+    )).toBe(true);
+  });
+
+  it("does not fall through to the start-time field, which holds the same instant", () => {
+    // Both intents below carry `previousServerStartedAt` as CANONICAL and the
+    // observation reports the same start time, so the start-time comparison would
+    // answer true in both cases. The first cannot reach it: the identity branch
+    // returns from inside the pid-collision block, and the fallback beneath it
+    // answers from `requestedAt` rather than from the start times. `REQUESTED_BEFORE`
+    // is chosen so that every fallback here answers false, which is what makes
+    // this a statement about the identity branch and not about the fixtures.
+    expect(isObservedHotRestartTargetAlive(
+      intentWith({ identity: RESPELLED, startedAt: CANONICAL, requestedAt: REQUESTED_BEFORE }),
+      observe(CANONICAL, CANONICAL),
+    )).toBe(false);
+
+    // The comparison that *would* have answered true, reached by dropping the
+    // replacement so the pid-collision block is skipped entirely. This is what
+    // makes the assertion above a statement about unreachability rather than
+    // about these particular values.
+    expect(isObservedHotRestartTargetAlive(
+      intentWith({ startedAt: CANONICAL, requestedAt: REQUESTED_BEFORE }),
+      { alive: true, startedAt: CANONICAL },
+    )).toBe(true);
+  });
+
+  it("survives a persistence round trip that leaves the identity verbatim", () => {
+    // The cause, pinned at the boundary where it happens. `parseHotRestartIntent`
+    // is where a stored intent becomes a value again, and its two fields are
+    // normalised differently: the start time goes through `asDateString` (parse,
+    // re-emit `toISOString()`) and the identity through `asString` (a trim-length
+    // check, nothing more). So a re-spelling survives here and is still there at
+    // the `===` above, while its sibling has already been collapsed.
+    const parsed = parseHotRestartIntent({
+      version: 1,
+      requestedAt: REQUESTED_AFTER,
+      previousServerPid: 4242,
+      previousServerIdentity: RESPELLED,
+      previousServerStartedAt: RESPELLED,
+    });
+
+    expect(parsed).not.toBeNull();
+    expect(parsed?.previousServerIdentity).toBe(RESPELLED);
+    expect(parsed?.previousServerStartedAt).toBe(CANONICAL);
+
+    // Pin the reason the identity survives, so this cannot be read as the parser
+    // simply not having run: a value that is not a date at all is kept too, which
+    // is the property `hot-restart.test.ts:178` depends on with its
+    // "server-boot-a" token.
+    const opaque = parseHotRestartIntent({
+      version: 1,
+      requestedAt: REQUESTED_AFTER,
+      previousServerPid: 4242,
+      previousServerIdentity: "server-boot-a",
+      previousServerStartedAt: null,
+    });
+    expect(opaque?.previousServerIdentity).toBe("server-boot-a");
   });
 });
