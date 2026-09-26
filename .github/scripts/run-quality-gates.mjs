@@ -13,7 +13,7 @@ import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
 import { checkTemplate } from './check-pr-template.mjs';
 import { checkLinkedIssue } from './check-pr-linked-issue.mjs';
 import { checkDedupSearch } from './check-pr-dedup-search.mjs';
-import { checkTestCoverage } from './check-pr-test-coverage.mjs';
+import { resolveTestCoverage } from './check-pr-test-coverage.mjs';
 import { checkLockfile } from './check-pr-lockfile.mjs';
 import { checkDependencies } from './check-pr-dependencies.mjs';
 import { checkReleaseBootstrap } from './check-pr-release-bootstrap.mjs';
@@ -192,7 +192,11 @@ async function main() {
       Promise.resolve(checkTemplate(prBody)),
       Promise.resolve(checkLinkedIssue(prBody, prTitle, { repoHasIssues })),
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
-      Promise.resolve(checkTestCoverage(files, prTitle)),
+      // Given a re-read, because a `prefix_mismatch` is the one verdict a
+      // stale `pulls/{n}/files` response can manufacture. See
+      // `resolveTestCoverage` for why only that verdict is re-read.
+      resolveTestCoverage(files, prTitle, () =>
+        fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN)),
       Promise.resolve(checkLockfile(files, author, branch)),
       checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
       checkReleaseBootstrap(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
