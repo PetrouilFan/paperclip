@@ -25,9 +25,17 @@ name: Slow Boot Proof
 # add to -- or be confused with -- the five unrelated legs in that file.
 #
 # Triggers on push to this branch as well as dispatch, for the reason
-# e2e-service-leg.yml documents: `actions/workflows/<file>` is resolved from
-# the default branch, so a dispatch only works once the file is on master,
-# while a push trigger runs the file as it exists on the pushed commit.
+# e2e-service-leg.yml documents: `actions/workflows/<file>` is resolved from the
+# default branch, so a dispatch only works once the file is on master, while a
+# push trigger runs the file as it exists on the pushed commit.
+#
+# A push runs PROBE mode and a dispatch runs PROOF mode, and the two default
+# that way on purpose. A push is how the lever that the proof needs gets chosen
+# -- there is one, and it is not the obvious one (run 36248896352 measured that
+# CPU oversubscription buys 2x where the bar needs 18x, because a boot is not
+# CPU-bound). The deliverable is the proof, so the deliverable is the run that
+# has to be chosen on purpose, and the measurement runs on whatever lands on
+# this branch.
 
 on:
   push:
@@ -36,19 +44,37 @@ on:
   workflow_dispatch:
     inputs:
       slow_boot_ref:
-        description: Git ref for the bootstrap tarball and the managed install
+        description: "Git ref for the bootstrap tarball and the managed install. Blank = the dispatched commit, so the build on disk is the build carrying the proof"
         required: false
-        default: master
+        default: ""
         type: string
       slow_boot_min_boot_seconds:
         description: The bar the proof boot must clear (systemd's default is 90)
         required: false
         default: "90"
         type: string
-      slow_boot_target_boot_seconds:
-        description: Where to aim the load, comfortably over the bar
+      slow_boot_mode:
+        # proof asserts DoD 1-7 and is the deliverable. probe measures what this
+        # host can be made to do, one warm boot per candidate lever, and prints
+        # the table. It asserts nothing, so the DoD steps below are skipped for
+        # it -- a probe that could only pass by asserting the proof would be a
+        # probe that cannot report a negative result.
+        description: proof (the deliverable) or probe (measure the load levers)
         required: false
-        default: "150"
+        default: proof
+        type: choice
+        options:
+          - proof
+          - probe
+      slow_boot_levers:
+        description: probe mode only - the levers to measure, in order
+        required: false
+        default: "idle cpu:x8 cpu:x32 io:64m io:8m io:1m swap:2048"
+        type: string
+      slow_boot_lever:
+        description: proof mode only - the lever that gets boot 2 over the bar
+        required: false
+        default: io:8m
         type: string
 
 permissions:
@@ -98,6 +124,19 @@ jobs:
             echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
           } >> "$GITHUB_ENV"
 
+      - name: Create a swapfile
+        # The swap:MB lever reports itself SKIP when there is no swapfile, so
+        # without this that row is missing from the probe table for a reason
+        # that has nothing to do with whether the lever works. GitHub runners
+        # ship with none. 4G so swap:2048 fits, and so the boot's own
+        # allocations have somewhere to be pushed to.
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          swapon --show
+
       - name: Record the prestate the proof depends on
         # The script's own preflight aborts on any of this, so a red here is
         # the same condition reported earlier rather than a mystery failure
@@ -128,7 +167,9 @@ jobs:
           # merged to master as d415c4196 and this commit is its descendant.
           SLOW_BOOT_REF: ${{ inputs.slow_boot_ref || github.sha }}
           SLOW_BOOT_MIN_BOOT_SECONDS: ${{ inputs.slow_boot_min_boot_seconds || '90' }}
-          SLOW_BOOT_TARGET_BOOT_SECONDS: ${{ inputs.slow_boot_target_boot_seconds || '150' }}
+          SLOW_BOOT_MODE: ${{ inputs.slow_boot_mode || (github.event_name == 'push' && 'probe' || 'proof') }}
+          SLOW_BOOT_LEVERS: ${{ inputs.slow_boot_levers || '' }}
+          SLOW_BOOT_LEVER: ${{ inputs.slow_boot_lever || 'io:8m' }}
         run: |
           set +e
           ./scripts/slow-boot-proof.sh 2>&1 | tee "$RUNNER_TEMP/slow-boot-proof.log"
@@ -138,6 +179,11 @@ jobs:
           exit "$code"
 
       - name: Require the DoD assertions
+        # Proof mode only. A probe reports measurements, not assertions, and
+        # forcing it through this gate would mean a probe that found no
+        # workable lever -- the most useful possible result -- still had to
+        # paint itself green to avoid going red.
+        if: ${{ (inputs.slow_boot_mode || (github.event_name == 'push' && 'probe' || 'proof')) == 'proof' }}
         # The script already exits non-zero on any FAIL, so this is belt and
         # braces -- and it is deliberately checking for named PASS lines rather
         # than for the absence of the word FAIL. A script that died before
@@ -167,11 +213,15 @@ jobs:
           exit "$missing"
 
       - name: Re-derive the headline number independently
+        # Proof mode only, for the same reason as the step above: there is no
+        # proof boot to re-derive in a probe.
+        #
         # Read the boot duration back out of the evidence block rather than
         # trusting the script's own comparison. Anchored on the field, not on
         # a bare number: the evidence line also carries the bar
         # ("152s (... bar >90s)"), so a looser match collects both numbers and
         # the comparison below is then run against a two-line string.
+        if: ${{ (inputs.slow_boot_mode || (github.event_name == 'push' && 'probe' || 'proof')) == 'proof' }}
         run: |
           ev="$RUNNER_TEMP/pet296-evidence.txt"
           test -f "$ev" || { echo "no evidence file at $ev"; exit 1; }

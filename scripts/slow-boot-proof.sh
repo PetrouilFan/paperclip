@@ -16,45 +16,83 @@ set -euo pipefail
 # that a fresh `paperclipai install` on a fresh machine inherits the budget.
 # This script runs the real installer and times the real unit.
 #
-# WHY THE BOOT IS MADE SLOW BY LOADING THE HOST
+# TWO MODES
 #
-# The outage this guards (board outage #4, 497s / NRestarts=6) was not a slow
-# machine, it was a slow boot on a *loaded* machine: the unit is Type=notify,
-# the embedded postmaster lives inside its cgroup, so READY=1 cannot be sent
-# until the database is accepting connections and migrations have finished.
-# Reproducing that means making the host slow, so that is what this does --
-# CPU oversubscription from outside the unit. It is deliberately the only
-# mechanism used, and specifically NOT:
+#   proof  the deliverable. One real install, one boot made to exceed 90s on
+#          purpose, and the DoD asserted on it.
+#   probe  measures what this host can actually be made to do, one boot per
+#          candidate lever, and prints the table. Exists because the obvious
+#          lever is wrong and guessing cost a cycle to find out (see below).
 #
-#   * a drop-in. DoD 4 forbids hand-editing the host to manufacture the proof.
-#     The whole point is that a fresh onboard inherits the budget, so the unit
-#     is read straight off disk after the installer writes it, its sha256 is
-#     taken, and it is re-checked at the end (assertion 7a/7b).
-#   * `systemctl set-property` / CPUQuota on the unit. That also writes a
-#     drop-in, so it is the same forbidden move wearing a different hat.
-#   * a cgroup move of the unit. Same reason.
+# WHY THE OBVIOUS LEVER IS WRONG (measured, run 36248896352)
 #
-# The load is sized from a MEASURED baseline boot of this very install rather
-# than guessed, because the runner's core count and the host's real boot time
-# are both unknown in advance. See the FACTOR arithmetic and the two-boot
-# structure below. Oversubscription is expressed as a multiple of nproc, so the
-# intended slowdown is the same on a 4-core runner as on a 16-core one.
+# The first version slowed the host with CPU oversubscription only, on the
+# theory that the outage was a loaded machine. On a clean runner:
 #
-# STRUCTURE (three boots, all measured, all on the real unit)
+#   boot 0  onboard, fresh db, all migrations, idle      9s
+#   boot 1  warm, idle (calibration baseline)            5s
+#   boot 2  warm, 190 CPU spinners on 4 cores            ~10s
+#
+# 190 spinners bought 2x, where the (r+1)/nproc model predicts ~48x. The boot
+# is not CPU-bound: `Type=notify` means READY=1 waits on the embedded
+# postmaster and migrations, which on an idle host is a short, largely serial,
+# largely *I/O-bound* sequence. Spinning cores contend for CPU the boot barely
+# uses. A boot that waits cannot be stretched by starving a CPU it is not using,
+# and the irreducible I/O wait is a floor no amount of CPU contention moves.
+# So the levers below are typed by WHAT they slow, and every boot records how
+# much CPU it actually got, so a weak lever can never again be mistaken for an
+# ineffective one.
+#
+#   idle     nothing. The control every other number is read against.
+#   cpu:N    N CPU spinners outside the unit's cgroup. Absolute count.
+#   cpu:xN   N * nproc spinners, so the same oversubscription on any runner.
+#   io:RATE  cgroup v2 `io.max` on the unit's cgroup: RATE bytes/sec of
+#            read+write, e.g. `io:8m`. This is the lever that speaks to the
+#            bottleneck, and it is also the closest stand-in for the real
+#            cause -- outage #4 was a host whose disk could not keep up, on a
+#            box where swap was exhausted and the postmaster was thrashing.
+#   swap:MB  hold MB resident to push the boot's own allocations onto a
+#            swapfile. Requires a swapfile; the workflow creates one and the
+#            lever reports itself skipped when there is none.
+#
+# DoD 4 is intact under all of them. `io.max` and swap are properties of the
+# machine, applied from outside: no drop-in is created, no unit property is
+# set, `systemctl set-property` is never called, and the unit file is hashed
+# before and after the proof and compared (assertions 7a/7b). Deliberately
+# NOT used, and why:
+#
+#   * a drop-in. DoD 4 forbids hand-editing the host to manufacture the proof;
+#     the point is that a fresh onboard inherits the budget.
+#   * `systemctl set-property` / CPUQuota / IOWeight on the unit. All of those
+#     write a drop-in -- the same forbidden move wearing a different hat.
+#   * a cgroup *move* of the unit. Same reason.
+#   * patching the server to sleep before it notifies. That would prove the
+#     budget is sufficient while proving nothing about a real boot.
+#
+# STRUCTURE (proof mode: four boots, all on the real unit)
 #
 #   boot 0  the onboard boot. Fresh instance, so this one pays for every
 #           migration. Reported, not asserted on: it is uncontrolled, because
 #           `onboard --install-service` installs and starts in one step.
-#   boot 1  warm baseline, unloaded. Calibrates the load for boot 2. Reported
-#           as `baselineBootSeconds`.
-#   boot 2  THE PROOF. Loaded host, then start. Asserts >90s to ready with
-#           NRestarts=0 and ActiveState=active. This is the number DoD 2 wants.
+#   boot 1  warm baseline, unloaded. Calibrates boot 2. Reported as
+#           `baselineBootSeconds`.
+#   boot 2  THE PROOF. The host is slowed on purpose, then start. Asserts >90s
+#           to ready with NRestarts=0 and ActiveState=active. This is the
+#           number DoD 2 wants.
+#   boot 3  THE CONTROL. The same lever, against a unit that differs from the
+#           rendered one in exactly one respect: TimeoutStartSec removed, so
+#           the 90s default applies. This is what makes boot 2 mean something.
+#           Without it, ">90s and it worked" is equally consistent with the
+#           budget being irrelevant. Asserted to FAIL with Result=timeout and
+#           NRestarts>=1 -- a control that passes is a broken control, so it
+#           is asserted to fail rather than merely reported.
 #
-# boot 1 is warm (migrations already applied) and boot 2 is warm too, so the
-# two are comparable and the calibration is not skewed by a fresh database.
-# A clean stop/start resets NRestarts (measured on systemd 261: kill -9 the
-# main pid -> NRestarts=1; stop; start -> NRestarts=0), so asserting
-# NRestarts=0 after boot 2 really does mean boot 2 needed zero restarts.
+# boot 1 and boot 2 are both warm, so they are comparable and the calibration
+# is not skewed by a fresh database. A clean stop/start resets NRestarts
+# (measured on systemd 261: kill -9 the main pid -> NRestarts=1; stop; start
+# -> NRestarts=0), so asserting NRestarts=0 after boot 2 really does mean boot
+# 2 needed zero restarts. The control's unit is restored and re-verified
+# byte-identical afterwards, so the host is left as it was found.
 #
 # HOST SAFETY
 #
@@ -74,43 +112,60 @@ set -euo pipefail
 # instance id is what makes the data dir fresh, so nothing else is needed.
 #
 # Env knobs:
-#   SLOW_BOOT_REPO               GitHub repo to install from (default PetrouilFan/paperclip)
-#   SLOW_BOOT_REF                ref/sha to install (default: this checkout's sha)
-#   SLOW_BOOT_INSTANCE           instance id (default pet296)
-#   SLOW_BOOT_MIN_BOOT_SECONDS   the bar the proof boot must clear (default 90)
-#   SLOW_BOOT_TARGET_BOOT_SECONDS where to aim the load (default 150)
-#   SLOW_BOOT_READY_TIMEOUT      hard cap on any single wait (default 420)
-#   SLOW_BOOT_MAX_LOAD_WORKERS   cap on oversubscription (default 256)
-#   SLOW_BOOT_KEEP_LOAD          1 = leave the unit running for inspection
+#   SLOW_BOOT_MODE              proof | probe (default proof)
+#   SLOW_BOOT_LEVERS            probe mode: space-separated lever list
+#   SLOW_BOOT_LEVER             proof mode: the lever that gets boot 2 over the bar
+#   SLOW_BOOT_REPO              GitHub repo to install from (default PetrouilFan/paperclip)
+#   SLOW_BOOT_REF               ref/sha to install (default: this checkout's sha)
+#   SLOW_BOOT_INSTANCE          instance id (default pet296)
+#   SLOW_BOOT_MIN_BOOT_SECONDS  the bar the proof boot must clear (default 90)
+#   SLOW_BOOT_READY_TIMEOUT     hard cap on any single wait (default 420)
+#   SLOW_BOOT_PROBE_CAP         hard cap on one probe boot (default 240)
+#   SLOW_BOOT_KEEP_LEVER        1 = leave the lever applied for inspection
 
+SLOW_BOOT_MODE="${SLOW_BOOT_MODE:-proof}"
+SLOW_BOOT_LEVERS="${SLOW_BOOT_LEVERS:-idle cpu:x8 cpu:x32 cpu:x64 io:64m io:8m io:1m swap:2048}"
+SLOW_BOOT_LEVER="${SLOW_BOOT_LEVER:-io:8m}"
 SLOW_BOOT_REPO="${SLOW_BOOT_REPO:-PetrouilFan/paperclip}"
 SLOW_BOOT_REF="${SLOW_BOOT_REF:-}"
 SLOW_BOOT_INSTANCE="${SLOW_BOOT_INSTANCE:-pet296}"
 SLOW_BOOT_MIN_BOOT_SECONDS="${SLOW_BOOT_MIN_BOOT_SECONDS:-90}"
-SLOW_BOOT_TARGET_BOOT_SECONDS="${SLOW_BOOT_TARGET_BOOT_SECONDS:-150}"
 SLOW_BOOT_READY_TIMEOUT="${SLOW_BOOT_READY_TIMEOUT:-420}"
-SLOW_BOOT_MAX_LOAD_WORKERS="${SLOW_BOOT_MAX_LOAD_WORKERS:-256}"
-SLOW_BOOT_KEEP_LOAD="${SLOW_BOOT_KEEP_LOAD:-0}"
+SLOW_BOOT_PROBE_CAP="${SLOW_BOOT_PROBE_CAP:-240}"
+SLOW_BOOT_KEEP_LEVER="${SLOW_BOOT_KEEP_LEVER:-0}"
 
 UNIT="paperclipai-${SLOW_BOOT_INSTANCE}.service"
 SHIM="$HOME/.local/bin/paperclipai"
 STORE="$HOME/.paperclip/cli"
 BOOT_CLI=""
-LOAD_PIDS=()
-LOAD_WORKERS=0
 CREATED="false"
 RESULTS=()
 FAILED=0
+TABLE=()
+
+# lever state, all released by lever_release / the EXIT trap
+LOAD_PIDS=()
+LOAD_WORKERS=0
+SWAP_PIDS=()
+IO_CG=""
+IO_DEV=""
+IO_PREV=""
 
 # --- output helpers -------------------------------------------------------
 note()  { printf '\n\033[1;34m== %s ==\033[0m\n' "$*"; }
 pass()  { RESULTS+=("PASS  $1"); printf '\033[1;32mPASS\033[0m %s\n' "$1"; }
 fail_() { RESULTS+=("FAIL  $1"); printf '\033[1;31mFAIL\033[0m %s\n' "$1"; FAILED=1; }
+skip()  { printf '\033[1;33mSKIP\033[0m %s\n' "$*"; }
 info()  { printf '      %s\n' "$*"; }
 die()   { printf '\033[1;31mABORT\033[0m %s\n' "$*" >&2; exit 1; }
 
+# `printf` with a leading dash in the format is a portability trap, and the
+# table is built from measured numbers, so keep every column non-empty and
+# space separated rather than padding by hand.
+row() { printf '      %-14s %8s %6s %6s %8s  %s\n' "$@"; }
+
 summarize() {
-  note "RESULTS ($SLOW_BOOT_REPO@$SLOW_BOOT_REF on $(uname -sm), $(nproc) cores)"
+  note "RESULTS ($SLOW_BOOT_REPO@$SLOW_BOOT_REF on $(uname -sm), $(nproc) cores, mode=$SLOW_BOOT_MODE)"
   if [ "${#RESULTS[@]}" -gt 0 ]; then printf '%s\n' "${RESULTS[@]}"; fi
   if [ "$FAILED" = "1" ]; then
     echo; echo "OVERALL: FAIL"
@@ -162,21 +217,27 @@ timespan_to_seconds() {
   echo "$total"
 }
 
+# --- levers ---------------------------------------------------------------
+# Every wait on a killed child goes through `|| true`. A child that ends on
+# SIGTERM makes `wait` return non-zero, and under `set -e` that is a silent
+# exit of the whole script -- which is exactly how run 36248896352 reported
+# `script_exit=1` with no FAIL and no ABORT, immediately after a proof boot
+# that had actually succeeded. Reproduced in isolation before the fix.
 load_stop() {
   local pid
   for pid in ${LOAD_PIDS[@]+"${LOAD_PIDS[@]}"}; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
   done
   for pid in ${LOAD_PIDS[@]+"${LOAD_PIDS[@]}"}; do
-    [ -n "$pid" ] && wait "$pid" 2>/dev/null
+    if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || true; fi
   done
+  LOAD_PIDS=()
+  LOAD_WORKERS=0
   return 0
 }
 
 # Add $1 more cpu workers. A tight arithmetic loop, no syscalls, no files:
-# pure oversubscription of the scheduler's CPU time, so the boot slows down for
-# the reason it slowed down in the outage (a busy host) and not because the disk
-# filled up or a fixture was corrupted.
+# pure oversubscription of the scheduler's CPU time.
 load_add() {
   local n="$1" i
   [ "$n" -ge 1 ] || return 0
@@ -187,21 +248,207 @@ load_add() {
   LOAD_WORKERS=$(( LOAD_WORKERS + n ))
 }
 
-cleanup() {
+# Hold $2 bytes resident in each of $1 processes, so the kernel has to put
+# them somewhere. With a swapfile present and already full of the other
+# holders, the boot's own anonymous pages get evicted -- which is the
+# mechanism behind outage #4, where swap was at 100% and the postmaster was
+# thrashing inside the unit's own boot.
+swap_add() {
+  local n="$1" bytes="$2" i
+  [ "$n" -ge 1 ] || return 0
+  for ((i = 0; i < n; i++)); do
+    ( timeout --signal=KILL 86400 perl -e '
+        my $b = $ARGV[0];
+        my @chunks = ("x" x (1024*1024)) x $b;
+        my $i = 0;
+        while (1) { $i = ($i + 1) % scalar @chunks; }
+      ' "$bytes" ) &
+    SWAP_PIDS+=("$!")
+  done
+}
+
+swap_stop() {
+  local pid
+  for pid in ${SWAP_PIDS[@]+"${SWAP_PIDS[@]}"}; do
+    if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+  done
+  for pid in ${SWAP_PIDS[@]+"${SWAP_PIDS[@]}"}; do
+    if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || true; fi
+  done
+  SWAP_PIDS=()
+  return 0
+}
+
+# Write to a cgroup file, escalating to sudo only if the plain write is
+# refused, and saying which of the two happened. Enabling a controller in a
+# subtree_control needs root even when the cgroup is otherwise yours.
+cg_write() {
+  local path="$1" value="$2"
+  if printf '%s' "$value" > "$path" 2>/dev/null; then
+    return 0
+  fi
+  if printf '%s' "$value" | sudo tee "$path" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 2
+}
+
+# cgroup v2 only creates io.max in a cgroup once `io` is in its PARENT's
+# cgroup.subtree_control, so the controller has to be switched on at every
+# level from the root down to the unit's parent. Enabling it needs the cgroup
+# to hold no processes directly (the "no internal process" rule), so failures
+# here are expected on some hosts and are reported, never assumed either way.
+io_enable() {
+  local target="$1" chain=() cur c rc
+  [ -d "/sys/fs/cgroup$target" ] || { info "io: no cgroup at $target"; return 1; }
+  cur="$target"
+  while [ "$cur" != "/" ] && [ -d "/sys/fs/cgroup$cur" ]; do
+    chain=("$cur" "${chain[@]+"${chain[@]}"}")
+    cur="$(dirname "$cur")"
+  done
+  for c in "${chain[@]+"${chain[@]}"}"; do
+    local sc="/sys/fs/cgroup$c/cgroup.subtree_control"
+    [ -f "$sc" ] || continue
+    grep -qw io "$sc" 2>/dev/null && continue
+    cg_write "$sc" "+io" || true
+  done
+  [ -f "/sys/fs/cgroup$target/io.max" ] || {
+    info "io: the io controller is not available for $target on this host"
+    info "io: (a cgroup holding processes directly cannot enable it for its children)"
+    return 1
+  }
+  return 0
+}
+
+# Which block device the instance's data actually lives on. io.max is keyed by
+# the physical device, so this has to be the real major:minor and not the
+# device the filesystem is mounted through.
+io_device() {
+  local dir="$1"
+  findmnt -no MAJ:MIN --target "$dir" 2>/dev/null | head -1 | tr -d ' '
+}
+
+# Apply the rate to both directions. A boot is mostly reads, but the
+# postmaster writes WAL and migrations write rows, so a read-only throttle
+# would let the boot's write path through untouched.
+io_apply() {
+  local dev="$1" rate="$2" file="/sys/fs/cgroup$IO_CG/io.max"
+  IO_PREV="$(cat "$file" 2>/dev/null || true)"
+  if ! printf '%s rbps=%s wbps=%s\n' "$dev" "$rate" "$rate" | sudo tee "$file" >/dev/null 2>&1; then
+    info "io: could not write $file"
+    return 1
+  fi
+  if ! grep -q "$dev rbps=$rate" "$file" 2>/dev/null; then
+    info "io: kernel did not accept the limit; read-back is: $(cat "$file" 2>/dev/null)"
+    return 1
+  fi
+  info "io: $file limited to $rate rbps/wbps on $dev"
+  return 0
+}
+
+io_release() {
+  [ -n "$IO_CG" ] || return 0
+  local file="/sys/fs/cgroup$IO_CG/io.max"
+  if [ -f "$file" ] && [ -n "$IO_DEV" ]; then
+    printf '%s rbps=max wbps=max\n' "$IO_DEV" | sudo tee "$file" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+lever_release() {
+  if [ "$SLOW_BOOT_KEEP_LEVER" = "1" ]; then return 0; fi
   load_stop
+  swap_stop
+  io_release
+  return 0
+}
+
+cleanup() {
+  lever_release
   # Only ever tear down the unit this script installed, and only after onboard
   # actually created it. The trap is registered before the preflight runs, so
   # without the CREATED guard the refusal path would stop a host's unit.
   [ "$CREATED" = "true" ] || return 0
-  if [ "$SLOW_BOOT_KEEP_LOAD" != "1" ]; then
-    systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
+  if [ "$SLOW_BOOT_KEEP_LEVER" != "1" ]; then
+    systemctl --user stop "paperclipai-${SLOW_BOOT_INSTANCE}.service" >/dev/null 2>&1 || true
     if [ -x "$SHIM" ]; then
       "$SHIM" service uninstall --instance "$SLOW_BOOT_INSTANCE" >/dev/null 2>&1 || true
     fi
   fi
   return 0
 }
-trap cleanup EXIT INT TERM
+
+# lever_apply <spec>. Returns 1 when the lever is not available on this host,
+# which the caller reports as SKIP rather than as a pass.
+lever_apply() {
+  local spec="$1" n
+  case "$spec" in
+    idle) info "lever: nothing applied (control)"; return 0 ;;
+    cpu:*)
+      n="${spec#cpu:}"
+      case "$n" in
+        x*) load_add $(( ${n#x} * $(nproc) )) ;;
+        *)  load_add "$n" ;;
+      esac
+      info "lever: ${LOAD_WORKERS} cpu spinners on $(nproc) cores"
+      return 0
+      ;;
+    swap:*)
+      n="${spec#swap:}"
+      if ! swapon --show 2>/dev/null | grep -q .; then
+        info "swap: no swapfile on this host, cannot apply swap:$n"
+        return 1
+      fi
+      swap_add 2 $(( n * 1024 * 1024 ))
+      # Give the kernel a moment to fault the pages in before the boot starts
+      # competing for them; otherwise the first moments of the boot are fast
+      # and the measurement flatters the lever.
+      sleep 5
+      info "lever: ${#SWAP_PIDS[@]} processes holding $n MB each, swap: $(free -m | awk '/^Swap:/{print $3"/"$2" MB used"}')"
+      return 0
+      ;;
+    io:*)
+      n="${spec#io:}"
+      if ! io_enable "$IO_CG"; then return 1; fi
+      IO_DEV="$(io_device "$HOME/.paperclip/instances/$SLOW_BOOT_INSTANCE")"
+      if [ -z "$IO_DEV" ]; then
+        info "io: could not resolve the block device for the instance data dir"
+        return 1
+      fi
+      if ! io_apply "$IO_DEV" "$n"; then return 1; fi
+      return 0
+      ;;
+    *) info "lever: unknown spec '$spec'"; return 1 ;;
+  esac
+}
+
+# --- host CPU accounting --------------------------------------------------
+# Sampled across a boot, so a boot that was "slow" while the host sat idle can
+# be told apart from one that was slow because the lever was actually biting.
+# Summed in the shell rather than in awk: the obvious awk version passes "|"
+# as a split() separator, which is an empty-matching regex, not a literal.
+CPU_BUSY=0
+CPU_IDLE=0
+cpu_accounting_reset() { CPU_BUSY=0; CPU_IDLE=0; }
+cpu_accounting_sample() {
+  local _tag u n s i iow irq sirq st _g _gn _rest
+  read -r _tag u n s i iow irq sirq st _g _gn _rest < /proc/stat || return 0
+  # guest and guest_nice are already counted inside user/nice, so they are
+  # read only to be discarded rather than added a second time.
+  CPU_BUSY=$(( CPU_BUSY + u + n + s + iow + irq + sirq + st ))
+  CPU_IDLE=$(( CPU_IDLE + i ))
+  return 0
+}
+cpu_percent() {
+  local total=$(( CPU_BUSY + CPU_IDLE ))
+  if [ "$total" -le 0 ]; then echo 0; else echo $(( 100 * CPU_BUSY / total )); fi
+}
+
+# Registered before the preflight so a lever can never be left applied because
+# the script died early. cleanup() returns immediately until onboard has
+# actually created a unit, so the refusal path cannot stop anything that
+# belongs to the host.
+trap 'cleanup' EXIT INT TERM
 
 # --- preflight ------------------------------------------------------------
 # A clean environment: no inherited Paperclip or build-mode state.
@@ -235,7 +482,8 @@ if [ -z "$SLOW_BOOT_REF" ]; then
   [ -n "$SLOW_BOOT_REF" ] || die "SLOW_BOOT_REF is unset and HEAD could not be resolved"
 fi
 info "repo=$SLOW_BOOT_REPO ref=$SLOW_BOOT_REF instance=$SLOW_BOOT_INSTANCE"
-info "unit=$UNIT"
+info "unit=$UNIT mode=$SLOW_BOOT_MODE"
+info "swap: $(swapon --show 2>/dev/null | tail -n +2 | wc -l) swap area(s), $(free -m | awk '/^Swap:/{print $2}') MB total"
 # The unit binds the server port. If something already holds it the boot would
 # fail for a reason that has nothing to do with the boot budget, and the
 # resulting Result=exit-code would be easy to misread as a start timeout.
@@ -315,6 +563,9 @@ note "4. The rendered unit (DoD 1)"
 UNIT_FILE="$(prop FragmentPath)"
 [ -n "$UNIT_FILE" ] && [ -f "$UNIT_FILE" ] || die "no unit file for $UNIT (FragmentPath='$UNIT_FILE')"
 info "unit file: $UNIT_FILE"
+# The cgroup the levers act on, and the device the instance data lives on.
+IO_CG="$(prop ControlGroup)"
+info "unit cgroup: ${IO_CG:-unknown}"
 # A drop-in here would mean the budget came from the host, not the renderer.
 DROPIN_DIR="${UNIT_FILE}.d"
 if [ -d "$DROPIN_DIR" ]; then
@@ -384,96 +635,187 @@ done
 BASELINE_BOOT="$(boot_seconds)"
 [ -n "$BASELINE_BOOT" ] || die "could not read the baseline boot duration"
 pass "5a baseline boot reached active in ${BASELINE_BOOT}s"
-
-# Size the load from what this host actually does, so the proof does not
-# depend on guessing the runner's core count or its real boot time.
-# With r busy workers and nproc cores, a CPU-bound process gets about
-# nproc/(r+1) of a core, so the slowdown is about (r+1)/nproc. Asking for a
-# factor F therefore means r = F*nproc - 1, which is why this is expressed as
-# a multiple of nproc and not as a raw worker count.
-NPROC="$(nproc)"
-DIVISOR="$BASELINE_BOOT"
-[ "$DIVISOR" -ge 1 ] || DIVISOR=1
-FACTOR=$(( SLOW_BOOT_TARGET_BOOT_SECONDS / DIVISOR ))
-[ "$FACTOR" -lt 4 ] && FACTOR=4
-[ "$FACTOR" -gt 24 ] && FACTOR=24
-INITIAL_WORKERS=$(( FACTOR * NPROC - 1 ))
-[ "$INITIAL_WORKERS" -lt 1 ] && INITIAL_WORKERS=1
-[ "$INITIAL_WORKERS" -gt "$SLOW_BOOT_MAX_LOAD_WORKERS" ] && INITIAL_WORKERS="$SLOW_BOOT_MAX_LOAD_WORKERS"
-info "baseline ${BASELINE_BOOT}s -> aiming for ~${SLOW_BOOT_TARGET_BOOT_SECONDS}s"
-info "load: ${INITIAL_WORKERS} workers on ${NPROC} cores (oversubscription factor ~${FACTOR})"
-
-# Stop the unit cleanly so boot 2's NRestarts=0 means boot 2 needed no restarts.
+info "the bar to clear is ${SLOW_BOOT_MIN_BOOT_SECONDS}s, i.e. $(( SLOW_BOOT_MIN_BOOT_SECONDS * 100 / (BASELINE_BOOT < 1 ? 1 : BASELINE_BOOT) ))% of the baseline boot"
 systemctl --user stop "$UNIT" || die "could not stop the baseline unit"
 systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+# A clean stop/start resets NRestarts, so NRestarts=0 after a later boot means
+# that boot needed zero restarts rather than inheriting a count.
 [ "$(prop NRestarts)" = "0" ] || die "NRestarts is $(prop NRestarts) after a clean stop; the baseline is not clean"
 
-# --- 6. boot 2: THE PROOF -------------------------------------------------
-note "6. boot 2, the proof: a host loaded on purpose, then start"
-load_add "$INITIAL_WORKERS"
-info "load running (${LOAD_WORKERS} workers); starting $UNIT"
-PROOF_START="$(date +%s)"
-systemctl --user start --no-block "$UNIT" || die "proof start failed"
+# --- one boot, under whatever lever is currently applied -------------------
+# Shared by probe mode and by boots 2/3 in proof mode, so both measure the
+# same things the same way. Prints nothing on success; sets BOOT_OUT to a
+# space-separated record: <seconds|none> <ActiveState> <SubState> <NRestarts>
+# <Result> <cpu-percent-of-one-core>. A boot that never becomes ready reports
+# "none" and the systemd state that explains why.
+BOOT_OUT=""
+measure_boot() {
+  local label="$1" cap="$2"
+  local start deadline elapsed out
+  start="$(date +%s)"
+  deadline=$(( start + cap ))
+  cpu_accounting_reset
+  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+  if ! systemctl --user start --no-block "$UNIT"; then
+    BOOT_OUT="none $(prop ActiveState) $(prop SubState) $(prop NRestarts) startrefused 0"
+    return 1
+  fi
+  while :; do
+    case "$(prop ActiveState)/$(prop SubState)" in
+      active/running) break ;;
+      failed/*) break ;;
+      inactive/*)
+        # A unit killed by a start timeout lands here rather than in failed/,
+        # because Restart=always means systemd is about to try again.
+        ;;
+    esac
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$elapsed" -ge "$cap" ]; then
+      # Leave it in whatever state it reached; the caller reports it as
+      # "did not finish inside the cap" rather than guessing why.
+      BOOT_OUT="none $(prop ActiveState) $(prop SubState) $(prop NRestarts) cap:${elapsed}s 0"
+      return 1
+    fi
+    cpu_accounting_sample
+    sleep 1
+  done
+  local seconds
+  seconds="$(boot_seconds)"
+  [ -n "$seconds" ] || seconds="none"
+  BOOT_OUT="$seconds $(prop ActiveState) $(prop SubState) $(prop NRestarts) $(prop Result) $(cpu_percent)"
+  return 0
+}
 
-# Wait for ready, topping the load up if this host is faster than the baseline
-# suggested. Adding load can only lengthen the *remaining* boot, so the top-up
-# has to start while there is still real work left. Two things bound it, and
-# both matter:
-#
-#   * a deadline at 60% of the target. Past that point the boot is nearly done
-#     and doubling the load mostly risks pushing it past the 600s budget under
-#     test, which would turn this proof into a timeout report.
-#   * a hard stop adding load once elapsed passes 45% of the budget, because
-#     from there a runaway would spend the rest of its time in the penalty box
-#     instead of finishing.
-TOPUP_UNTIL=$(( SLOW_BOOT_TARGET_BOOT_SECONDS * 60 / 100 ))
-LOAD_FROZEN_AT=$(( 600 * 45 / 100 ))
-TOPUPS=0
-NEXT_TOPUP=20
-PROOF_DEADLINE=$(( PROOF_START + SLOW_BOOT_READY_TIMEOUT + 60 ))
-while :; do
-  case "$(prop ActiveState)/$(prop SubState)" in
-    active/running) break ;;
-    failed/*)
-      FAILED_RESULT="$(prop Result)"
-      FAILED_NRESTARTS="$(prop NRestarts)"
-      info "unit failed: Result=$FAILED_RESULT StatusText=$(prop StatusText) NRestarts=$FAILED_NRESTARTS"
-      journalctl --user -u "$UNIT" --no-pager -n 40 || true
-      if [ "$FAILED_RESULT" = "timeout" ]; then
-        # The budget bounded the boot rather than the boot completing inside it.
-        # That is a real (and useful) answer, but it is NOT this ticket's DoD, so
-        # it is named as such rather than left looking like a crash.
-        die "the boot overran the ${EFF_TIMEOUT} budget and was SIGTERMed (Result=timeout, NRestarts=$FAILED_NRESTARTS): the load was too strong, lower SLOW_BOOT_TARGET_BOOT_SECONDS"
-      fi
-      die "the proof boot failed (Result=$FAILED_RESULT) instead of completing"
-      ;;
-  esac
-  ELAPSED=$(( $(date +%s) - PROOF_START ))
-  if [ "$ELAPSED" -ge "$NEXT_TOPUP" ] \
-     && [ "$ELAPSED" -lt "$TOPUP_UNTIL" ] \
-     && [ "$ELAPSED" -lt "$LOAD_FROZEN_AT" ] \
-     && [ $(( LOAD_WORKERS * 2 )) -le "$SLOW_BOOT_MAX_LOAD_WORKERS" ]; then
-    load_add "$LOAD_WORKERS"
-    TOPUPS=$(( TOPUPS + 1 ))
-    NEXT_TOPUP=$(( NEXT_TOPUP + 10 ))
-    info "still activating at ${ELAPSED}s; load now ${LOAD_WORKERS} workers"
+# ===========================================================================
+# PROBE MODE
+# ===========================================================================
+if [ "$SLOW_BOOT_MODE" = "probe" ]; then
+  note "6. PROBE: what can this host actually be made to do to a real boot?"
+  info "one warm boot per lever; the idle row is the control for all the others"
+  info "cpu% is the unit's share of total host CPU time across the boot, so a"
+  info "row that is slow while cpu% is ~100 means the lever was not the constraint"
+  row LEVER BOOTS NRES RESULT CPU% NOTE
+  for LEVER in $SLOW_BOOT_LEVERS; do
+    systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+    if ! lever_apply "$LEVER"; then
+      row "$LEVER" - - - - "lever unavailable on this host"
+      TABLE+=("$LEVER|unavailable|-|-|-|-")
+      continue
+    fi
+    set +e
+    measure_boot "$LEVER" "$SLOW_BOOT_PROBE_CAP"
+    mrc=$?
+    set -e
+    lever_release
+    # shellcheck disable=SC2086
+    set -- $BOOT_OUT
+    P_BOOT="$1"; P_STATE="$2"; P_SUB="$3"; P_NRES="$4"; P_RESULT="$5"; P_CPU="$6"
+    NOTE=""
+    if [ "$mrc" != "0" ] && [ "$P_RESULT" = "timeout" ]; then
+      NOTE="SIGTERMed at the 600s budget"
+    elif [ "$mrc" != "0" ]; then
+      NOTE="$P_RESULT"
+    elif [ "$P_BOOT" -gt "$SLOW_BOOT_MIN_BOOT_SECONDS" ] 2>/dev/null; then
+      NOTE="CLEARS THE ${SLOW_BOOT_MIN_BOOT_SECONDS}s BAR"
+    fi
+    row "$LEVER" "$P_BOOT" "$P_NRES" "$P_RESULT" "${P_CPU}%" "$NOTE"
+    TABLE+=("$LEVER|$P_BOOT|$P_NRES|$P_RESULT|$P_CPU|$NOTE")
+  done
+
+  note "PROBE TABLE"
+  printf '      %-14s %8s %6s %10s %6s  %s\n' LEVER BOOTS NRES RESULT CPU% NOTE
+  for line in ${TABLE[@]+"${TABLE[@]}"}; do
+    IFS='|' read -r l b n r c note_ <<< "$line"
+    printf '      %-14s %8s %6s %10s %6s  %s\n' "$l" "$b" "$n" "$r" "${c}%" "$note_"
+  done
+
+  # The probe writes the same evidence file the proof does, so the workflow's
+  # artifact upload (if-no-files-found: error) has something to pick up and the
+  # table is a durable artifact rather than only a line in a CI log that
+  # expires. Its schema is the probe's, not the proof's: there is no proof boot
+  # here, so PROOF_BOOT and the control numbers would be lies.
+  EVIDENCE="${RUNNER_TEMP:-$HOME}/pet296-evidence.txt"
+  # Recomputed here rather than reusing the proof's UNIT_SHA_AFTER, which is
+  # assigned after this block. If the levers did write a drop-in, this is where
+  # the probe would show it.
+  UNIT_SHA_AFTER="$(sha256sum "$UNIT_FILE" 2>/dev/null | cut -d' ' -f1)"
+  {
+    echo "PET-296 slow-boot lever probe (clean host)"
+    echo "  host                : $(uname -srm), $(nproc) cores, systemd $(systemctl --version | head -1 | awk '{print $2}')"
+    echo "  ref installed       : $SLOW_BOOT_REPO@$SLOW_BOOT_REF"
+    echo "  unit                : paperclipai-${SLOW_BOOT_INSTANCE}.service"
+    echo "  unit sha256         : $UNIT_SHA_AFTER (was $UNIT_SHA_BEFORE before any probe boot)"
+    echo "  rendered            : TimeoutStartSec=600 KillMode=process Type=notify"
+    echo "  mode                : probe (no proof boot; this measures which lever can make one)"
+    echo "  bar for a lever     : >${SLOW_BOOT_MIN_BOOT_SECONDS}s to ready, with headroom under the 600s budget"
+    echo "  onboard boot        : ${ONBOARD_BOOT:-unknown}s (fresh db, uncontrolled)"
+    echo "  drop-in dir         : $([ -d "${UNIT_FILE}.d" ] && echo "EXISTS - a lever wrote to the unit, which DoD 4 forbids" || echo "absent (the levers are host-level only)")"
+    echo "  unit unchanged      : $([ "$UNIT_SHA_BEFORE" = "$UNIT_SHA_AFTER" ] && echo "yes" || echo "NO - the unit file changed during the probe")"
+    echo
+    echo "  LEVER       BOOTS  NRES     RESULT   CPU%  NOTE"
+    for line in ${TABLE[@]+"${TABLE[@]}"}; do
+      IFS='|' read -r l b n r c note_ <<< "$line"
+      printf '  %-12s %7s %5s %9s %5s  %s\n' "$l" "$b" "$n" "$r" "$c" "$note_"
+    done
+  } > "$EVIDENCE"
+  note "EVIDENCE"
+  cat "$EVIDENCE"
+
+  note "READING THIS TABLE"
+  cat <<'EOF'
+  The lever for the proof is the cheapest row that CLEARS THE BAR and leaves
+  headroom under the 600s budget -- a row that only just clears it is a row
+  that will flake on the next runner, and one that reaches 600s proves the
+  budget bounded the boot rather than the boot completing inside it.
+
+  cpu% near 100 with a boot that did not move says the CPU was the constraint
+  and there was not enough of it. cpu% far below 100 says the boot was waiting
+  on something else, and only a lever that slows that something will move it.
+EOF
+
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      echo "### PET-296 slow-boot lever probe (clean host)"
+      echo
+      echo '```'
+      printf '%-14s %8s %6s %10s %6s  %s\n' LEVER BOOTS NRES RESULT CPU% NOTE
+      for line in ${TABLE[@]+"${TABLE[@]}"}; do
+        IFS='|' read -r l b n r c note_ <<< "$line"
+        printf '%-14s %8s %6s %10s %6s  %s\n' "$l" "$b" "$n" "$r" "${c}%" "$note_"
+      done
+      echo '```'
+    } >> "$GITHUB_STEP_SUMMARY"
   fi
-  if [ "$(date +%s)" -ge "$PROOF_DEADLINE" ]; then
-    die "the proof boot did not reach active within $(( SLOW_BOOT_READY_TIMEOUT + 60 ))s"
+  summarize
+fi
+
+# ===========================================================================
+# PROOF MODE
+# ===========================================================================
+note "6. boot 2, THE PROOF: $SLOW_BOOT_LEVER applied, then start"
+if ! lever_apply "$SLOW_BOOT_LEVER"; then
+  die "the lever '$SLOW_BOOT_LEVER' is not available on this host, so boot 2 cannot be made slow. Run SLOW_BOOT_MODE=probe to find one that is."
+fi
+set +e
+measure_boot "proof" $(( SLOW_BOOT_READY_TIMEOUT + 60 ))
+PROOF_RC=$?
+set -e
+# shellcheck disable=SC2086
+set -- $BOOT_OUT
+PROOF_BOOT="$1"; ACTIVE_STATE="$2"; SUB_STATE="$3"; N_RESTARTS="$4"; RESULT="$5"
+PROOF_CPU="$6"
+info "boot 2: ${PROOF_BOOT}s  ActiveState=$ACTIVE_STATE SubState=$SUB_STATE NRestarts=$N_RESTARTS Result=$RESULT cpu=${PROOF_CPU}%"
+if [ "$PROOF_RC" != "0" ]; then
+  if [ "$RESULT" = "timeout" ]; then
+    die "the boot overran the ${EFF_TIMEOUT} budget and was SIGTERMed (Result=timeout): the lever was too strong, weaken SLOW_BOOT_LEVER"
   fi
-  sleep 1
-done
-load_stop
-WALL_BOOT=$(( $(date +%s) - PROOF_START ))
-PROOF_BOOT="$(boot_seconds)"
-[ -n "$PROOF_BOOT" ] || die "could not read the proof boot duration"
-pass "6a proof boot reached active (systemd-measured ${PROOF_BOOT}s, wall clock ${WALL_BOOT}s, ${TOPUPS} top-up(s))"
+  journalctl --user -u "$UNIT" --no-pager -n 40 || true
+  die "the proof boot failed (Result=$RESULT, ActiveState=$ACTIVE_STATE) instead of completing"
+fi
+lever_release
 
 # The three numbers DoD 2 asks for, read back from systemd.
-ACTIVE_STATE="$(prop ActiveState)"
-SUB_STATE="$(prop SubState)"
-N_RESTARTS="$(prop NRestarts)"
-RESULT="$(prop Result)"
 STATUS_TEXT="$(prop StatusText)"
 TIMEOUT_USEC="$(prop TimeoutStartUSec)"
 KILLMODE="$(prop KillMode)"
@@ -484,7 +826,7 @@ if [ "$PROOF_BOOT" -gt "$SLOW_BOOT_MIN_BOOT_SECONDS" ]; then
   pass "6b boot took ${PROOF_BOOT}s, over the ${SLOW_BOOT_MIN_BOOT_SECONDS}s default start timeout"
 else
   fail_ "6b boot took ${PROOF_BOOT}s, which does NOT exceed ${SLOW_BOOT_MIN_BOOT_SECONDS}s"
-  info "the load was not enough to reproduce a slow boot; raise SLOW_BOOT_TARGET_BOOT_SECONDS"
+  info "the lever was not enough to reproduce a slow boot; probe for a stronger one"
 fi
 # READY=1. A Type=notify unit cannot report active/running until it has
 # received READY=1, so SubState=running is the witness. StatusText is the
@@ -515,20 +857,79 @@ else
 fi
 info "nRestarts=${N_RESTARTS} activeEnter=$(prop ActiveEnterTimestamp) execStart=$(prop ExecMainStartTimestamp)"
 
+# --- 7. boot 3, THE CONTROL: the same load, the 90s default ---------------
+# Everything about boot 3 is boot 2 with one line changed, so the only
+# explanation left for the difference is the rendered budget. The changed line
+# lives in a copy of the rendered unit under a second name, so the unit under
+# test keeps its own file untouched and this host is left as it was found.
+note "7. boot 3, THE CONTROL: same lever, TimeoutStartSec removed"
+CONTROL_UNIT="paperclipai-${SLOW_BOOT_INSTANCE}-control.service"
+CONTROL_FILE="$HOME/.config/systemd/user/$CONTROL_UNIT"
+CONTROL_SHA="$(sha256sum "$FRAGMENT" | cut -d' ' -f1)"
+[ "$CONTROL_SHA" = "$UNIT_SHA_BEFORE" ] \
+  || die "the unit changed between boot 2 and the control (before $UNIT_SHA_BEFORE now $CONTROL_SHA)"
+sed -e 's/^TimeoutStartSec=600$//' \
+    -e "s/^Description=.*/Description=Paperclip AI (${SLOW_BOOT_INSTANCE} CONTROL, no start budget)/" \
+    "$FRAGMENT" > "$CONTROL_FILE"
+systemctl --user daemon-reload
+CONTROL_EFF="$(systemctl --user show "$CONTROL_UNIT" -p TimeoutStartUSec --value 2>/dev/null || true)"
+CONTROL_EFF_SECS="$(timespan_to_seconds "$CONTROL_EFF" || echo -1)"
+info "control unit: $CONTROL_FILE (TimeoutStartSec line removed)"
+info "control effective TimeoutStartUSec=$CONTROL_EFF (${CONTROL_EFF_SECS}s)"
+# The control is a different unit name, so point the measurement helpers at it
+# for the length of this boot and put them back afterwards.
+UNIT="$CONTROL_UNIT"
+if [ "$CONTROL_EFF_SECS" != "90" ]; then
+  fail_ "7a the control really does run on the 90s default (got ${CONTROL_EFF_SECS}s); without that the control proves nothing"
+  systemctl --user stop "$CONTROL_UNIT" >/dev/null 2>&1 || true
+else
+  pass "7a the control runs on systemd's 90s default (TimeoutStartUSec=$CONTROL_EFF)"
+fi
+
+if lever_apply "$SLOW_BOOT_LEVER"; then :; else
+  fail_ "7b the control could not apply $SLOW_BOOT_LEVER, so it cannot be a control for boot 2"
+fi
+set +e
+measure_boot "control" $(( CONTROL_EFF_SECS + 90 ))
+CTL_RC=$?
+set -e
+# shellcheck disable=SC2086
+set -- $BOOT_OUT
+CTL_BOOT="$1"; CTL_STATE="$2"; CTL_SUB="$3"; CTL_NRES="$4"; CTL_RESULT="$5"
+lever_release
+info "control: boot ${CTL_BOOT:-did not complete}  ActiveState=$CTL_STATE SubState=$CTL_SUB NRestarts=$CTL_NRES Result=$CTL_RESULT"
+journalctl --user -u "$CONTROL_UNIT" --no-pager -n 12 || true
+# Asserted to FAIL. A control that completed is a broken control: it would mean
+# the boot was never actually under pressure, and boot 2's result would be
+# explaining itself with the one difference that is supposed to matter.
+if [ "$CTL_RESULT" = "timeout" ] && [ "$CTL_NRES" -ge 1 ] 2>/dev/null; then
+  pass "7b the control was SIGTERMed at ${CONTROL_EFF_SECS}s and restarted (Result=timeout, NRestarts=$CTL_NRES)"
+elif [ "$CTL_BOOT" != "none" ] && [ "${CTL_BOOT:-0}" -gt "$SLOW_BOOT_MIN_BOOT_SECONDS" ] 2>/dev/null; then
+  fail_ "7b the control completed in ${CTL_BOOT}s on a 90s budget, so the load is not what the proof turns on"
+  info "the lever must make a boot exceed 90s even with no budget at all"
+else
+  fail_ "7b the control did not show the outage (Result=$CTL_RESULT NRestarts=$CTL_NRES); it should have been SIGTERMed at ${CONTROL_EFF_SECS}s"
+fi
+systemctl --user stop "$CONTROL_UNIT" >/dev/null 2>&1 || true
+rm -f "$CONTROL_FILE"
+systemctl --user daemon-reload
+systemctl --user reset-failed "$CONTROL_UNIT" >/dev/null 2>&1 || true
+UNIT="paperclipai-${SLOW_BOOT_INSTANCE}.service"
+
 # DoD 4, re-checked: the unit the proof ran is byte-for-byte the one the
 # installer wrote. If anything had hand-edited it to buy the result, the hash
 # moves.
 UNIT_SHA_AFTER="$(sha256sum "$FRAGMENT" | cut -d' ' -f1)"
 if [ "$UNIT_SHA_BEFORE" = "$UNIT_SHA_AFTER" ]; then
-  pass "7a the unit is unchanged across both boots (sha256 $UNIT_SHA_AFTER): nothing was hand-edited"
+  pass "8a the unit is unchanged across every boot (sha256 $UNIT_SHA_AFTER): nothing was hand-edited"
 else
-  fail_ "7a the unit changed across the proof (before $UNIT_SHA_BEFORE after $UNIT_SHA_AFTER)"
+  fail_ "8a the unit changed across the proof (before $UNIT_SHA_BEFORE after $UNIT_SHA_AFTER)"
 fi
 if [ -d "${FRAGMENT}.d" ]; then
-  fail_ "7b no drop-in appeared for the unit during the proof (DoD 4)"
+  fail_ "8b no drop-in appeared for the unit during the proof (DoD 4)"
   ls -la "${FRAGMENT}.d"
 else
-  pass "7b no drop-in exists for the unit (DoD 4): the renderer's budget is what carried the boot"
+  pass "8b no drop-in exists for the unit (DoD 4): the renderer's budget is what carried the boot"
 fi
 
 # --- evidence block -------------------------------------------------------
@@ -536,22 +937,28 @@ fi
 EVIDENCE="${RUNNER_TEMP:-$HOME}/pet296-evidence.txt"
 {
   echo "PET-296 slow-boot proof (clean host)"
-  echo "  host                : $(uname -srm), ${NPROC} cores, systemd $(systemctl --version | head -1 | awk '{print $2}')"
+  echo "  host                : $(uname -srm), $(nproc) cores, systemd $(systemctl --version | head -1 | awk '{print $2}')"
   echo "  ref installed       : $SLOW_BOOT_REPO@$SLOW_BOOT_REF"
-  echo "  unit                : $UNIT"
+  echo "  unit                : paperclipai-${SLOW_BOOT_INSTANCE}.service"
   echo "  unit file           : $FRAGMENT"
-  echo "  unit sha256         : $UNIT_SHA_AFTER"
+  echo "  unit sha256         : $UNIT_SHA_AFTER (identical before and after every boot)"
   echo "  rendered            : TimeoutStartSec=600 KillMode=process Type=notify"
   echo "  systemd effective   : TimeoutStartUSec=$TIMEOUT_USEC KillMode=$KILLMODE"
+  echo "  lever under test    : $SLOW_BOOT_LEVER (host-level, no drop-in, no unit property)"
   echo "  onboard boot        : ${ONBOARD_BOOT:-unknown}s (fresh db, uncontrolled)"
   echo "  baseline boot       : ${BASELINE_BOOT}s (warm, idle host)"
   echo "  proof boot          : ${PROOF_BOOT}s (loaded host, systemd-measured, bar >${SLOW_BOOT_MIN_BOOT_SECONDS}s)"
-  echo "  wall clock          : ${WALL_BOOT}s"
-  echo "  load                : ${LOAD_WORKERS} workers on ${NPROC} cores (${TOPUPS} top-up(s))"
+  echo "  proof cpu share     : ${PROOF_CPU}% of host CPU time"
   echo "  READY=1 reached     : yes (SubState=$SUB_STATE, StatusText='$STATUS_TEXT')"
   echo "  NRestarts           : $N_RESTARTS"
   echo "  ActiveState         : $ACTIVE_STATE"
   echo "  Result              : $RESULT"
+  echo
+  echo "  -- control: identical, with TimeoutStartSec removed --"
+  echo "  control budget      : TimeoutStartUSec=$CONTROL_EFF (${CONTROL_EFF_SECS}s, the 90s default)"
+  echo "  control boot        : ${CTL_BOOT:-did not complete}"
+  echo "  control NRestarts   : $CTL_NRES"
+  echo "  control Result      : $CTL_RESULT"
   echo
   echo "--- rendered unit as the installer wrote it ($FRAGMENT) ---"
   cat "$FRAGMENT"
