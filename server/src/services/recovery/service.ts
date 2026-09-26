@@ -2715,8 +2715,21 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
+    // A recovery issue that cannot be recovered in place is not held by a
+    // dependency, so this block has to carry its own exit. Without a descriptor
+    // the issue is `blocked` with nothing holding it and no named owner, which
+    // is the zero-blocker hold the block-status route already refuses to author
+    // for a human. The comment below names the recovery owner in prose; this
+    // records the same owner where the routing machinery reads it.
+    const unblockDescriptor = strandedRunUnblockDescriptor({
+      existing: input.issue.unblockDescriptor,
+      assigneeAgentId: input.issue.assigneeAgentId,
+      assigneeUserId: input.issue.assigneeUserId,
+      action: strandedUnblockAction(input.latestRun, "stranded_assigned_issue"),
+    });
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      ...(unblockDescriptor ? { unblockDescriptor } : {}),
     });
     if (!updated) return null;
 
@@ -3545,8 +3558,23 @@ export function recoveryService(
         ),
       );
 
+    // The recovery action above hands this hold to the board under
+    // `STRANDED_BOARD_ESCALATION_POLICY`, but the issue row itself would stay
+    // `blocked` with no blocker and no descriptor, so the block status carries no
+    // exit of its own. Record the same routing decision where the board
+    // reads it, so a disposition-repair exhaustion is a named hold rather than
+    // a terminal one.
+    const unblockDescriptor = strandedRunUnblockDescriptor({
+      existing: input.issue.unblockDescriptor,
+      owner: "board",
+      action: strandedUnblockAction(
+        input.latestRun,
+        "deliberate_wait_without_target",
+      ),
+    });
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      ...(unblockDescriptor ? { unblockDescriptor } : {}),
     });
     if (!updated) return null;
     const sourceAssigneePreserved =

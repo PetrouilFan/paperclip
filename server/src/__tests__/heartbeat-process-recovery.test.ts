@@ -1397,6 +1397,68 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
+  /**
+   * The zero-blocker-hold invariant.
+   *
+   * `POST /api/issues/:id` refuses to put an issue into `blocked` unless
+   * something is actually holding it: unresolved dependency blockers, a pending
+   * interaction/approval, or an `unblockDescriptor` naming an owner. The recovery
+   * sweeps are internal, so they never went through that check, and each of them
+   * that wrote the bare status produced an issue the server reported as blocked
+   * and as having nothing blocking it at the same time — which nothing could
+   * release, because checkout refuses a `blocked` issue and no blocker existed
+   * for the dependency path to release.
+   *
+   * Every assertion below is written against this helper rather than against one
+   * sweep's descriptor, so a writer that regresses is caught by the invariant
+   * instead of by one site's expected wording.
+   */
+  async function expectBlockedIssueHasExit(
+    input: { companyId: string; issueId: string },
+    context: string,
+  ) {
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(
+        and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)),
+      );
+    expect(issue, `${context}: issue exists`).toBeDefined();
+    if (issue?.status !== "blocked") return;
+
+    const blockerIds = await sourceBlockerIssueIds(input.companyId, input.issueId);
+    const owner = issue.unblockDescriptor?.owner;
+    const hasOwner =
+      owner === "board" ||
+      (typeof owner === "object" && owner !== null && "agentId" in owner) ||
+      (typeof owner === "object" && owner !== null && "userId" in owner);
+
+    expect(
+      blockerIds.length > 0 || hasOwner,
+      `${context}: blocked issue ${input.issueId} must have non-empty blockedByIssueIds ` +
+        `or an unblockDescriptor with an owner (got blockers=${JSON.stringify(blockerIds)}, ` +
+        `unblockDescriptor=${JSON.stringify(issue.unblockDescriptor)})`,
+    ).toBe(true);
+  }
+
+  it("rejects a blocked issue that has neither blockers nor an unblock owner", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "setup_failed",
+    });
+    // Reproduce the pre-fix hold by hand, so the invariant above is proven
+    // non-vacuous rather than passing because it never runs.
+    await db
+      .update(issues)
+      .set({ status: "blocked", unblockDescriptor: null })
+      .where(eq(issues.id, issueId));
+
+    await expect(
+      expectBlockedIssueHasExit({ companyId, issueId }, "hand-built hold"),
+    ).rejects.toThrow(/must have non-empty blockedByIssueIds/);
+  });
+
   async function seedQueuedIssueRunFixture() {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -9724,6 +9786,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ]);
     expect(issue?.status).toBe("blocked");
     expect(continuationRuns).toHaveLength(5);
+    // The repair action hands this hold to the board, but nothing was holding the
+    // issue, so the `blocked` status has to carry the same routing decision as
+    // its own exit or the ticket is terminal in practice.
+    await expectBlockedIssueHasExit(
+      { companyId, issueId },
+      "disposition repair exhausted",
+    );
+    expect(issue?.unblockDescriptor).toMatchObject({
+      owner: "board",
+      action: expect.stringContaining("resume this issue"),
+    });
     expect(
       comments.some((comment) => comment.body.includes("Attempts: 5/5")),
     ).toBe(true);
@@ -10264,7 +10337,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("blocks an already stranded recovery issue without creating a recovery child", async () => {
-    const { companyId, issueId } = await seedStrandedIssueFixture({
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "todo",
       runStatus: "failed",
       retryReason: "assignment_recovery",
@@ -10336,6 +10409,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       );
     expect(blockerRelations).toHaveLength(0);
+
+    // No dependency holds this recovery issue, so the block itself has to carry
+    // the exit. The recorded comment already names the recovery owner in prose;
+    // the descriptor is where the routing machinery reads it.
+    await expectBlockedIssueHasExit(
+      { companyId, issueId },
+      "stranded recovery issue escalated in place",
+    );
+    expect(recoveryIssues[0]?.unblockDescriptor).toMatchObject({
+      owner: { agentId },
+      action: expect.stringContaining("resume this issue"),
+    });
 
     const comments = await db
       .select()
