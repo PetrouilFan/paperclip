@@ -31,6 +31,7 @@ import {
 } from "./status-decision-committer.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
+import { strandedRunUnblockDescriptor } from "../routable-blocked.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { reportRunFailure } from "../run-failure-report.js";
 import { resumeNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
@@ -467,9 +468,25 @@ export async function claimNativeSessionResumptions(input: {
         // both "running" and "failed") must not send a second Sentry event.
         terminalRunToEmit =
           updatedRun && updatedRun.status !== row.run.status ? updatedRun : null;
+        // An ambiguous native finalization is a dead end, not a hold: no
+        // dependency is holding the issue and no blocker will ever resolve. The
+        // recovery action below already hands the decision to the board, so
+        // record the same owner on the issue — otherwise the `blocked` status
+        // names nobody who can release it, and checkout refuses the issue to
+        // the agent that would.
+        const unblockDescriptor = strandedRunUnblockDescriptor({
+          owner: "board",
+          action:
+            "The native session's final state is ambiguous, so the run cannot be " +
+            "resumed or safely repeated. Inspect the recorded run evidence, then " +
+            "repair, retry the original owner, or resolve the issue by hand.",
+        });
         await issueService(tx as unknown as Db).update(
           row.coordinator.issueId,
-          { status: "blocked" },
+          {
+            status: "blocked",
+            ...(unblockDescriptor ? { unblockDescriptor } : {}),
+          },
           tx,
         );
         await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({

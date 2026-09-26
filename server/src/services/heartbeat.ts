@@ -3,6 +3,7 @@ import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
+import { strandedRunUnblockDescriptor } from "./routable-blocked.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
@@ -27745,6 +27746,26 @@ export function heartbeatService(
                 `- Reason: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE}`,
                 `- Next action: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`,
               ].join("\n");
+              // Nothing is holding this issue: the workspace configuration is
+              // the problem, and the block is what reports it. Record that as a
+              // hold with a named owner, the way a hand-authored block does, or
+              // the status is terminal in practice — checkout refuses a blocked
+              // issue, so the assignee could never pick it back up.
+              const [blockOwner] = await tx
+                .select({
+                  assigneeAgentId: issues.assigneeAgentId,
+                  assigneeUserId: issues.assigneeUserId,
+                  unblockDescriptor: issues.unblockDescriptor,
+                })
+                .from(issues)
+                .where(eq(issues.id, issue.id))
+                .limit(1);
+              const unblockDescriptor = strandedRunUnblockDescriptor({
+                existing: blockOwner?.unblockDescriptor,
+                assigneeAgentId: blockOwner?.assigneeAgentId,
+                assigneeUserId: blockOwner?.assigneeUserId,
+                action: `${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION} This hold was auto-authored by the dispatch preflight, not by a dependency.`,
+              });
               await tx
                 .update(issues)
                 .set({
@@ -27753,6 +27774,7 @@ export function heartbeatService(
                   executionRunId: null,
                   executionAgentNameKey: null,
                   executionLockedAt: null,
+                  ...(unblockDescriptor ? { unblockDescriptor } : {}),
                   updatedAt: now,
                 })
                 .where(eq(issues.id, issue.id));
