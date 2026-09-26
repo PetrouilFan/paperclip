@@ -93,11 +93,11 @@ find "$(npm root -g)/paperclipai/node_modules/@paperclipai/server/dist" -name '*
 
 Eight `.pre-pet110-20260925T171750Z` files and two `.bak-20260925T002012Z` files, all carrying an on-disk mtime of 00:57Z — the timestamp embedded in each name records when its patch was cut, which is not when the file was last written. Each is byte-identical to the published release, so the backups are trustworthy originals and the patch can be read as a clean diff against them. `diff -rq` against the published tarball reported 18 differing or extra files across two unrelated subsystems.
 
-### Patch 1 — PET-110, embedded-Postgres shutdown intent (00:57Z)
+### Patch 1 — embedded-Postgres shutdown intent (00:57Z)
 
 `embedded-postgres-supervisor.js` and `index.js` gained a shutdown-intent mark and an `onControlledExit` path: distinguish PostgreSQL exiting `code=0` with no signal during a requested shutdown from a crash, so a unit using `KillMode=control-group` does not get its own requested stop read as an unexpected exit and relaunched. Also renames `shuttingDown` to `shutdownIntent` and tracks instances stopped via a local `stop()` in `instancesRequestedToStop`. Note this edited the **top-level `index.js` entrypoint** as well as the supervisor.
 
-### Patch 2 — PET-156, cross-issue write gate (00:20Z)
+### Patch 2 — cross-issue write gate (00:20Z)
 
 `services/cross-issue-influence-limit.js` gained a `TERMINAL_HEARTBEAT_RUN_STATUSES` set, a `reason` parameter on `crossIssueInfluenceRunContextError` emitting `malformed_run_id`, `run_not_found`, and `no_context_source_and_target_unbound`, and `status: heartbeatRuns.status` added to the run select. That in turn let a run-binding fallback trust an issue's `checkoutRunId` / `executionRunId` **only while the run is not terminal**. The published release has no `reason` field and refuses any run with no source issue outright.
 
