@@ -88,6 +88,8 @@ import {
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  ISSUE_STATUSES,
+  ISSUE_ORIGIN_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -163,6 +165,8 @@ import {
   inboxAgentPolicyService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
+  findUnknownIssueOriginKindValues,
+  findUnknownIssueStatusValues,
   issueReferenceService,
   issueService,
   type ActivityPublication,
@@ -680,6 +684,42 @@ function readObject(value: unknown): Record<string, unknown> {
 
 function hasOwn(record: Record<string, unknown>, key: string) {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * Reject a `?status=` or `?originKind=` value the board cannot contain.
+ *
+ * Both the list and the count route accept these two keys, and both used to
+ * hand them to the filter unvalidated while 400-ing every neighbouring enum key
+ * (`sortField`, `sortDir`, `view`, `attention`). The silent answer was the
+ * damaging part: `?status=<typo>` returned `200` with an empty list, and
+ * `?attention=blocked&status=<typo>` on the count route returned a confident
+ * `0` while issues were in fact blocked.
+ *
+ * Returns `true` when it has written the 400, so each caller can `return`.
+ */
+function rejectUnknownIssueFilterValues(
+  res: Response,
+  rawStatus: string | string[] | undefined,
+  rawOriginKind: string | string[] | undefined,
+): boolean {
+  const unknownStatuses = findUnknownIssueStatusValues(rawStatus);
+  if (unknownStatuses.length > 0) {
+    res.status(400).json({
+      error: `status must be one of ${ISSUE_STATUSES.join(", ")} when provided`,
+      unknownStatusValues: unknownStatuses,
+    });
+    return true;
+  }
+  const unknownOriginKinds = findUnknownIssueOriginKindValues(rawOriginKind);
+  if (unknownOriginKinds.length > 0) {
+    res.status(400).json({
+      error: `originKind must be one of ${ISSUE_ORIGIN_KINDS.join(", ")} or a plugin: value when provided`,
+      unknownOriginKindValues: unknownOriginKinds,
+    });
+    return true;
+  }
+  return false;
 }
 
 async function auditAgentIssueCreateAttributionSpoof(input: {
@@ -7999,6 +8039,15 @@ export function issueRoutes(
         .json({ error: "attention must be 'blocked' when provided" });
       return;
     }
+    if (
+      rejectUnknownIssueFilterValues(
+        res,
+        req.query.status as string | string[] | undefined,
+        req.query.originKind as string | string[] | undefined,
+      )
+    ) {
+      return;
+    }
     if (view !== undefined && view !== "compact") {
       res.status(400).json({ error: "view must be 'compact' when provided" });
       return;
@@ -8299,6 +8348,15 @@ export function issueRoutes(
       res
         .status(400)
         .json({ error: "issues/count does not accept limit or offset" });
+      return;
+    }
+    if (
+      rejectUnknownIssueFilterValues(
+        res,
+        req.query.status as string | string[] | undefined,
+        req.query.originKind as string | string[] | undefined,
+      )
+    ) {
       return;
     }
     if (hasPlanDocument === null) {

@@ -1062,6 +1062,17 @@ Invites tab does not hide this Cloud action.
 - `GET /issues/:issueId/runner-goal?agentId=...`
 - `POST /issues/:issueId/runner-goal/actions`
 
+The issue list and blocked-count routes reject a `status` or `originKind` query
+value that is not a canonical spelling with `400`, matching the routes' existing
+treatment of `sortField`, `sortDir`, `view`, and `attention`. An unrecognised
+value used to answer `200` with an empty result, and a comma list with one bad
+member applied only the valid members. `status` is matched against
+`ISSUE_STATUSES` and accepts the comma-separated form the filter already
+supported; `originKind` is matched against `ISSUE_ORIGIN_KINDS` and additionally
+accepts the `plugin:` namespace, which is a valid `IssueOriginKind`.
+`originKindPrefix` stays unvalidated because it is a `LIKE` prefix rather than a
+complete value.
+
 The runner-goal endpoints control an issue-scoped durable agent-session goal,
 not a row in the company `goals` hierarchy. Reads return the effective agent,
 negotiated capability, normalized goal snapshot, active-run state, pending

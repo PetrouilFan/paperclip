@@ -36,6 +36,8 @@ export {
 export { projectService } from "./projects.js";
 export {
   clampIssueListLimit,
+  findUnknownIssueOriginKindValues,
+  findUnknownIssueStatusValues,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
