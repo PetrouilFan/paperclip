@@ -6,6 +6,7 @@ import {
   MAX_PR_FILES,
   SELF_EXEMPT_PATHS,
   checkInternalRefs,
+  findInstanceHosts,
   patchIsComplete,
   resolvePrefixes,
 } from '../check-pr-internal-refs.mjs';
@@ -285,3 +286,172 @@ test('one finding is reported once, not once per surface spelling', () => {
   assert.equal(result.passed, false);
   assert.equal(result.failures.filter((f) => f.includes('The PR title')).length, 1);
 });
+
+// --- the instance-local address rule, in authored text only ----------------
+//
+// The negative controls here are the ones that decide whether this rule is
+// usable at all. 664 files on master use `localhost` legitimately, so a
+// matcher that fires on the word is a matcher that gets disabled. The controls
+// that must PASS are as load-bearing as the ones that must fail.
+
+// NEGATIVE CONTROL, required by the issue: naming the loopback interface in
+// prose is not a leak. It is how a reviewer is told the service is not public.
+test('NEGATIVE CONTROL: `localhost` in prose passes', () => {
+  const result = checkInternalRefs({
+    ...CLEAN,
+    prTitle: 'fix(service): bind the loopback interface only',
+    prBody: [
+      'The unit listened on every interface, so two instances on one host could collide.',
+      '',
+      'It now binds localhost, and the e2e service leg passes against it.',
+      'The health probe reads the JSON body rather than the status code.',
+    ].join('\n'),
+    prBranch: 'fix/bind-loopback-only',
+    commits: [{ commit: { message: 'fix(service): bind localhost and keep the port check' } }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('NEGATIVE CONTROL: a loopback or private address as prose passes', () => {
+  for (const body of [
+    'The socket binds 127.0.0.1 before the port is published.',
+    'A wildcard bind (0.0.0.0:3100) is the second half of the collision.',
+    'Node picks an ephemeral port on 127.0.0.1, so the fixture cannot hardcode one.',
+    'The upstream address 1.2.3.4 and the resolver 8.8.8.8 are public and stay.',
+    '172.32.0.1 is outside RFC1918, and so is 192.169.0.1.',
+  ]) {
+    const result = checkInternalRefs({ ...CLEAN, prBody: body });
+    assert.equal(result.passed, true, `expected pass for: ${body}\n${JSON.stringify(result.failures, null, 2)}`);
+  }
+});
+
+test('NEGATIVE CONTROL: the diff is not scanned for addresses', () => {
+  // This is the distinction the whole rule rests on. A test asserting a
+  // service binds 127.0.0.1 is the code working, and a config fixture holding
+  // a loopback baseURL is the subject matter, not a leak. Scoping the rule to
+  // authored text is what keeps it from being born failing.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{
+      filename: 'e2e/service-smoke/fixture.json',
+      status: 'added',
+      changes: 1,
+      patch: '@@ -0,0 +1,1 @@\n+{"baseURL": "http://127.0.0.1:8099/v1"}\n',
+    }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+// The positive control the issue asks for, and the class it was written for:
+// PR #22 on this fork carried a loopback baseURL in its body, copy-pasted out
+// of a config, and it is exactly as permanent as a commit subject.
+test('NEGATIVE CONTROL: a loopback URL in the body fails', () => {
+  const result = checkInternalRefs({ ...CLEAN, prBody: 'Reproduce with `curl http://localhost:3000/api/health`.' });
+  assert.equal(result.passed, false);
+  const joined = result.failures.join('\n');
+  assert.match(joined, /The PR description/);
+  assert.match(joined, /scheme:\/\/<host>:<port>/, 'the failure must name the fix, or the author deletes the sentence instead');
+});
+
+test('every address class the issue names is caught in the body', () => {
+  const cases = [
+    ['http://localhost:3000/api/health', 'loopback by name'],
+    ['http://127.0.0.1:8099/v1', 'loopback by address'],
+    ['http://[::1]:3100/api/health', 'IPv6 loopback'],
+    ['http://0.0.0.0:3100/api/health', 'wildcard bind, as a URL'],
+    ['postgres://agent:hunter2@10.0.0.7:5432/paperclip', 'RFC1918 10/8, behind credentials'],
+    ['ssh -p 2222 admin@192.168.1.20:22', 'RFC1918 192.168/16, as an ssh target'],
+    ['http://172.16.0.9:8080', 'RFC1918 172.16/12, low end'],
+    ['http://172.31.255.1:8080', 'RFC1918 172.16/12, high end'],
+    ['tailscale ssh box.tail1234.ts.net', 'MagicDNS with no scheme'],
+    ['http://100.101.102.103:3101', 'a tailnet node by its CGNAT address'],
+    ['the gateway is at 192.168.1.20:8080', 'a bare authority, no scheme'],
+  ];
+  for (const [body, why] of cases) {
+    const result = checkInternalRefs({ ...CLEAN, prBody: `Observed on the instance: ${body}` });
+    assert.equal(result.passed, false, `expected failure (${why}) for: ${body}`);
+  }
+});
+
+test('a bare private address with neither a scheme nor a port is not claimed', () => {
+  // The boundary of the rule, stated as a test because a reviewer will ask.
+  // `10.0.0.7` alone is indistinguishable from a version, a fixture id or a
+  // doc cross-reference, and a matcher that reached for it would fire on
+  // correct work. The port or the scheme is what makes it an address, and that
+  // is the same reason `agent://` alone is not an issue link.
+  for (const body of ['the fixture is 10.0.0.7 in the sample data', 'build 192.168.0.0 of the matrix']) {
+    const result = checkInternalRefs({ ...CLEAN, prBody: body });
+    assert.equal(result.passed, true, `expected pass for: ${body}\n${JSON.stringify(result.failures, null, 2)}`);
+  }
+});
+
+test('a wildcard bind in prose is not a leak, but in a URL it is', () => {
+  // The one asymmetry in the host list, and it is deliberate: a wildcard is a
+  // socket description in one position and a target in the other.
+  const prose = checkInternalRefs({ ...CLEAN, prBody: 'The unit has `ListenStream=0.0.0.0:3100`, which is the collision.' });
+  assert.equal(prose.passed, true, JSON.stringify(prose.failures, null, 2));
+  const url = checkInternalRefs({ ...CLEAN, prBody: 'Curl `http://0.0.0.0:3100/api/health` to reproduce.' });
+  assert.equal(url.passed, false);
+});
+
+test('an address in the title, the branch or a commit subject each fail', () => {
+  const title = checkInternalRefs({ ...CLEAN, prTitle: 'fix(api): the instance at http://10.1.2.3 answered 500' });
+  assert.equal(title.passed, false);
+  assert.match(title.failures.join('\n'), /The PR title/);
+
+  // A branch naming the machine fails, and so would one carrying an authority.
+  // A branch carrying only the bare interface name does not, and should not:
+  // `fix/localhost-bind-only` describes the change accurately and leaks no
+  // coordinate — the same boundary the prose surfaces hold to, because a name
+  // is not a sentence either.
+  const branch = checkInternalRefs({ ...CLEAN, prBranch: 'fix/box.tail1234.ts.net-reboot' });
+  assert.equal(branch.passed, false);
+  assert.match(branch.failures.join('\n'), /branch name/);
+
+  const bareName = checkInternalRefs({ ...CLEAN, prBranch: 'fix/localhost-bind-only' });
+  assert.equal(bareName.passed, true, JSON.stringify(bareName.failures, null, 2));
+
+
+  const subject = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ commit: { message: 'fix(api): http://localhost:3101 returned 500 on boot\n\nbody' } }],
+  });
+  assert.equal(subject.passed, false);
+  assert.match(subject.failures.join('\n'), /A commit subject/);
+});
+
+test('the commit-subject scan reads the subject, not the body of the message', () => {
+  // A long commit body is prose the author wrote for `git log`; the rule that
+  // survives the merge is the subject line, and that is the line checked here.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ commit: { message: 'fix(api): survive a restart\n\ncurl http://localhost:3100/api/health\n' } }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('the address rule reports the address, and one finding once per surface', () => {
+  const result = checkInternalRefs({
+    ...CLEAN,
+    prBody: 'Try http://localhost:3101 then http://localhost:3101 again, or 10.0.0.1:5432.',
+  });
+  assert.equal(result.passed, false);
+  const joined = result.failures.join('\n');
+  assert.match(joined, /10\.0\.0\.1:5432/);
+  assert.match(joined, /scheme:\/\/<host>:<port>/);
+  assert.equal(result.failures.filter((f) => f.includes('an address that resolves to one machine')).length, 1);
+});
+
+test('findInstanceHosts is the whole rule, and it explains its own boundaries', () => {
+  assert.deepEqual(findInstanceHosts('http://localhost:3101/api'), ['http://localhost']);
+  assert.deepEqual(findInstanceHosts('reached at localhost:3101'), ['localhost:3101']);
+  assert.deepEqual(findInstanceHosts('nothing here at all'), []);
+  assert.deepEqual(findInstanceHosts(''), []);
+  assert.deepEqual(findInstanceHosts(undefined), []);
+  // A glob is documentation, not a hostname: `*.ts.net` is how the rule text
+  // itself has to name the class, and it must not match itself.
+  assert.deepEqual(findInstanceHosts('bans *.ts.net and <host>:<port> shapes'), []);
+  // A longer public name that merely ends in a covered word is not a hit.
+  assert.deepEqual(findInstanceHosts('see docs.example.com and 172.15.0.1'), []);
+});
+
