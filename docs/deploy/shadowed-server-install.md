@@ -93,7 +93,9 @@ Instance `default`, server pid 2416922, `node ~/.npm-global/bin/paperclipai run 
 find "$(npm root -g)/paperclipai/node_modules/@paperclipai/server/dist" -name '*.pre-*' -o -name '*.bak-*'
 ```
 
-Eight `.pre-pet110-20260925T171750Z` files and two `.bak-20260925T002012Z` files, all carrying an on-disk mtime of 00:57Z — the timestamp embedded in each name records when its patch was cut, which is not when the file was last written. Each is byte-identical to the published release, so the backups are trustworthy originals and the patch can be read as a clean diff against them. `diff -rq` against the published tarball reported 18 differing or extra files across two unrelated subsystems.
+Eight `.pre-<ticket>-20260925T171750Z` files and two `.bak-20260925T002012Z` files, all carrying an on-disk mtime of 00:57Z — the timestamp embedded in each name records when its patch was cut, which is not when the file was last written. Each is byte-identical to the published release, so the backups are trustworthy originals and the patch can be read as a clean diff against them. `diff -rq` against the published tarball reported 18 differing or extra files across two unrelated subsystems.
+
+The `<ticket>` placeholder stands for this instance's own issue number, which is a coordinate that resolves only here and means nothing on github.com. The embedded timestamp is the part you match on, and it needs no `ls` glob to do it — the `find` above finds all ten regardless of shell or depth. (A `**/` glob is not a substitute: without `globstar`, bash degrades `**` to a single `*` and it matches one level *down*, which is where these files are not — the eight `.pre-*` sit at depth 0, directly in `dist/`.)
 
 ### Patch 1 — embedded-Postgres shutdown intent (00:57Z)
 

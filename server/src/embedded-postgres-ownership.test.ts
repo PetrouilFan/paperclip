@@ -134,7 +134,7 @@ setInterval(() => {}, 1000);
 `;
 
 async function writeScript(name: string, source: string): Promise<string> {
-  const file = path.join(await makeTempDir("pet167-scripts-"), name);
+  const file = path.join(await makeTempDir("pgown-scripts-"), name);
   await fs.writeFile(file, source, "utf8");
   return file;
 }
@@ -228,11 +228,11 @@ interface SplitInstance {
 
 /** A `paperclipai run` server with the postmaster as its direct child. */
 async function spawnSplitInstance(): Promise<SplitInstance> {
-  const binDir = await makeTempDir("pet167-bin-");
+  const binDir = await makeTempDir("pgown-bin-");
   const bin = path.join(binDir, "paperclipai");
   await fs.writeFile(bin, SERVER_SOURCE, "utf8");
   const postmasterScript = await writeScript("postmaster.cjs", POSTMASTER_SOURCE);
-  const dataDir = await makeTempDir("pet167-db-");
+  const dataDir = await makeTempDir("pgown-db-");
   const port = await reserveFreePort();
 
   const { pid: serverPid } = await relaunch({
@@ -265,7 +265,7 @@ interface OrphanDatabase {
  */
 async function spawnOrphanedDatabase(): Promise<OrphanDatabase> {
   const postmasterScript = await writeScript("postmaster.cjs", POSTMASTER_SOURCE);
-  const dataDir = await makeTempDir("pet167-orphan-db-");
+  const dataDir = await makeTempDir("pgown-orphan-db-");
   const port = await reserveFreePort();
   const { pid: postmasterPid } = await relaunch({
     command: process.execPath,

@@ -167,17 +167,28 @@ export function resolvePrefixes(raw) {
  *
  * Two shapes per prefix, because the identifier is written both ways and a
  * branch-name check that only knows the separated form misses the one shape
- * that actually lands in git: `fix/pet392-blocker-edge-one-way-door` carries
+ * that actually lands in git: `fix/pet9002-blocker-edge-one-way-door` carries
  * no hyphen after the prefix at all, so `PET-\d+` cannot see it.
  */
 function buildMatchers(prefixes) {
   const alternation = prefixes.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`)).join('|');
   return {
-    // `PET-123`, `#PET-123`, `/PET-123`
+    // `PET-9001`, `#PET-9001`, `/PET-9001`
     separated: new RegExp(`${NOT_IN_WORD}(${alternation})-\\d+\\b`, 'gi'),
-    // `pet392-blocker`, `pet392_blocker`, `pet392`. Two digits minimum: with no
-    // separator a single trailing digit is far more likely to be a coincidence,
-    // and on master the compact form has exactly two occurrences, both real.
+    // `pet9002-blocker`, `pet9002_blocker`, `pet9002`. Two digits minimum: with no
+    // separator a single trailing digit is far more likely to be a coincidence.
+    // The floor used to be measured, not argued — the sweep that removed the
+    // real compact-form occurrences found eleven on master, all in temp-dir
+    // prefixes, throwaway systemd unit names and a deploy note. It is stated as
+    // a judgement now because that measurement is zero. Read the zero narrowly:
+    // it is a property of one tree at one moment, not of the rule. Eleven sat
+    // on master past the sweep that cleared the separated spelling, and four of
+    // them arrived *after* a first cut of this cleanup had already rebased, so
+    // the same claim made one commit earlier was false. The separated form also
+    // still has one live occurrence this cleanup does not touch — a branch
+    // name in .github/workflows/e2e-service-leg.yml, where renaming the ref
+    // would break the workflow that names it. "Zero" means this matcher, this
+    // spelling, this tree.
     compact: new RegExp(`${NOT_IN_WORD}(${alternation})\\d{2,}\\b`, 'gi'),
     // `/PET/issues/...`, `/PET/agents/...`, `agent://PET`
     link: new RegExp(
@@ -497,7 +508,7 @@ export function checkInternalRefs({
   for (const file of files ?? []) {
     const filename = file?.filename ?? '(unnamed)';
     // A file's own name is part of the change and can carry the id, which is
-    // how `pet392-blocker-edge-one-way-door.test.ts` reached the tree. A rename
+    // how `pet9002-blocker-edge-one-way-door.test.ts` reached the tree. A rename
     // publishes its new name, so the path is checked even where the *content*
     // is exempt — which is why this sits above the exemption checks.
     const pathHits = [...findAll(filename, separated), ...findAll(filename, compact)];
