@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import { prepareOpenCodeRuntimeConfig, readLocallyDeclaredOpenCodeModels } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -319,5 +319,82 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(prepared.env).toEqual({ XDG_CONFIG_HOME: configHome });
     expect(prepared.notes).toEqual([]);
     await prepared.cleanup();
+  });
+});
+
+describe("readLocallyDeclaredOpenCodeModels", () => {
+  it("reports provider/model ids declared in the run's OpenCode config", async () => {
+    const configHome = await makeConfigHome({
+      provider: {
+        "local-zenfree": {
+          options: { baseURL: "http://localhost:8099/v1" },
+          models: { default: {}, "space-bunny-free": {} },
+        },
+        // A provider with no explicit models map declares nothing.
+        omniroute: { options: { baseURL: "http://localhost:20128/v1" } },
+        broken: "not-an-object",
+      },
+    });
+
+    const declared = await readLocallyDeclaredOpenCodeModels({
+      env: { XDG_CONFIG_HOME: configHome },
+    });
+
+    expect([...declared.models].sort()).toEqual([
+      "local-zenfree/default",
+      "local-zenfree/space-bunny-free",
+    ]);
+    expect(declared.sources).toEqual([
+      path.join(configHome, "opencode", "opencode.json"),
+    ]);
+  });
+
+  it("merges ids declared through PAPERCLIP_OPENCODE_PROVIDERS", async () => {
+    const configHome = await makeConfigHome({
+      provider: { "local-zenfree": { models: { default: {} } } },
+    });
+
+    const declared = await readLocallyDeclaredOpenCodeModels({
+      env: {
+        XDG_CONFIG_HOME: configHome,
+        PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+          omniroute: { models: { "openrouter/z-ai/glm-5.3-flash": {} } },
+        }),
+      },
+    });
+
+    expect([...declared.models].sort()).toEqual([
+      "local-zenfree/default",
+      "omniroute/openrouter/z-ai/glm-5.3-flash",
+    ]);
+    expect(declared.sources).toContain("PAPERCLIP_OPENCODE_PROVIDERS");
+  });
+
+  it("returns an empty set instead of throwing on a missing or malformed config", async () => {
+    const configHome = await fs.mkdtemp(
+      path.join(os.tmpdir(), "paperclip-opencode-test-"),
+    );
+    cleanupPaths.add(configHome);
+
+    await expect(
+      readLocallyDeclaredOpenCodeModels({ env: { XDG_CONFIG_HOME: configHome } }),
+    ).resolves.toEqual({ models: new Set(), sources: [] });
+
+    await fs.writeFile(
+      path.join(configHome, "opencode", "opencode.json"),
+      "{ not json",
+      "utf8",
+    ).catch(async () => {
+      await fs.mkdir(path.join(configHome, "opencode"), { recursive: true });
+      await fs.writeFile(
+        path.join(configHome, "opencode", "opencode.json"),
+        "{ not json",
+        "utf8",
+      );
+    });
+
+    await expect(
+      readLocallyDeclaredOpenCodeModels({ env: { XDG_CONFIG_HOME: configHome } }),
+    ).resolves.toEqual({ models: new Set(), sources: [] });
   });
 });
