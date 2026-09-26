@@ -29,13 +29,15 @@ name: Slow Boot Proof
 # default branch, so a dispatch only works once the file is on master, while a
 # push trigger runs the file as it exists on the pushed commit.
 #
-# A push runs PROBE mode and a dispatch runs PROOF mode, and the two default
-# that way on purpose. A push is how the lever that the proof needs gets chosen
-# -- there is one, and it is not the obvious one (run 36248896352 measured that
-# CPU oversubscription buys 2x where the bar needs 18x, because a boot is not
-# CPU-bound). The deliverable is the proof, so the deliverable is the run that
-# has to be chosen on purpose, and the measurement runs on whatever lands on
-# this branch.
+# A push runs PROOF mode and a dispatch can be pointed at either, and both
+# default to proof. The lever the proof needs is chosen in-run by step 5b of
+# the script (cheapest rung that lands inside the band), so there is no longer
+# a measurement pass for a human to read before the deliverable is worth
+# spending: run 36253471735 produced a table with no row above 90s, and
+# turning that into a proof cost a push, a read, an edit and a second run.
+# probe mode stays for when the question really is "what can this host do",
+# which is a different question from "does the rendered unit survive a slow
+# boot" and is the one worth asking before changing a lever.
 
 on:
   push:
@@ -69,12 +71,17 @@ on:
       slow_boot_levers:
         description: probe mode only - the levers to measure, in order
         required: false
-        default: "idle cpuset:1 io:8m mem:768 cpuset:1,io:8m"
+        default: "idle cpuset:1 io:8m mem:768 bandwidth:20 bandwidth:8 bandwidth:4 bandwidth:2"
         type: string
       slow_boot_lever:
-        description: "proof mode only - the lever that gets boot 2 over the bar. Comma-separate to combine (e.g. cpuset:1,io:8m)"
+        description: "proof mode only - the lever for boot 2, or `auto` to calibrate it in this run. Comma-separate to combine (e.g. mem:768,swap:512)"
         required: false
-        default: "cpuset:1,io:8m"
+        default: "auto"
+        type: string
+      slow_boot_ladder:
+        description: "proof mode with SLOW_BOOT_LEVER=auto - the rungs to try, cheapest first. The first boot that lands in (bar, 60% of budget] wins"
+        required: false
+        default: "bandwidth:20 bandwidth:8 bandwidth:4 bandwidth:2"
         type: string
 
 permissions:
@@ -187,9 +194,16 @@ jobs:
           # merged to master as d415c4196 and this commit is its descendant.
           SLOW_BOOT_REF: ${{ inputs.slow_boot_ref || github.sha }}
           SLOW_BOOT_MIN_BOOT_SECONDS: ${{ inputs.slow_boot_min_boot_seconds || '90' }}
-          SLOW_BOOT_MODE: ${{ inputs.slow_boot_mode || (github.event_name == 'push' && 'probe' || 'proof') }}
+          # A push runs the deliverable. It used to run probe mode instead,
+          # on the theory that the lever had to be chosen by a human reading
+          # a table before a proof was worth spending; run 36253471735 is the
+          # cost of that theory, when the table has no winner in it. Step 5b
+          # now makes that choice in-run, so there is nothing left for a human
+          # to decide between two runs and the push is worth being the proof.
+          SLOW_BOOT_MODE: ${{ inputs.slow_boot_mode || 'proof' }}
           SLOW_BOOT_LEVERS: ${{ inputs.slow_boot_levers || '' }}
-          SLOW_BOOT_LEVER: ${{ inputs.slow_boot_lever || 'io:8m' }}
+          SLOW_BOOT_LEVER: ${{ inputs.slow_boot_lever || 'auto' }}
+          SLOW_BOOT_LADDER: ${{ inputs.slow_boot_ladder || '' }}
         run: |
           set +e
           ./scripts/slow-boot-proof.sh 2>&1 | tee "$RUNNER_TEMP/slow-boot-proof.log"
@@ -199,19 +213,34 @@ jobs:
           exit "$code"
 
       - name: Require the DoD assertions
-        # Proof mode only. A probe reports measurements, not assertions, and
-        # forcing it through this gate would mean a probe that found no
-        # workable lever -- the most useful possible result -- still had to
-        # paint itself green to avoid going red.
-        if: ${{ (inputs.slow_boot_mode || (github.event_name == 'push' && 'probe' || 'proof')) == 'proof' }}
         # The script already exits non-zero on any FAIL, so this is belt and
         # braces -- and it is deliberately checking for named PASS lines rather
         # than for the absence of the word FAIL. A script that died before
         # reaching its summary has no FAIL line either, and treating that as a
         # pass is how an earlier leg on this fork reported green while the
         # thing it was cited for was still broken.
+        #
+        # No `if:` on the mode, deliberately. This step used to carry the same
+        # `inputs.slow_boot_mode || (push && probe || proof)` expression the
+        # script's own default came from, and when that default changed from
+        # probe to proof the two drifted apart: the script ran a proof on every
+        # push while this gate evaluated false and was SKIPPED. A gate that can
+        # be silently skipped is not a gate, and the failure is invisible -- the
+        # run is green precisely because the thing that would have checked it
+        # did not run. So the mode is read out of the log the script actually
+        # wrote instead of being re-derived from the event, and there is only
+        # one source of truth left.
         run: |
           sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/slow-boot-proof.log" > "$RUNNER_TEMP/proof.clean.log"
+          if grep -q "mode=probe" "$RUNNER_TEMP/proof.clean.log"; then
+            echo "the script ran in probe mode, so it asserts nothing and this gate does not apply."
+            echo "A probe that found no workable lever is a result, not a failure."
+            exit 0
+          fi
+          grep -q "mode=proof" "$RUNNER_TEMP/proof.clean.log" || {
+            echo "could not tell which mode the script ran in; refusing to pass a run I cannot classify"
+            exit 1
+          }
           {
             echo "== all result lines =="
             grep -E '^(PASS|FAIL) +[0-9]' "$RUNNER_TEMP/proof.clean.log" || echo "(none: the proof did not reach its results)"
@@ -234,18 +263,22 @@ jobs:
 
       - name: Re-derive the headline number independently
         # Proof mode only, for the same reason as the step above: there is no
-        # proof boot to re-derive in a probe.
+        # proof boot to re-derive in a probe. Read out of the log rather than
+        # off the event, for the same reason -- see the step above.
         #
         # Read the boot duration back out of the evidence block rather than
         # trusting the script's own comparison. Anchored on the field, not on
         # a bare number: the evidence line also carries the bar
         # ("152s (... bar >90s)"), so a looser match collects both numbers and
         # the comparison below is then run against a two-line string.
-        if: ${{ (inputs.slow_boot_mode || (github.event_name == 'push' && 'probe' || 'proof')) == 'proof' }}
         run: |
           ev="$RUNNER_TEMP/pet296-evidence.txt"
-          test -f "$ev" || { echo "no evidence file at $ev"; exit 1; }
-          bar="${{ inputs.slow_boot_min_boot_seconds || '90' }}"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/slow-boot-proof.log" > "$RUNNER_TEMP/proof.clean.log"
+          if grep -q "mode=probe" "$RUNNER_TEMP/proof.clean.log"; then
+            echo "probe mode: there is no proof boot to re-derive."
+            exit 0
+          fi
+          test -f "$ev" || { echo "no evidence file at $ev"; exit 1; }          bar="${{ inputs.slow_boot_min_boot_seconds || '90' }}"
           secs="$(sed -n 's/^ *proof boot *: *\([0-9][0-9]*\)s.*/\1/p' "$ev")"
           test -n "$secs" || { echo "no proof-boot line in the evidence block"; exit 1; }
           echo "proof boot ${secs}s against a bar of ${bar}s"

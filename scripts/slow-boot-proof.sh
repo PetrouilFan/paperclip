@@ -18,11 +18,16 @@ set -euo pipefail
 #
 # TWO MODES
 #
-#   proof  the deliverable. One real install, one boot made to exceed 90s on
-#          purpose, and the DoD asserted on it.
+#   proof  the deliverable. One real install, a calibration pass that picks the
+#          lever in the same run, one boot made to exceed 90s on purpose, and
+#          the DoD asserted on it.
 #   probe  measures what this host can actually be made to do, one boot per
-#          candidate lever, and prints the table. Exists because the obvious
-#          lever is wrong and guessing cost a cycle to find out (see below).
+#          candidate lever, and prints the table. Diagnostic; it asserts
+#          nothing. Proof mode used to need a probe run, a human reading the
+#          table, and a second run -- and run 36253471735 is what that costs
+#          when the table comes back with no winner, which is why the
+#          selection rule is now the loop in 5b instead of a paragraph of
+#          prose at the bottom of the probe's output.
 #
 # WHY THE OBVIOUS LEVER IS WRONG (measured, run 36248896352)
 #
@@ -46,11 +51,20 @@ set -euo pipefail
 #   idle     nothing. The control every other number is read against.
 #   cpu:N    N CPU spinners outside the unit's cgroup. Absolute count.
 #   cpu:xN   N * nproc spinners, so the same oversubscription on any runner.
+#   bandwidth:PCT
+#            cgroup v2 `cpu.max` on the unit's cgroup: PCT percent of ONE
+#            core, applied to the boot's own threads. This is the lever the
+#            bar actually needs, and it is the one run 36253471735 was missing.
+#            See the comment on bandwidth_apply for why it is not the same
+#            thing as cpu:N above, and why that difference is the whole
+#            eighteen-fold.
 #   io:RATE  cgroup v2 `io.max` on the unit's cgroup: RATE bytes/sec of
 #            read+write, e.g. `io:8m`. The lever that speaks directly to a
 #            disk-bound boot, and the closest stand-in for the real cause --
 #            outage #4 was a host whose disk could not keep up, on a box where
-#            swap was exhausted and the postmaster was thrashing.
+#            swap was exhausted and the postmaster was thrashing. Reported
+#            unavailable on a GitHub runner: the `io` controller is not
+#            delegated to the unit's cgroup there.
 #   mem:MB   cgroup v2 `memory.max` on the unit's cgroup. A ceiling below what
 #            the boot wants does not fail it: it puts the kernel on the direct
 #            reclaim path for every allocation past the ceiling, and inside a
@@ -62,16 +76,15 @@ set -euo pipefail
 #   cpuset:N the boot's own threads confined to N CPUs. Not more spinners:
 #            oversubscription outside the cgroup asks whether the scheduler is
 #            contended, this asks whether the boot is short of CPU, and only
-#            the second question is the one worth asking.
+#            the second question is the one worth asking. Unavailable on a
+#            GitHub runner, and provably so rather than by accident: a cgroup
+#            that holds processes cannot enable cpuset for its children.
 #   swap:MB  hold MB resident to push the boot's own allocations onto a
 #            swapfile. Requires a swapfile; the workflow creates one and the
 #            lever reports itself skipped when there is none.
 #
 # A spec may also be a comma-separated list, applied left to right, and it
-# counts as available only if every part of it is. The bar needs about
-# eighteen-fold and no single controller gives that much on its own --
-# cpuset:1 is 4x by arithmetic -- so the combination is the expected shape of
-# the answer. All the parts are still properties of the machine.
+# counts as available only if every part of it is.
 #
 # Every one of these reports itself SKIP when the host cannot provide it, rather
 # than passing vacuously -- io needs the `io` controller delegated down to the
@@ -94,13 +107,19 @@ set -euo pipefail
 #   * patching the server to sleep before it notifies. That would prove the
 #     budget is sufficient while proving nothing about a real boot.
 #
-# STRUCTURE (proof mode: four boots, all on the real unit)
+# STRUCTURE (proof mode: calibration pass, then three boots, all on the real
+# unit)
 #
 #   boot 0  the onboard boot. Fresh instance, so this one pays for every
 #           migration. Reported, not asserted on: it is uncontrolled, because
 #           `onboard --install-service` installs and starts in one step.
 #   boot 1  warm baseline, unloaded. Calibrates boot 2. Reported as
 #           `baselineBootSeconds`.
+#   5b      CALIBRATION, only when SLOW_BOOT_LEVER=auto. One warm boot per
+#           rung of SLOW_BOOT_LADDER, cheapest first, and the first boot that
+#           lands in (90s, 60% of the budget] is the lever boots 2 and 3 use.
+#           Selecting it here rather than from a probe run's table is the
+#           difference between one run to prove a boot and three.
 #   boot 2  THE PROOF. The host is slowed on purpose, then start. Asserts >90s
 #           to ready with NRestarts=0 and ActiveState=active. This is the
 #           number DoD 2 wants.
@@ -139,7 +158,12 @@ set -euo pipefail
 # Env knobs:
 #   SLOW_BOOT_MODE              proof | probe (default proof)
 #   SLOW_BOOT_LEVERS            probe mode: space-separated lever list
-#   SLOW_BOOT_LEVER             proof mode: the lever that gets boot 2 over the bar
+#   SLOW_BOOT_LEVER             proof mode: the lever for boot 2, or `auto` to
+#                               pick it in this run from SLOW_BOOT_LADDER
+#   SLOW_BOOT_LADDER            auto mode: rungs, cheapest first
+#   SLOW_BOOT_CAL_CAP           hard cap on one calibration boot (default: the
+#                               headroom line + 90s, so it can never discard a
+#                               rung the band would have accepted)
 #   SLOW_BOOT_REPO              GitHub repo to install from (default PetrouilFan/paperclip)
 #   SLOW_BOOT_REF               ref/sha to install (default: this checkout's sha)
 #   SLOW_BOOT_INSTANCE          instance id (default pet296)
@@ -149,8 +173,10 @@ set -euo pipefail
 #   SLOW_BOOT_KEEP_LEVER        1 = leave the lever applied for inspection
 
 SLOW_BOOT_MODE="${SLOW_BOOT_MODE:-proof}"
-SLOW_BOOT_LEVERS="${SLOW_BOOT_LEVERS:-idle cpuset:1 io:8m mem:768 cpuset:1,io:8m}"
-SLOW_BOOT_LEVER="${SLOW_BOOT_LEVER:-cpuset:1,io:8m}"
+SLOW_BOOT_LEVERS="${SLOW_BOOT_LEVERS:-idle cpuset:1 io:8m mem:768 bandwidth:20 bandwidth:8 bandwidth:4 bandwidth:2}"
+SLOW_BOOT_LEVER="${SLOW_BOOT_LEVER:-auto}"
+SLOW_BOOT_LADDER="${SLOW_BOOT_LADDER:-bandwidth:20 bandwidth:8 bandwidth:4 bandwidth:2}"
+SLOW_BOOT_CAL_CAP="${SLOW_BOOT_CAL_CAP:-}"
 SLOW_BOOT_REPO="${SLOW_BOOT_REPO:-PetrouilFan/paperclip}"
 SLOW_BOOT_REF="${SLOW_BOOT_REF:-}"
 SLOW_BOOT_INSTANCE="${SLOW_BOOT_INSTANCE:-pet296}"
@@ -175,6 +201,7 @@ SWAP_PIDS=()
 IO_CG=""
 IO_DEV=""
 IO_PREV=""
+BANDWIDTH_PREV=""
 
 # --- output helpers -------------------------------------------------------
 note()  { printf '\n\033[1;34m== %s ==\033[0m\n' "$*"; }
@@ -475,6 +502,64 @@ cpuset_release() {
   return 0
 }
 
+# cpu.max. The lever the probe in run 36253471735 never tried, and the one it
+# should have: `mem` wrote its file fine on the same cgroup, and `cpu` sits in
+# the very same parent `cgroup.subtree_control` that `mem` was read out of, so
+# availability was never in question -- the lever was simply not written.
+#
+# It is also the only one of the four that scales the way the bar needs. The
+# bar is about eighteen-fold on a ~5s boot. `cpu:N` oversubscribes the
+# scheduler with processes that are not the boot, and the boot barely uses the
+# CPU (measured: 46% of the host across a baseline boot), so it bought 2x.
+# `cpuset:1` is 4x by arithmetic and is not even available here, because a
+# cgroup holding processes cannot enable cpuset for its children. `mem` only
+# bites once the boot is already in reclaim, which on an idle runner means it
+# restarts rather than slows (measured: mem:768 gave NRestarts=1 and a boot
+# that still finished in seconds).
+#
+# cpu.max is a *bandwidth* limit on the boot's own threads -- not a share of
+# the host, a fraction of ONE core -- so `bandwidth:2` is a hard 2% and moves
+# the boot by 50x while still being a property of the machine applied from
+# outside. Nothing is dropped, and the waits that do not consume quota (the
+# embedded postmaster, fsync) stay free, so the real boot lands ABOVE the
+# pure-arithmetic estimate: the error is in the safe direction.
+CPU_MAX_US=""
+bandwidth_apply() {
+  local pct="$1" file="/sys/fs/cgroup$IO_CG/cpu.max"
+  case "$pct" in
+    ''|*[!0-9]*) info "bandwidth: '$pct' is not a number of percent"; return 1 ;;
+  esac
+  if [ "$pct" -lt 1 ] || [ "$pct" -gt 100 ]; then
+    info "bandwidth: ${pct}% is out of range (1-100)"
+    return 1
+  fi
+  BANDWIDTH_PREV="$(cat "$file" 2>/dev/null || true)"
+  CPU_MAX_US="$(( pct * 1000 )) 100000"
+  if ! printf '%s\n' "$CPU_MAX_US" | sudo tee "$file" >/dev/null 2>&1; then
+    info "bandwidth: could not write $file"
+    return 1
+  fi
+  local now
+  now="$(cat "$file" 2>/dev/null || true)"
+  if [ "$now" != "$CPU_MAX_US" ]; then
+    info "bandwidth: kernel did not accept $CPU_MAX_US; read-back is: $now"
+    return 1
+  fi
+  info "bandwidth: $file = $now (was ${BANDWIDTH_PREV:-?}) -- ${pct}% of one core for the boot's own threads"
+  return 0
+}
+
+bandwidth_release() {
+  [ -n "$IO_CG" ] || return 0
+  local file="/sys/fs/cgroup$IO_CG/cpu.max"
+  if [ -f "$file" ] && [ -n "$BANDWIDTH_PREV" ]; then
+    printf '%s\n' "$BANDWIDTH_PREV" | sudo tee "$file" >/dev/null 2>&1 || true
+  fi
+  BANDWIDTH_PREV=""
+  CPU_MAX_US=""
+  return 0
+}
+
 lever_release() {
   if [ "$SLOW_BOOT_KEEP_LEVER" = "1" ]; then return 0; fi
   load_stop
@@ -482,6 +567,7 @@ lever_release() {
   io_release
   mem_release
   cpuset_release
+  bandwidth_release
   return 0
 }
 
@@ -585,6 +671,17 @@ lever_apply_one() {
       n="${spec#cpuset:}"
       cg_enable cpuset "$IO_CG" cpuset.cpus || return 1
       cpuset_apply "$n" || return 1
+      return 0
+      ;;
+    bandwidth:*)
+      # bandwidth:PCT  cgroup v2 `cpu.max` on the unit's own cgroup: PCT
+      #                 percent of ONE core, for the boot's own threads.
+      #                 Not to be confused with cpu:N above, which adds
+      #                 processes OUTSIDE the cgroup; this constrains the
+      #                 boot itself, which is why it moves.
+      n="${spec#bandwidth:}"
+      if ! cg_enable cpu "$IO_CG" cpu.max; then return 1; fi
+      bandwidth_apply "$n" || return 1
       return 0
       ;;
     *) info "lever: unknown spec '$spec'"; return 1 ;;
@@ -764,6 +861,28 @@ EFF_KILLMODE="$(prop KillMode)"
 EFF_TYPE="$(prop Type)"
 EFF_TIMEOUT_SECS="$(timespan_to_seconds "$EFF_TIMEOUT" || echo -1)"
 info "systemd effective: Type=$EFF_TYPE TimeoutStartUSec=$EFF_TIMEOUT (${EFF_TIMEOUT_SECS}s) KillMode=$EFF_KILLMODE"
+# The headroom line the calibration ladder selects against, as a real number.
+# Derived from what systemd actually applied rather than hardcoded to 600, so
+# a host that rendered a different budget calibrates against its own. -1 means
+# the unit's TimeoutStartUSec could not be parsed, in which case there is no
+# trustworthy budget to leave headroom under and the rendered 600 is the only
+# defensible assumption.
+if [ "$EFF_TIMEOUT_SECS" -gt 0 ] 2>/dev/null; then
+  CAL_HEADROOM_SECS=$(( EFF_TIMEOUT_SECS * 60 / 100 ))
+else
+  CAL_HEADROOM_SECS=360
+fi
+# The cap on ONE calibration boot, derived from the headroom line rather than
+# fixed. A hardcoded cap below the headroom line silently throws away the
+# rungs this loop exists to find: a boot that completes at 320s against a 360s
+# headroom is a perfectly good answer, and with a 300s cap it is reported as
+# "did not finish" and the ladder moves on to something worse. The 90s of slack
+# is the difference between "this rung is too strong" and "this rung never
+# answered", which are different findings.
+if [ -z "$SLOW_BOOT_CAL_CAP" ]; then
+  SLOW_BOOT_CAL_CAP=$(( CAL_HEADROOM_SECS + 90 ))
+fi
+info "calibration: headroom line ${CAL_HEADROOM_SECS}s, per-boot cap ${SLOW_BOOT_CAL_CAP}s"
 if [ "$EFF_TIMEOUT_SECS" = "600" ]; then
   pass "4d systemd applied the 600s start budget (not the 90s default)"
 elif [ "$EFF_TIMEOUT_SECS" -gt "$SLOW_BOOT_MIN_BOOT_SECONDS" ] 2>/dev/null; then
@@ -962,6 +1081,81 @@ fi
 # ===========================================================================
 # PROOF MODE
 # ===========================================================================
+# --- 5b. calibration: pick the lever, in this run -------------------------
+# SLOW_BOOT_LEVER=auto. The probe's own "READING THIS TABLE" section states
+# the selection rule as prose -- the cheapest row that clears the bar and
+# leaves headroom under the 600s budget -- and run 36253471735 showed what
+# happens when that rule lives only in prose: the table came back, no row
+# cleared, and closing the ticket cost a read-the-log, edit-the-workflow,
+# wait-another-20-minutes cycle. The rule is a loop, so it is a loop.
+#
+# Cheapest means highest bandwidth, because a boot held near 91s is a boot
+# that will flake on the next runner. Headroom is the other half of the same
+# rule: a row that reached the 600s budget would prove the budget BOUNDED the
+# boot, not that the boot completed inside it, which is the opposite claim.
+# So the band is MIN < boot <= 60% of the budget, and the ladder is ordered
+# from most headroom to least, so the first hit is the cheapest hit.
+if [ "$SLOW_BOOT_LEVER" = "auto" ]; then
+  note "5b. CALIBRATE: choosing the lever for boot 2"
+  info "band for the chosen boot: >${SLOW_BOOT_MIN_BOOT_SECONDS}s and <=${CAL_HEADROOM_SECS}s of the ${EFF_TIMEOUT_SECS}s budget"
+  info "the ladder runs cheapest-first, so the first row inside the band wins"
+  row LEVER BOOTS NRES RESULT CPU% VERDICT
+  CAL_TABLE=()
+  CHOSEN=""
+  for LEVER in $SLOW_BOOT_LADDER; do
+    systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+    if ! lever_apply "$LEVER"; then
+      row "$LEVER" - - - - "unavailable on this host"
+      CAL_TABLE+=("$LEVER|unavailable|-|-|-|-|")
+      continue
+    fi
+    set +e
+    measure_boot "cal:$LEVER" "$SLOW_BOOT_CAL_CAP"
+    crc=$?
+    set -e
+    lever_release
+    # shellcheck disable=SC2086
+    set -- $BOOT_OUT
+    C_BOOT="$1"; C_STATE="$2"; C_NRES="$4"; C_RESULT="$5"; C_CPU="$6"
+    C_VERDICT="under the bar"
+    C_OVER_HEADROOM=0
+    if [ "$crc" != "0" ]; then
+      C_VERDICT="did not finish: $C_RESULT/$C_STATE"
+    elif [ "$C_BOOT" -gt "$CAL_HEADROOM_SECS" ] 2>/dev/null; then
+      C_VERDICT="over the headroom line"
+      C_OVER_HEADROOM=1
+    elif [ "$C_BOOT" -gt "$SLOW_BOOT_MIN_BOOT_SECONDS" ] 2>/dev/null; then
+      C_VERDICT="SELECTED"
+      [ -n "$CHOSEN" ] || CHOSEN="$LEVER"
+    fi
+    row "$LEVER" "$C_BOOT" "$C_NRES" "$C_RESULT" "${C_CPU}%" "$C_VERDICT"
+    CAL_TABLE+=("$LEVER|$C_BOOT|$C_NRES|$C_RESULT|$C_CPU|$C_VERDICT|")
+    # Every remaining rung is a SMALLER number, i.e. a harder limit, i.e. a
+    # slower boot. So once one rung is past the headroom line nothing left in
+    # the ladder can be cheaper than it, and the answer to the question this
+    # loop asks is already decided. Walking the rest of the ladder would only
+    # spend the runner's minutes confirming it.
+    if [ "$C_OVER_HEADROOM" = "1" ] && [ -z "$CHOSEN" ]; then
+      info "$LEVER is already past the ${CAL_HEADROOM_SECS}s headroom line and every"
+      info "remaining rung is stronger, so the ladder stops here rather than"
+      info "spending a boot per rung to re-derive an answer this row just gave."
+      break
+    fi
+  done
+  note "CALIBRATION TABLE"
+  printf '      %-16s %8s %6s %10s %6s  %s\n' LEVER BOOTS NRES RESULT CPU% VERDICT
+  for line in ${CAL_TABLE[@]+"${CAL_TABLE[@]}"}; do
+    IFS='|' read -r l b n r c v _ <<< "$line"
+    printf '      %-16s %8s %6s %10s %6s  %s\n' "$l" "$b" "$n" "$r" "${c}%" "$v"
+  done
+  if [ -z "$CHOSEN" ]; then
+    die "no lever on $SLOW_BOOT_LADDER cleared >${SLOW_BOOT_MIN_BOOT_SECONDS}s inside ${CAL_HEADROOM_SECS}s on this host. The table above is the whole finding; widen SLOW_BOOT_LADDER or drop SLOW_BOOT_MIN_BOOT_SECONDS. Do not lower the bar -- 90s is the default this ticket is about."
+  fi
+  SLOW_BOOT_LEVER="$CHOSEN"
+  info "auto-selected SLOW_BOOT_LEVER=$SLOW_BOOT_LEVER"
+fi
+
 note "6. boot 2, THE PROOF: $SLOW_BOOT_LEVER applied, then start"
 if ! lever_apply "$SLOW_BOOT_LEVER"; then
   die "the lever '$SLOW_BOOT_LEVER' is not available on this host, so boot 2 cannot be made slow. Run SLOW_BOOT_MODE=probe to find one that is."
