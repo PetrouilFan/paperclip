@@ -44,8 +44,17 @@ const MEMBER_CALL_PATTERN = String.raw`\??\.\s*markShutdownIntent\s*\(\s*\)`;
 /** The bare identifier, to catch a destructured/bare call or a copied second latch. */
 const MENTION_PATTERN = String.raw`\bmarkShutdownIntent\b`;
 
-/** A call to the local `shutdown(signal, exitProcess)` with a literal second argument. */
-const SHUTDOWN_CALL_PATTERN = String.raw`\bshutdown\(\s*(?:"[A-Z]+"|[A-Za-z_$][\w$]*)\s*,\s*(true|false)\s*\)`;
+/**
+ * A call to the local `shutdown(signal, exitProcess)` with a literal second argument.
+ *
+ * The signal-literal alternative must admit digits. `SIGUSR1` and `SIGUSR2` are the two
+ * signals POSIX reserves for whatever a program wants to hang its own handlers on, so they
+ * are the most likely names for a reconfigure or pause-the-supervisor path — exactly the
+ * paths that mark the intent without exiting. With `[A-Z]+` such a call matched nothing at
+ * all and the guard below passed on it silently, which is the exact failure this file exists
+ * to prevent. The identifier alternative still covers a signal held in a variable.
+ */
+const SHUTDOWN_CALL_PATTERN = String.raw`\bshutdown\(\s*(?:"[A-Z0-9]+"|[A-Za-z_$][\w$]*)\s*,\s*(true|false)\s*\)`;
 
 /**
  * `shutdown` is the next local declaration; the first `process.once(` after it is
@@ -303,6 +312,27 @@ describe("embedded PostgreSQL shutdown-intent call site", () => {
       "embedded-postgres-supervisor.ts",
       "index.ts",
     ]);
+  });
+
+  it("sees every signal spelling, including the digit-bearing user signals", () => {
+    // Self-test for the scanner itself. A hole in SHUTDOWN_CALL_PATTERN is invisible from
+    // the outside: the scan simply finds fewer calls, the "non-exiting callers" list stays
+    // short, and every assertion below it passes. `SIGUSR1`/`SIGUSR2` are the signals a
+    // program is expected to use for its own reconfigure/pause handlers, so a pattern that
+    // skipped them would miss the very call this ticket is about.
+    const seen = (line: string) =>
+      [...line.matchAll(new RegExp(SHUTDOWN_CALL_PATTERN, "g"))].map((m) => m[0]);
+
+    expect(seen('void shutdown("SIGTERM", true);')).toHaveLength(1);
+    expect(seen('void shutdown("SIGINT", true);')).toHaveLength(1);
+    expect(seen('void shutdown("SIGUSR1", false);')).toHaveLength(1);
+    expect(seen('void shutdown("SIGUSR2", false);')).toHaveLength(1);
+    expect(seen("void shutdown(SOME_SIGNAL, false);")).toHaveLength(1);
+
+    // The literal branch is still anchored: a lowercase or non-signal token is a different
+    // call and must not be counted as evidence either way.
+    expect(seen('void shutdown("sigterm", false);')).toHaveLength(0);
+    expect(seen("void shutdown(signal, maybe);")).toHaveLength(0);
   });
 
   it("only runs shutdown() without exiting the process from the teardown export", () => {
