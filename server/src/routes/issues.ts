@@ -88,6 +88,8 @@ import {
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  ISSUE_STATUSES,
+  ISSUE_ORIGIN_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -680,6 +682,106 @@ function readObject(value: unknown): Record<string, unknown> {
 
 function hasOwn(record: Record<string, unknown>, key: string) {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * Members of a `?status=` filter that are not canonical issue statuses.
+ *
+ * The list and count routes 400 every other enum-bearing key they accept
+ * (`sortField`, `sortDir`, `view`, `attention`), but `status` reached the filter
+ * unvalidated, so a value the board cannot contain answered `200` with an empty
+ * list.
+ *
+ * Reads the canonical set from `ISSUE_STATUSES` rather than retyping it, so the
+ * day a status is added there it is accepted without a second edit.
+ *
+ * Defined here rather than re-exported from the service barrel on purpose: the
+ * route layer's only job is to read and reject query values, and a pure helper
+ * exported through `services/index.js` becomes a member of a barrel that 37 test
+ * files hand-enumerate under `vi.mock`. Adding to that barrel turns every one of
+ * those mocks into a 500 on the list route, which is a much larger blast radius
+ * than the fix warrants.
+ */
+function findUnknownIssueStatusValues(
+  input: string | string[] | undefined,
+): string[] {
+  const known = ISSUE_STATUSES as readonly string[];
+  const entries = Array.isArray(input) ? input : [input];
+  return [
+    ...new Set(
+      entries
+        .filter((entry): entry is string => typeof entry === "string")
+        .flatMap((entry) => entry.split(","))
+        .map((status) => status.trim())
+        .filter(Boolean)
+        .filter((status) => !known.includes(status)),
+    ),
+  ];
+}
+
+/**
+ * `?originKind=` value that is neither a built-in origin kind nor a plugin kind.
+ *
+ * Unlike `status`, the filter applies `originKind` with an exact match rather
+ * than a comma list, so this deliberately does not split on commas: doing so
+ * would turn today's `eq(origin_kind, "manual,routine_execution")` (which matches
+ * nothing) into a two-member filter, i.e. a silent behaviour change on top of a
+ * validation change.
+ *
+ * `IssueOriginKind` is `BuiltInIssueOriginKind | \`plugin:${string}\``, so the
+ * `plugin:` namespace is accepted by design and matched by prefix here.
+ */
+function findUnknownIssueOriginKindValues(
+  input: string | string[] | undefined,
+): string[] {
+  const known = ISSUE_ORIGIN_KINDS as readonly string[];
+  const values = (Array.isArray(input) ? input : [input])
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return [
+    ...new Set(
+      values.filter(
+        (kind) => !known.includes(kind) && !kind.startsWith("plugin:"),
+      ),
+    ),
+  ];
+}
+
+/**
+ * Reject a `?status=` or `?originKind=` value the board cannot contain.
+ *
+ * Both the list and the count route accept these two keys, and both used to
+ * hand them to the filter unvalidated while 400-ing every neighbouring enum key
+ * (`sortField`, `sortDir`, `view`, `attention`). The silent answer was the
+ * damaging part: `?status=<typo>` returned `200` with an empty list, and
+ * `?attention=blocked&status=<typo>` on the count route returned a confident
+ * `0` while issues were in fact blocked.
+ *
+ * Returns `true` when it has written the 400, so each caller can `return`.
+ */
+function rejectUnknownIssueFilterValues(
+  res: Response,
+  rawStatus: string | string[] | undefined,
+  rawOriginKind: string | string[] | undefined,
+): boolean {
+  const unknownStatuses = findUnknownIssueStatusValues(rawStatus);
+  if (unknownStatuses.length > 0) {
+    res.status(400).json({
+      error: `status must be one of ${ISSUE_STATUSES.join(", ")} when provided`,
+      unknownStatusValues: unknownStatuses,
+    });
+    return true;
+  }
+  const unknownOriginKinds = findUnknownIssueOriginKindValues(rawOriginKind);
+  if (unknownOriginKinds.length > 0) {
+    res.status(400).json({
+      error: `originKind must be one of ${ISSUE_ORIGIN_KINDS.join(", ")} or a plugin: value when provided`,
+      unknownOriginKindValues: unknownOriginKinds,
+    });
+    return true;
+  }
+  return false;
 }
 
 async function auditAgentIssueCreateAttributionSpoof(input: {
@@ -7999,6 +8101,15 @@ export function issueRoutes(
         .json({ error: "attention must be 'blocked' when provided" });
       return;
     }
+    if (
+      rejectUnknownIssueFilterValues(
+        res,
+        req.query.status as string | string[] | undefined,
+        req.query.originKind as string | string[] | undefined,
+      )
+    ) {
+      return;
+    }
     if (view !== undefined && view !== "compact") {
       res.status(400).json({ error: "view must be 'compact' when provided" });
       return;
@@ -8299,6 +8410,15 @@ export function issueRoutes(
       res
         .status(400)
         .json({ error: "issues/count does not accept limit or offset" });
+      return;
+    }
+    if (
+      rejectUnknownIssueFilterValues(
+        res,
+        req.query.status as string | string[] | undefined,
+        req.query.originKind as string | string[] | undefined,
+      )
+    ) {
       return;
     }
     if (hasPlanDocument === null) {
