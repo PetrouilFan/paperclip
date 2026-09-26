@@ -17,6 +17,7 @@ import { checkTestCoverage } from './check-pr-test-coverage.mjs';
 import { checkLockfile } from './check-pr-lockfile.mjs';
 import { checkDependencies } from './check-pr-dependencies.mjs';
 import { checkReleaseBootstrap } from './check-pr-release-bootstrap.mjs';
+import { checkInternalReferences } from './check-pr-internal-references.mjs';
 import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
@@ -137,15 +138,36 @@ async function main() {
 
   // Run all quality gates (pure functions run sync, deps check is async)
   const prTitle = pr.title ?? '';
-  const [templateResult, issueResult, dedupResult, testResult, lockfileResult, depsResult, bootstrapResult] =
+  const [
+    templateResult,
+    issueResult,
+    dedupResult,
+    testResult,
+    lockfileResult,
+    refsResult,
+    depsResult,
+    bootstrapResult,
+  ] =
     await Promise.all([
       Promise.resolve(checkTemplate(prBody)),
       Promise.resolve(checkLinkedIssue(prBody, prTitle, { repoHasIssues })),
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
       Promise.resolve(checkTestCoverage(files, prTitle)),
       Promise.resolve(checkLockfile(files, author, branch)),
-      checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
-      checkReleaseBootstrap(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
+      // The internal-reference gate is the one gate that is not a pure function
+      // of the PR body: it also reads the branch name and the commit subjects,
+      // because a squash merge turns the title into permanent history and the
+      // branch name is public too. `commits` is already fetched above and is
+      // allowed to have failed, in which case this degrades to
+      // title/body/branch/diff.
+      Promise.resolve(
+        checkInternalReferences(
+          { prTitle, prBody, branch, commits, files },
+          { instanceIssuePrefixes: process.env.INSTANCE_ISSUE_PREFIXES }
+        )
+      ),
+      checkDependencies(files, GH_TOKEN, GH_REPO, PR_NUMBER, pr.base?.ref),
+      checkReleaseBootstrap(files, GH_TOKEN, GH_REPO, PR_NUMBER, pr.base?.ref),
     ]);
   const coauthorResult = checkCoauthors(commits, author);
 
@@ -155,6 +177,7 @@ async function main() {
     ...dedupResult.failures,
     ...testResult.failures,
     ...lockfileResult.failures,
+    ...refsResult.failures,
   ];
   const informational = [
     ...(depsResult.informational ?? []),
