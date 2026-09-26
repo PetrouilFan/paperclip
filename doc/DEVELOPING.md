@@ -236,6 +236,26 @@ pnpm --filter @paperclipai/server exec tsx ../scripts/request-hot-restart.ts --s
 systemctl restart paperclip.service
 ```
 
+> **Pitfall — pre-fix `paperclipai service restart` bricks the unit.**
+> The CLI re-renders `~/.config/systemd/user/paperclipai.service` inside
+> `restart()`, *before* it asks systemd to restart, and the renderer resolves
+> `ExecStart` from the current environment rather than from the installed unit.
+> On a host whose binary lives outside the default shim path (an
+> `npm install -g` install, a hand-patched unit, an unexported
+> `PAPERCLIP_SHIM_PATH`) that writes a target systemd cannot exec: five
+> `status=203/EXEC` failures, `start-limit-hit`, and the API plus embedded
+> PostgreSQL down for the rest of the repair. The renderer also emitted no
+> `KillMode=`, so systemd's default `control-group` SIGTERMs detached local
+> agent runs and the database in the same cgroup as the server — the opposite
+> of the ordering this section says Paperclip owns. On any CLI older than this
+> fix, write the marker and restart with plain `systemctl` as above. The current
+> CLI resolves the executable against the installed unit, refuses to write a
+> definition whose target is not runnable, preserves operator-supplied
+> `Environment=` lines, emits `KillMode=process`, and records the preflight set
+> itself, so `paperclipai service restart` is safe to use once this version is
+> installed. If the unit is already broken, follow
+> [Recover A Broken Service Unit](INSTALLING.md#recover-a-broken-service-unit).
+
 The staged command records the target server's boot identity and operating
 system process start time with the PID. It reads process metadata through
 `/proc` on Linux, `ps` on macOS and BSD, and PowerShell on Windows. These
@@ -255,6 +275,13 @@ When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eage
 snapshot and any required drain complete while the database is still available;
 the coordinated shutdown path stops embedded PostgreSQL afterward.
 
+The generated systemd unit pairs with that ordering: it emits `KillMode=process`
+so a supervisor stop signals only the Paperclip server, not every process in the
+cgroup. With the systemd default `control-group`, `systemctl stop`/`restart`
+would SIGTERM detached local-agent runs and embedded PostgreSQL concurrently
+with the coordinated shutdown, which defeats run adoption and takes the database
+away before the snapshot.
+
 The request command records the preflight set of running heartbeat IDs and writes
 an instance-scoped marker plus a PID-targeted legacy home-root handoff marker.
 This lets a previous server version capture its snapshot at the old path while
@@ -262,6 +289,14 @@ the new server correlates that snapshot back to the authoritative instance
 request. If any preflight run ID is absent from the shutdown snapshot, the
 startup report includes it in `lostRunIds`; a missing snapshot therefore cannot
 look like a zero-loss restart.
+
+`paperclipai service restart` performs the same recording on its own: before it
+invokes the service manager it snapshots the running heartbeat run IDs from the
+database into `hot-restart-intent.json` as `preflightActiveRunIds`, and carries
+the target server's `serverInfo.processStartedAt` as `previousServerIdentity`.
+If that preflight set cannot be read, the restart aborts instead of writing an
+intent with an empty list — an empty preflight set would let the startup report
+pass vacuously with `lostRunIds: []` while adoption was silently skipped.
 
 A healthy guarded deploy must compare the report against `/api/health` (`version` or `serverVersion`) and treat any `lostRunIds` entry as a continuity failure that needs recovery before marking deployment complete.
 

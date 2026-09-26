@@ -50,6 +50,7 @@ function supportedDetection() {
       })),
       logs: vi.fn(async () => undefined),
       installedExecutablePath: vi.fn(async () => null),
+      desiredDefinition: vi.fn(async () => "unit"),
     },
   };
 }

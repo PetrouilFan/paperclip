@@ -71,11 +71,19 @@ export async function serviceHealthChecks(
   }
 
   const results: CheckResult[] = [];
+  // Compare against what the installer would write (resolved executable plus
+  // preserved operator Environment= lines), not the bare render: otherwise a
+  // correctly preserved definition is reported as permanently drifted.
   let definitionCurrent = false;
+  let definitionRefusal: string | null = null;
   try {
-    definitionCurrent = (await fs.readFile(manager.definitionPath, "utf8")) === manager.renderDefinition();
-  } catch {
+    definitionCurrent = (await fs.readFile(manager.definitionPath, "utf8")) === (await manager.desiredDefinition());
+  } catch (error) {
     definitionCurrent = false;
+    // A refusal means neither the resolved nor the installed ExecStart target
+    // is runnable; surface it verbatim instead of a generic drift message.
+    const message = error instanceof Error ? error.message : String(error);
+    definitionRefusal = message.startsWith("Refusing to write ") ? message : null;
   }
   results.push(
     definitionCurrent
@@ -83,8 +91,11 @@ export async function serviceHealthChecks(
       : {
           name: "Service definition",
           status: "fail",
-          message: `Missing or drifted definition at ${manager.definitionPath}`,
-          repairHint: "Run `paperclipai service install` to regenerate the service definition",
+          message: definitionRefusal ?? `Missing or drifted definition at ${manager.definitionPath}`,
+          repairHint:
+            definitionRefusal
+              ? "Run `paperclipai install` to restore the managed shim, then `paperclipai service install`"
+              : "Run `paperclipai service install` to regenerate the service definition",
         },
   );
 

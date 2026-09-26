@@ -181,12 +181,36 @@ function readConfig(configPath: string): PartialConfig | null {
   };
 }
 
-export function resolveDatabaseTarget(): ResolvedDatabaseTarget {
-  const configPath = resolvePaperclipConfigPath();
+export type ResolveDatabaseTargetOptions = {
+  /**
+   * Resolve the *selected instance's* configuration rather than this process's
+   * own environment.
+   *
+   * The server resolves from `process.env` because that environment is the
+   * server's: the service unit is what put those values there. A CLI invoked by
+   * an operator resolves from the operator's shell, which is a different
+   * environment, and the preflight run set it records is only meaningful if it
+   * comes from the database the selected instance's service actually opened.
+   */
+  instanceId?: string;
+  homeDir?: string;
+};
+
+export function resolveDatabaseTarget(
+  options: ResolveDatabaseTargetOptions = {},
+): ResolvedDatabaseTarget {
+  const instanceId = options.instanceId?.trim() || undefined;
+  const configPath = instanceId
+    ? resolvePaperclipConfigPathForInstance({ instanceId, homeDir: options.homeDir })
+    : resolvePaperclipConfigPath();
   const envPath = resolvePaperclipEnvPath(configPath);
   const envEntries = readEnvEntries(envPath);
 
-  const envUrl = process.env.DATABASE_URL?.trim();
+  // A shell override is the process's own environment. Honouring it under an
+  // instance-scoped resolution would point the caller at whatever database the
+  // operator's shell happens to name, which is exactly the database the
+  // selected instance's service did not open.
+  const envUrl = instanceId ? undefined : process.env.DATABASE_URL?.trim();
   if (envUrl) {
     return {
       mode: "postgres",
@@ -222,7 +246,8 @@ export function resolveDatabaseTarget(): ResolvedDatabaseTarget {
 
   const port = config?.database?.embeddedPostgresPort ?? 54329;
   const dataDir = resolveHomeAwarePath(
-    config?.database?.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
+    config?.database?.embeddedPostgresDataDir ??
+      resolveDefaultEmbeddedPostgresDir(instanceId ? { instanceId, homeDir: options.homeDir } : {}),
   );
 
   return {

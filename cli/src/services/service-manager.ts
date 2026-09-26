@@ -27,6 +27,14 @@ export interface ServiceManager {
   readonly serviceName: string;
   readonly definitionPath: string;
   renderDefinition(): string;
+  /**
+   * The exact bytes this manager would write to `definitionPath`: the
+   * canonical rendering, re-pointed at a usable executable and carrying the
+   * operator-supplied settings the renderer does not own. Writing anything
+   * else silently deletes operator configuration, so install/start/restart
+   * and the doctor's drift check all go through this.
+   */
+  desiredDefinition(): Promise<string>;
   install(options: ServiceInstallOptions): Promise<{ changed: boolean }>;
   uninstall(): Promise<void>;
   start(): Promise<void>;
@@ -79,10 +87,21 @@ export function resolveServiceShimPath(homeDir = os.homedir()): string {
 
 // The installed definition, not the current environment, is the truth
 // about what the service executes: PAPERCLIP_SHIM_PATH may have changed
-// or been unset since the definition was written.
+// or been unset since the definition was written. A backslash escape is
+// part of a systemd word, so `\ ` is a space inside the path and not the
+// end of it: an unescaped `\` that systemd would honour cannot be read as
+// a literal one, or the path is misreported and the repair is refused.
 function unescapeSystemd(value: string): string {
-  return value.replace(/\\\\|\\"|\$\$|%%/g, (m) =>
-    m === "\\\\" ? "\\" : m === '\\"' ? '"' : m === "$$" ? "$" : "%",
+  return value.replace(/\\\\|\\"|\\ |\$\$|%%/g, (m) =>
+    m === "\\\\"
+      ? "\\"
+      : m === '\\"'
+        ? '"'
+        : m === "\\ "
+          ? " "
+          : m === "$$"
+            ? "$"
+            : "%",
   );
 }
 
@@ -93,8 +112,19 @@ function unescapeXml(value: string): string {
 }
 
 export function extractExecutableFromSystemdUnit(content: string): string | null {
-  const match = content.match(/^ExecStart="((?:\\.|[^"\\])*)"/m);
-  return match ? unescapeSystemd(match[1]) : null;
+  // systemd accepts both `ExecStart="/path/with space"` and `ExecStart=/path`.
+  // Only the first word counts in the bare form; a unit written by hand or by
+  // another packager is usually unquoted, and missing it makes the installed
+  // target look absent, which turns a safe rewrite into a refusal.
+  const quoted = content.match(/^ExecStart="((?:\\.|[^"\\])*)"/m);
+  if (quoted) return unescapeSystemd(quoted[1]);
+  // The same escape-aware word shape systemd parses: a backslash escapes the
+  // next character, so `ExecStart=/tmp/My\ Apps/bin/paperclipai` is one word.
+  // `\S+` stops at the escaped space and reports `/tmp/My\`, which makes a
+  // runnable installed target look missing and turns a safe rewrite into a
+  // refusal.
+  const bare = content.match(/^ExecStart=((?:\\.|[^\s\\])+)/m);
+  return bare ? unescapeSystemd(bare[1]) : null;
 }
 
 export function extractExecutableFromLaunchdPlist(content: string): string | null {
@@ -114,6 +144,36 @@ export async function isExecutableFile(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Resolve the executable a service definition may point at.
+ *
+ * `PAPERCLIP_SHIM_PATH` and the `~/.local/bin` default describe the current
+ * environment, not the machine's history: an instance installed under a
+ * different prefix (npm-global, a managed git store) keeps working through
+ * every environment change. Rewriting the definition around a path that does
+ * not exist produces `status=203/EXEC` and a `start-limit-hit` crash loop, so
+ * the preferred candidate wins only when it is a usable executable and the
+ * installed target is the fallback. When neither is usable the caller must
+ * refuse to write rather than install a corpse.
+ */
+export async function resolveExecutableShimPath(input: {
+  preferredPath: string;
+  installedPath?: string | null;
+  definitionPath?: string;
+}): Promise<string> {
+  if (await isExecutableFile(input.preferredPath)) return input.preferredPath;
+  const installedPath = input.installedPath?.trim() || null;
+  if (installedPath && await isExecutableFile(installedPath)) return installedPath;
+  throw new Error(
+    `Refusing to write ${input.definitionPath ?? "the service definition"}: `
+    + `its ExecStart target ${input.preferredPath} does not exist or is not executable`
+    + (installedPath && installedPath !== input.preferredPath
+      ? `, and the installed target ${installedPath} is unusable too`
+      : "")
+    + ". Restore the executable (run `paperclipai install` to rebuild the managed shim) and retry.",
+  );
 }
 
 export function systemdServiceName(instanceId: string): string {
@@ -142,10 +202,164 @@ WorkingDirectory=%h
 Restart=always
 RestartSec=5
 TimeoutStopSec=300
+# Only the server itself is signalled: the default KillMode=control-group
+# would SIGTERM detached local-agent runs and embedded PostgreSQL in the same
+# cgroup concurrently with the coordinated shutdown, which defeats hot-restart
+# run adoption and puts the database out from under the snapshot.
+KillMode=process
 
 [Install]
 WantedBy=default.target
 `;
+}
+
+// Only these Environment keys belong to the renderer. Everything else in the
+// installed definition (PATH, PAPERCLIP_OPENCODE_PROVIDERS, operator
+// credentials) is operator configuration that a rewrite must carry forward
+// instead of silently deleting.
+const MANAGED_ENVIRONMENT_KEYS = new Set([
+  "PAPERCLIP_SERVICE_MANAGED",
+  "PAPERCLIP_INSTANCE_ID",
+  "PAPERCLIP_HOME",
+]);
+
+type EnvironmentAssignment = { key: string; raw: string };
+
+function parseEnvironmentAssignments(line: string): EnvironmentAssignment[] {
+  const body = line.match(/^\s*Environment\s*=\s*(.*)$/)?.[1];
+  if (body === undefined) return [];
+  const assignments: EnvironmentAssignment[] = [];
+  // The bare branch keeps `KEY=/opt/My\ Apps/bin` whole: systemd unescapes
+  // backslashes in unquoted values, so splitting on whitespace would write a
+  // truncated PATH back into the unit.
+  const segment = /"((?:\\.|[^"\\])*)"|'([^']*)'|((?:\\.|[^\s"'])+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = segment.exec(body)) !== null) {
+    const content = match[1] ?? match[2] ?? match[3] ?? "";
+    const separator = content.indexOf("=");
+    if (separator < 1) continue;
+    assignments.push({ key: content.slice(0, separator), raw: match[0] });
+  }
+  return assignments;
+}
+
+function environmentLinesOfServiceSection(definition: string): string[] {
+  const lines: string[] = [];
+  let inServiceSection = false;
+  for (const line of definition.split("\n")) {
+    const section = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (section) {
+      inServiceSection = section[1] === "Service";
+      continue;
+    }
+    if (inServiceSection && /^\s*Environment\s*=/.test(line)) lines.push(line.trim());
+  }
+  return lines;
+}
+
+/**
+ * Carry the operator's own `Environment=` settings from the installed
+ * definition into the rendered one. The renderer owns only its three
+ * PAPERCLIP_* keys; dropping the rest rewrites a working unit into one that
+ * no longer resolves executables or reaches the configured providers.
+ */
+export function preserveEnvironmentLines(installedDefinition: string | null, renderedDefinition: string): string {
+  if (!installedDefinition) return renderedDefinition;
+  const renderedLines = renderedDefinition.split("\n");
+  const seen = new Set(renderedLines.map((line) => line.trim()));
+  // `Environment=` is a reset directive, not an assignment: systemd clears the
+  // environment assembled so far. It has no KEY=VALUE to re-render, so the line
+  // itself has to survive the rewrite or the operator's reset is silently
+  // cancelled. It also only keeps its meaning *before* the renderer's own keys
+  // — carried after them, it clears PAPERCLIP_SERVICE_MANAGED,
+  // PAPERCLIP_INSTANCE_ID and PAPERCLIP_HOME and the service stops being a
+  // managed one. The two groups are therefore placed either side of the
+  // rendered block, each keeping the operator's relative order.
+  const resets: string[] = [];
+  const carried: string[] = [];
+  for (const line of environmentLinesOfServiceSection(installedDefinition)) {
+    const assignments = parseEnvironmentAssignments(line);
+    const kept = assignments.filter((assignment) => !MANAGED_ENVIRONMENT_KEYS.has(assignment.key));
+    if (assignments.length === 0) {
+      if (seen.has(line)) continue;
+      seen.add(line);
+      resets.push(line);
+      continue;
+    }
+    if (kept.length === 0) continue;
+    const rendered = `Environment=${kept.map((assignment) => assignment.raw).join(" ")}`;
+    if (seen.has(rendered)) continue;
+    seen.add(rendered);
+    carried.push(rendered);
+  }
+  if (resets.length === 0 && carried.length === 0) return renderedDefinition;
+
+  // First and last `Environment=` of the rendered [Service] section; the
+  // renderer's own managed block is what they bracket.
+  let firstAnchor = -1;
+  let lastAnchor = -1;
+  let inServiceSection = false;
+  for (let index = 0; index < renderedLines.length; index += 1) {
+    const section = renderedLines[index].match(/^\s*\[([^\]]+)\]\s*$/);
+    if (section) {
+      inServiceSection = section[1] === "Service";
+      continue;
+    }
+    if (inServiceSection && /^\s*Environment\s*=/.test(renderedLines[index])) {
+      if (firstAnchor < 0) firstAnchor = index;
+      lastAnchor = index;
+    }
+  }
+  if (firstAnchor < 0) {
+    // No rendered environment block to bracket; the [Service] header is the
+    // earliest legal place for either group.
+    for (let index = 0; index < renderedLines.length; index += 1) {
+      if (/^\s*\[Service\]\s*$/.test(renderedLines[index])) {
+        firstAnchor = index;
+        lastAnchor = index;
+        break;
+      }
+    }
+  }
+  if (firstAnchor < 0) return renderedDefinition;
+  const head = firstAnchor === lastAnchor ? renderedLines.slice(0, firstAnchor + 1) : renderedLines.slice(0, firstAnchor);
+  const managedBlock = firstAnchor === lastAnchor ? [] : renderedLines.slice(firstAnchor, lastAnchor + 1);
+  const tail = renderedLines.slice(lastAnchor + 1);
+  return [...head, ...resets, ...managedBlock, ...carried, ...tail].join("\n");
+}
+
+type LaunchdEnvironmentEntry = { key: string; value: string };
+
+function extractLaunchdEnvironmentVariables(plist: string): LaunchdEnvironmentEntry[] {
+  const block = plist.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/);
+  if (!block) return [];
+  const entries: LaunchdEnvironmentEntry[] = [];
+  const pair = /<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/g;
+  let match: RegExpExecArray | null;
+  while ((match = pair.exec(block[1])) !== null) {
+    entries.push({ key: unescapeXml(match[1]), value: unescapeXml(match[2]) });
+  }
+  return entries;
+}
+
+/**
+ * Carry the operator's own `EnvironmentVariables` from the installed launch
+ * agent into the rendered one. The renderer owns only its three PAPERCLIP_*
+ * keys; without this a hand-edited agent loses PATH and credentials on every
+ * install or restart, which is exactly the contract the systemd path honours.
+ */
+export function preserveLaunchdEnvironmentVariables(installedPlist: string | null, renderedPlist: string): string {
+  if (!installedPlist) return renderedPlist;
+  const renderedKeys = new Set(extractLaunchdEnvironmentVariables(renderedPlist).map((entry) => entry.key));
+  const additions = extractLaunchdEnvironmentVariables(installedPlist)
+    .filter((entry) => !MANAGED_ENVIRONMENT_KEYS.has(entry.key) && !renderedKeys.has(entry.key));
+  if (additions.length === 0) return renderedPlist;
+  const serialized = additions.map((entry) => `    <key>${escapeXml(entry.key)}</key><string>${escapeXml(entry.value)}</string>`).join("\n");
+  const replaced = renderedPlist.replace(
+    /(<key>EnvironmentVariables<\/key>\s*<dict>[\s\S]*?)(\s*)(<\/dict>)/,
+    (_match, body: string, indent: string, close: string) => `${body}\n${serialized}${indent}${close}`,
+  );
+  return replaced === renderedPlist ? renderedPlist : replaced;
 }
 
 export function renderLaunchdPlist(input: { instanceId: string; shimPath: string; homeDir: string; stdoutPath: string; stderrPath: string }): string {
@@ -223,8 +437,33 @@ export class SystemdServiceManager implements ServiceManager {
     }
   }
 
+  private async installedDefinition(): Promise<string | null> {
+    try {
+      return await fs.readFile(this.definitionPath, "utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  async desiredDefinition(): Promise<string> {
+    const rendered = this.renderDefinition();
+    const renderedTarget = extractExecutableFromSystemdUnit(rendered);
+    // Preferred candidate first, then the target the installed unit already
+    // uses; if neither is a runnable executable this throws instead of
+    // writing a unit systemd cannot exec (status=203/EXEC → start-limit-hit).
+    const target = await resolveExecutableShimPath({
+      preferredPath: renderedTarget ?? this.shimPath,
+      installedPath: await this.installedExecutablePath(),
+      definitionPath: this.definitionPath,
+    });
+    const withTarget = target === renderedTarget
+      ? rendered
+      : rendered.replace(/^ExecStart="(?:\\.|[^"\\])*"/m, `ExecStart="${escapeSystemd(target)}"`);
+    return preserveEnvironmentLines(await this.installedDefinition(), withTarget);
+  }
+
   private async ensureCurrent(): Promise<boolean> {
-    const changed = await writeIfChanged(this.definitionPath, this.renderDefinition());
+    const changed = await writeIfChanged(this.definitionPath, await this.desiredDefinition());
     if (changed) await this.runner("systemctl", ["--user", "daemon-reload"]);
     return changed;
   }
@@ -299,9 +538,38 @@ export class LaunchdServiceManager implements ServiceManager {
     }
   }
 
+  async desiredDefinition(): Promise<string> {
+    const rendered = this.renderDefinition();
+    const renderedTarget = extractExecutableFromLaunchdPlist(rendered);
+    // Same contract as the systemd manager: preferred shim, else the target
+    // the installed plist already uses, else refuse to write (launchd would
+    // otherwise respawn a missing binary forever).
+    const target = await resolveExecutableShimPath({
+      preferredPath: renderedTarget ?? this.shimPath,
+      installedPath: await this.installedExecutablePath(),
+      definitionPath: this.definitionPath,
+    });
+    const installed = await this.installedDefinition();
+    const withTarget = target === renderedTarget
+      ? rendered
+      : rendered.replace(
+        /(<string>)([^<]*)(<\/string><string>run<\/string>)/,
+        (_match, prefix, _current, suffix: string) => `${prefix}${escapeXml(target)}${suffix}`,
+      );
+    return preserveLaunchdEnvironmentVariables(installed, withTarget);
+  }
+
+  private async installedDefinition(): Promise<string | null> {
+    try {
+      return await fs.readFile(this.definitionPath, "utf8");
+    } catch {
+      return null;
+    }
+  }
+
   async install(options: ServiceInstallOptions): Promise<{ changed: boolean }> {
     await fs.mkdir(path.dirname(this.stdoutPath), { recursive: true });
-    const changed = await writeIfChanged(this.definitionPath, this.renderDefinition());
+    const changed = await writeIfChanged(this.definitionPath, await this.desiredDefinition());
     if (changed) await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]).catch(() => undefined);
     await this.runner("launchctl", [options.startOnLogin ? "enable" : "disable", `${this.domain}/${this.serviceName}`]);
     if (options.startOnLogin || options.startNow) {
@@ -318,7 +586,7 @@ export class LaunchdServiceManager implements ServiceManager {
   }
   async start(): Promise<void> { await this.install({ startNow: true, startOnLogin: await this.isEnabled() }); }
   async stop(): Promise<void> { await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]); }
-  async restart(): Promise<void> { await writeIfChanged(this.definitionPath, this.renderDefinition()); await this.runner("launchctl", ["kickstart", "-k", `${this.domain}/${this.serviceName}`]); }
+  async restart(): Promise<void> { await writeIfChanged(this.definitionPath, await this.desiredDefinition()); await this.runner("launchctl", ["kickstart", "-k", `${this.domain}/${this.serviceName}`]); }
 
   async status(): Promise<ServiceStatus> {
     try {

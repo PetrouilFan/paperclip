@@ -291,6 +291,80 @@ the downloaded `install.sh` workflow under **Recommended Install**. Do not use
 the piped form for this repair because it requires a supported Node.js runtime
 before it starts.
 
+## Recover A Broken Service Unit
+
+`paperclipai service install`, `start`, and `restart` re-render
+`~/.config/systemd/user/paperclipai.service` *before* they talk to systemd. The
+renderer derives `ExecStart` from the current environment, so a host whose
+service was installed under a different prefix — an `npm install -g` binary, a
+hand-edited unit, a `PAPERCLIP_SHIM_PATH` that was never exported in the shell
+that ran the restart — can be rewritten onto a path that does not exist.
+systemd then answers `status=203/EXEC` on every start attempt, reaches the
+start limit after five tries, and parks the unit in `failed`.
+
+The API and the embedded PostgreSQL live in that unit's cgroup, so the whole
+instance goes down for as long as the unit is broken. Every in-flight agent
+write is dropped with it. Before this fix there was no CLI command that
+repairs the unit, so the recovery below is manual; with the current CLI,
+`paperclipai service install` rewrites a broken unit once `paperclipai install`
+has restored a runnable shim, and the doctor prints that refusal with the same
+hint. The steps below still apply when you want the unit back without running
+the installer.
+
+Recognise it:
+
+```sh
+systemctl --user status paperclipai --no-pager
+journalctl --user -u paperclipai -n 20 --no-pager
+grep -n '^ExecStart=' "$HOME/.config/systemd/user/paperclipai.service"
+```
+
+`status` reports `failed` with `start-limit-hit`, the journal shows
+`Unable to locate executable ...` five times in a row, and `ExecStart` points
+at a file that is not there.
+
+Repair it in place:
+
+```sh
+unit="$HOME/.config/systemd/user/paperclipai.service"
+binary="$(command -v paperclipai)"        # the CLI that is actually installed
+test -x "$binary" || echo "no runnable CLI on PATH"
+
+cp -a "$unit" "$unit.bak"
+sed -i 's|^ExecStart=.*|ExecStart="'"$binary"'" run --instance "default"|' "$unit"
+
+systemctl --user daemon-reload
+systemctl --user reset-failed paperclipai
+systemctl --user start paperclipai
+```
+
+Use `systemctl --user edit --full paperclipai` instead of `sed` when you prefer
+a real editor.
+
+For an instance other than `default`, change every name below, not only the
+`--instance` argument: the unit file is
+`~/.config/systemd/user/paperclipai-<id>.service`, each `systemctl --user`
+command targets `paperclipai-<id>.service`, and `ExecStart` keeps
+`--instance "<id>"`. Editing only `--instance` repairs `ExecStart` while the
+`reset-failed` and `start` commands keep hitting the default unit and leave the
+failed instance down.
+
+While you are in the unit, check the `Environment=` lines. The renderer only
+owns `PAPERCLIP_SERVICE_MANAGED`, `PAPERCLIP_INSTANCE_ID`, and
+`PAPERCLIP_HOME`; a rewrite performed by an older CLI also drops
+operator-supplied lines such as `PATH` and `PAPERCLIP_OPENCODE_PROVIDERS`. The
+service starts without them, but adapter dispatch and provider selection are
+wrong, which looks like a healthy process serving broken runs. Restore those
+lines from `$unit.bak`.
+
+`paperclipai doctor` and `paperclipai service status` report unit-file drift
+but do not repair it. On a CLI older than this fix, no `ExecStart` validation
+runs before a write, so copy the unit aside (`cp -a "$unit" "$unit.bak"`) before
+every `paperclipai service restart` on a host with a hand-patched unit. The
+current CLI keeps an installed executable that still works and refuses a rewrite
+that would land on a missing one, so the backup is a precaution for older
+installs rather than a step on the current upgrade path.
+
 ## Uninstall
 
 Remove the background service and managed CLI payloads:
