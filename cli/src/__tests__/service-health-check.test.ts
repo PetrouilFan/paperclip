@@ -43,6 +43,9 @@ function managerFixture(active = true) {
     instanceId: "default",
     serviceName: "paperclipai.service",
     definitionPath,
+    // Widened on purpose: two tests below point this at a real directory, and a
+    // literal-typed `null` here would make the fixture unusable for them.
+    dropInDirectory: null as string | null,
     renderDefinition: () => "unit",
     install: vi.fn(async () => ({ changed: false })),
     uninstall: vi.fn(async () => undefined),
@@ -183,6 +186,65 @@ describe("service health doctor checks", () => {
 
     expect(results.filter((result) => result.status === "fail").length).toBeGreaterThan(0);
     expect(results.every((result) => result.blocking === false)).toBe(true);
+  });
+
+  it("reports drop-ins orphaned by a removed unit, instead of reporting the instance as clean", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-orphan-dropins-"));
+    const dropInDirectory = path.join(root, "paperclipai.service.d");
+    fs.mkdirSync(dropInDirectory, { recursive: true });
+    fs.writeFileSync(path.join(dropInDirectory, "20-runtime-env.conf"), "[Service]\n");
+    fs.writeFileSync(path.join(dropInDirectory, "50-memory-ceiling.conf"), "[Service]\n");
+
+    const manager = managerFixture(false);
+    // The unit file is gone; the overrides it loaded are not. This is the state
+    // `uninstall()` leaves behind, and `status.installed === false` is the only
+    // thing that distinguishes it from a host that never had a service.
+    manager.dropInDirectory = dropInDirectory;
+    manager.status = vi.fn(async () => ({
+      platform: "systemd" as const,
+      serviceName: "paperclipai.service",
+      installed: false,
+      active: false,
+      enabled: false,
+      pid: null,
+      linger: true,
+    }));
+
+    const results = await serviceHealthChecks(config, {
+      detect: vi.fn(async () => ({ supported: true as const, manager })),
+      probe: vi.fn(async () => ({ ok: true, version: "1.0.0" })),
+    });
+
+    const orphan = results.find((result) => result.name === "Orphaned service drop-ins");
+    expect(orphan?.status).toBe("warn");
+    expect(orphan?.message).toContain("2 drop-in files");
+    expect(orphan?.message).toContain("50-memory-ceiling.conf");
+    // `commands/run.ts` refuses to bind the port on a `fail`, so this must stay
+    // advisory: a configuration smell cannot be allowed to take the instance
+    // offline.
+    expect(orphan?.blocking).toBe(false);
+  });
+
+  it("stays quiet about a drop-in directory for a unit that is installed", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-live-dropins-"));
+    const dropInDirectory = path.join(root, "paperclipai.service.d");
+    fs.mkdirSync(dropInDirectory, { recursive: true });
+    fs.writeFileSync(path.join(dropInDirectory, "50-memory-ceiling.conf"), "[Service]\n");
+
+    const manager = managerFixture(true);
+    manager.dropInDirectory = dropInDirectory;
+    manager.desiredDefinition = vi.fn(async () => "unit");
+
+    const results = await serviceHealthChecks(config, {
+      detect: vi.fn(async () => ({ supported: true as const, manager })),
+      probe: vi.fn(async () => ({ ok: true, version: "1.0.0" })),
+      shimPresent: vi.fn(async () => true),
+    });
+
+    // Loaded drop-ins are the supported configuration, not a finding. Only the
+    // orphaned case is a finding, and calling this one a warning would train
+    // operators to ignore the check that matters.
+    expect(results.some((result) => result.name === "Orphaned service drop-ins")).toBe(false);
   });
 });
 

@@ -5,12 +5,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   assertForegroundRunAllowed,
   detectServiceManager,
+  describeLaunchdOwnership,
+  describeSystemdOwnership,
   extractExecutableFromSystemdUnit,
   LaunchdServiceManager,
+  listDropInFiles,
   preserveEnvironmentLines,
   preserveLaunchdEnvironmentVariables,
   renderLaunchdPlist,
   renderSystemdUnit,
+  systemdEnvironmentValue,
   SystemdServiceManager,
   type CommandRunner,
   type ServiceManager,
@@ -688,5 +692,268 @@ describe("installed launch agent parsing", () => {
     const written = await fs.readFile(manager.definitionPath, "utf8");
     expect(written).toContain("<key>PAPERCLIP_OPENCODE_PROVIDERS</key><string>openai anthropic</string>");
     expect(await manager.desiredDefinition()).toBe(written);
+  });
+});
+
+describe("uninstall ownership gate", () => {
+  /** A runner that records every command and reports a stopped, loaded unit —
+   *  the state a host is in when its service is installed but not running, and
+   *  the state in which `uninstall()` goes straight for the file. */
+  function recordingRunner(state: Partial<{ load: string; active: string }> = {}) {
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      if (args.includes("--property=LoadState,ActiveState,UnitFileState,MainPID")) {
+        return {
+          stdout: `LoadState=${state.load ?? "loaded"}\nActiveState=${state.active ?? "inactive"}\nUnitFileState=enabled\nMainPID=0\n`,
+          stderr: "",
+        };
+      }
+      return { stdout: "", stderr: "" };
+    };
+    return { calls, runner };
+  }
+
+  it("refuses to remove the control plane's own unit when the caller is another deployment", async () => {
+    const userHome = await temporaryDirectory();
+    const { calls, runner } = recordingRunner();
+    // The operator's home is shared, the instance id is the default one every
+    // agent also resolves, and only PAPERCLIP_HOME differs: this is an agent
+    // running its own instance against the host's account.
+    const manager = new SystemdServiceManager("default", runner, "/srv/agent-home/team-a", path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    const controlPlane = renderSystemdUnit({
+      instanceId: "default",
+      shimPath: path.join(userHome, ".local/bin/paperclipai"),
+      homeDir: "/home/operator/.paperclip",
+    });
+    await fs.writeFile(manager.definitionPath, controlPlane, "utf8");
+
+    // The unit name, the Description= line, the path and the instance id are all
+    // identical to what this manager would render. Only the home differs, and
+    // that is the only thing left to tell them apart.
+    await expect(manager.uninstall()).rejects.toThrow(/Refusing to remove/);
+    expect((await fs.readFile(manager.definitionPath, "utf8"))).toBe(controlPlane);
+    // A refusal has to be inert. Not one systemctl verb was issued, so the
+    // service was not stopped, disabled, or reloaded on the way to the refusal.
+    expect(calls).toEqual([]);
+  });
+
+  it("removes a definition that carries this manager's instance and home", async () => {
+    const userHome = await temporaryDirectory();
+    const { runner } = recordingRunner();
+    const home = path.join(userHome, ".paperclip");
+    const manager = new SystemdServiceManager("default", runner, home, path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    await fs.writeFile(manager.definitionPath, manager.renderDefinition(), "utf8");
+
+    await manager.uninstall();
+
+    await expect(fs.access(manager.definitionPath)).rejects.toThrow();
+  });
+
+  it("refuses a definition that records no Paperclip identity at all", async () => {
+    const userHome = await temporaryDirectory();
+    const { calls, runner } = recordingRunner();
+    const manager = new SystemdServiceManager("default", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    const foreign = "[Service]\nExecStart=/opt/something-else\n";
+    await fs.writeFile(manager.definitionPath, foreign, "utf8");
+
+    await expect(manager.uninstall()).rejects.toThrow(/records no PAPERCLIP_INSTANCE_ID/);
+    expect(await fs.readFile(manager.definitionPath, "utf8")).toBe(foreign);
+    expect(calls).toEqual([]);
+  });
+
+  it("refuses a same-home definition belonging to a different instance", async () => {
+    const userHome = await temporaryDirectory();
+    const { runner } = recordingRunner();
+    const home = path.join(userHome, ".paperclip");
+    const manager = new SystemdServiceManager("default", runner, home, path.join(userHome, ".local/bin/paperclipai"), userHome);
+    const teammate = new SystemdServiceManager("team-a", runner, home, path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    const teamA = teammate.renderDefinition();
+    await fs.writeFile(manager.definitionPath, teamA, "utf8");
+
+    await expect(manager.uninstall()).rejects.toThrow(/is instance "team-a"/);
+    expect(await fs.readFile(manager.definitionPath, "utf8")).toBe(teamA);
+  });
+
+  it("refuses while drop-ins are present, and names them", async () => {
+    const userHome = await temporaryDirectory();
+    const { calls, runner } = recordingRunner();
+    const manager = new SystemdServiceManager("default", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(manager.dropInDirectory, { recursive: true });
+    await fs.writeFile(manager.definitionPath, manager.renderDefinition(), "utf8");
+    await fs.writeFile(path.join(manager.dropInDirectory, "20-runtime-env.conf"), "[Service]\nEnvironment=\"PORT=3101\"\n", "utf8");
+    await fs.writeFile(path.join(manager.dropInDirectory, "30-pin-api-port.conf"), "[Service]\nEnvironment=\"PORT=3101\"\n", "utf8");
+
+    await expect(manager.uninstall()).rejects.toThrow(/2 drop-in files .*20-runtime-env\.conf, 30-pin-api-port\.conf/s);
+
+    // Orphaning is the failure this closes: the unit file and every override
+    // survive, so nothing is half-removed and nothing is silently dropped.
+    expect(await fs.readFile(manager.definitionPath, "utf8")).toBe(manager.renderDefinition());
+    expect(await listDropInFiles(manager.dropInDirectory)).toEqual(["20-runtime-env.conf", "30-pin-api-port.conf"]);
+    expect(calls).toEqual([]);
+  });
+
+  it("removes the unit under --force and leaves the drop-ins, as the flag says", async () => {
+    const userHome = await temporaryDirectory();
+    const { runner } = recordingRunner();
+    const manager = new SystemdServiceManager("default", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(manager.dropInDirectory, { recursive: true });
+    await fs.writeFile(manager.definitionPath, manager.renderDefinition(), "utf8");
+    await fs.writeFile(path.join(manager.dropInDirectory, "50-memory-ceiling.conf"), "[Service]\nMemoryHigh=12G\n", "utf8");
+
+    await manager.uninstall({ force: true });
+
+    await expect(fs.access(manager.definitionPath)).rejects.toThrow();
+    expect(await listDropInFiles(manager.dropInDirectory)).toEqual(["50-memory-ceiling.conf"]);
+  });
+
+  it("refuses to remove the file when the unit is running and cannot be stopped", async () => {
+    const userHome = await temporaryDirectory();
+    const calls: string[] = [];
+    // RefuseManualStop= makes `systemctl --user stop` exit non-zero while the
+    // unit keeps running. That error used to abort uninstall() by accident, and
+    // that accident was the only thing stopping a mis-scoped uninstall from
+    // deleting the unit the board runs on.
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      if (args.includes("--property=LoadState,ActiveState,UnitFileState,MainPID")) {
+        return { stdout: "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nMainPID=983191\n", stderr: "" };
+      }
+      if (args.includes("stop")) throw new Error("Failed to stop paperclipai.service: Operation refused, unit protected by RefuseManualStop=.");
+      return { stdout: "", stderr: "" };
+    };
+    const manager = new SystemdServiceManager("default", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    const unit = manager.renderDefinition();
+    await fs.writeFile(manager.definitionPath, unit, "utf8");
+
+    await expect(manager.uninstall()).rejects.toThrow(/RefuseManualStop/);
+
+    expect(await fs.readFile(manager.definitionPath, "utf8")).toBe(unit);
+    // The removal, and the disable that would have left a unit pointing at a
+    // deleted file, never ran.
+    expect(calls.some((call) => call.includes("disable"))).toBe(false);
+    expect(calls.some((call) => call.includes("daemon-reload"))).toBe(false);
+  });
+
+  it("surfaces a failed disable instead of reporting a successful uninstall", async () => {
+    const userHome = await temporaryDirectory();
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      if (args.includes("--property=LoadState,ActiveState,UnitFileState,MainPID")) {
+        return { stdout: "LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\nMainPID=0\n", stderr: "" };
+      }
+      if (args.includes("disable")) throw new Error("Failed to disable unit: Unit file does not exist.");
+      return { stdout: "", stderr: "" };
+    };
+    const manager = new SystemdServiceManager("default", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    await fs.writeFile(manager.definitionPath, manager.renderDefinition(), "utf8");
+
+    // Swallowed, this uninstall reported success while leaving an enabled unit
+    // that returns on the next login.
+    await expect(manager.uninstall()).rejects.toThrow(/may still be enabled/);
+    await expect(fs.access(manager.definitionPath)).rejects.toThrow();
+    expect(calls.some((call) => call.includes("daemon-reload"))).toBe(true);
+  });
+
+  it("uninstalls cleanly when nothing is installed", async () => {
+    const userHome = await temporaryDirectory();
+    const { calls, runner } = recordingRunner({ load: "not-found" });
+    const manager = new SystemdServiceManager("default", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+
+    await manager.uninstall();
+
+    expect(calls).toContain("systemctl --user daemon-reload");
+  });
+
+  it("refuses a launchd plist that is not this instance's agent, before booting it out", async () => {
+    const userHome = await temporaryDirectory();
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      return { stdout: "", stderr: "" };
+    };
+    const manager = new LaunchdServiceManager("default", runner, "/srv/agent-home/team-a", path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    const foreign = renderLaunchdPlist({
+      instanceId: "default",
+      shimPath: path.join(userHome, ".local/bin/paperclipai"),
+      homeDir: "/Users/operator/.paperclip",
+      stdoutPath: "/tmp/out.log",
+      stderrPath: "/tmp/err.log",
+    });
+    await fs.writeFile(manager.definitionPath, foreign, "utf8");
+
+    await expect(manager.uninstall()).rejects.toThrow(/Refusing to remove/);
+    expect(await fs.readFile(manager.definitionPath, "utf8")).toBe(foreign);
+    // The refusal precedes bootout, so a running LaunchAgent is not stopped by a
+    // command that has no claim to it.
+    expect(calls).toEqual([]);
+  });
+
+  it("removes a launchd plist that carries this manager's identity", async () => {
+    const userHome = await temporaryDirectory();
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      return { stdout: "", stderr: "" };
+    };
+    const manager = new LaunchdServiceManager("default", runner, path.join(userHome, ".paperclip"), path.join(userHome, ".local/bin/paperclipai"), userHome);
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    await fs.writeFile(manager.definitionPath, manager.renderDefinition(), "utf8");
+
+    await manager.uninstall();
+
+    await expect(fs.access(manager.definitionPath)).rejects.toThrow();
+    expect(calls.some((call) => call.includes("bootout"))).toBe(true);
+  });
+
+  it("has no drop-in directory to reason about on launchd", () => {
+    const manager = new LaunchdServiceManager("default", recordingRunner().runner, "/tmp/pc", "/tmp/shim", "/tmp/home");
+    expect(manager.dropInDirectory).toBeNull();
+  });
+});
+
+describe("definition ownership evidence", () => {
+  it("round-trips a home containing systemd escape characters", () => {
+    // A home with `$` and `%` is written escaped. Comparing the escaped text
+    // instead of the unescaped value is how an identity check starts refusing
+    // the very unit it wrote.
+    const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/opt/bin/paperclipai", homeDir: "/srv/a$b/c%d" });
+    expect(systemdEnvironmentValue(unit, "PAPERCLIP_HOME")).toBe("/srv/a$b/c%d");
+    expect(describeSystemdOwnership(unit, { instanceId: "team-a", homeDir: "/srv/a$b/c%d" }).owned).toBe(true);
+    expect(describeSystemdOwnership(unit, { instanceId: "team-a", homeDir: "/srv/other" }).owned).toBe(false);
+  });
+
+  it("reads the bare Environment= spelling a hand-written unit uses", () => {
+    const unit = "[Service]\nEnvironment=PAPERCLIP_INSTANCE_ID=team-a\nEnvironment=PAPERCLIP_HOME=/srv/team-a\n";
+    expect(describeSystemdOwnership(unit, { instanceId: "team-a", homeDir: "/srv/team-a" }).owned).toBe(true);
+  });
+
+  it("reads a launchd plist's identity", () => {
+    const plist = renderLaunchdPlist({
+      instanceId: "team-a",
+      shimPath: "/opt/bin/paperclipai",
+      homeDir: "/srv/team-a",
+      stdoutPath: "/tmp/out.log",
+      stderrPath: "/tmp/err.log",
+    });
+    expect(describeLaunchdOwnership(plist, { instanceId: "team-a", homeDir: "/srv/team-a" }).owned).toBe(true);
+    expect(describeLaunchdOwnership(plist, { instanceId: "default", homeDir: "/srv/team-a" }).owned).toBe(false);
+  });
+
+  it("lists drop-in files, ignoring a directory that is not a drop-in", async () => {
+    const root = await temporaryDirectory();
+    await expect(listDropInFiles(path.join(root, "absent"))).resolves.toEqual([]);
+    await fs.mkdir(path.join(root, "nested"), { recursive: true });
+    await fs.writeFile(path.join(root, "50-memory-ceiling.conf"), "x", "utf8");
+    await fs.symlink("/dev/null", path.join(root, "60-link.conf"));
+    expect(await listDropInFiles(root)).toEqual(["50-memory-ceiling.conf", "60-link.conf"]);
   });
 });

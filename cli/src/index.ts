@@ -83,7 +83,8 @@ program
 program
   .command("uninstall")
   .description("Remove the managed CLI install while preserving user data")
-  .action(uninstallCommand);
+  .option("--force", "Also remove a service definition that is not provably this instance's unit, or one with drop-ins the CLI did not create", false)
+  .action((opts) => uninstallCommand({ force: opts.force === true }));
 
 program
   .command("update")

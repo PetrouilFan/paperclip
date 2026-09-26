@@ -21,11 +21,29 @@ export type ServiceStatus = {
 };
 export type ServiceInstallOptions = { startNow: boolean; startOnLogin: boolean };
 
+/**
+ * `uninstall()` is gated on positive proof that the definition it is about to
+ * remove belongs to this instance. `force` is the operator's explicit override
+ * for the two refusals that gate can raise — an unrecognised definition, and a
+ * drop-in directory the CLI did not create. It is deliberately per-call and
+ * never a persisted setting: an override that survives in a config file is an
+ * override nobody re-reads before the next uninstall.
+ */
+export type ServiceUninstallOptions = { force?: boolean };
+
 export interface ServiceManager {
   readonly platform: ServicePlatform;
   readonly instanceId: string;
   readonly serviceName: string;
   readonly definitionPath: string;
+  /**
+   * The systemd drop-in directory that systemd would load alongside
+   * `definitionPath`, or `null` where the platform has no such mechanism.
+   *
+   * It is exposed on the manager, not recomputed by callers, so the doctor's
+   * orphan check and `uninstall()` cannot drift onto different paths.
+   */
+  readonly dropInDirectory: string | null;
   renderDefinition(): string;
   /**
    * The exact bytes this manager would write to `definitionPath`: the
@@ -36,7 +54,7 @@ export interface ServiceManager {
    */
   desiredDefinition(): Promise<string>;
   install(options: ServiceInstallOptions): Promise<{ changed: boolean }>;
-  uninstall(): Promise<void>;
+  uninstall(options?: ServiceUninstallOptions): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
   restart(): Promise<void>;
@@ -182,6 +200,135 @@ export function systemdServiceName(instanceId: string): string {
 
 export function launchdServiceName(instanceId: string): string {
   return instanceId === "default" ? "ing.paperclip.paperclipai" : `ing.paperclip.paperclipai.${instanceId}`;
+}
+
+/**
+ * The identity a definition must carry before `uninstall()` will remove it, and
+ * what the file on disk actually says.
+ */
+export type DefinitionOwnership = { owned: boolean; detail: string };
+
+/**
+ * Read one `Environment="KEY=VALUE"` out of a systemd unit.
+ *
+ * Both spellings are accepted because the quoted form is what the renderer emits
+ * and the bare form is what a unit written by hand or by another packager
+ * carries. Escaping is undone by {@link unescapeSystemd}, so a `$` or `%` in a
+ * path compares equal to itself rather than to its escaped twin — comparing
+ * escaped text is how an identity check starts rejecting the very unit it wrote.
+ */
+export function systemdEnvironmentValue(contents: string, key: string): string | null {
+  const quoted = contents.match(new RegExp(`^Environment="${escapeRegExp(key)}=((?:\\\\.|[^"\\\\])*)"`, "m"));
+  if (quoted) return unescapeSystemd(quoted[1]);
+  const bare = contents.match(new RegExp(`^Environment=${escapeRegExp(key)}=((?:\\\\.|\\S)+)`, "m"));
+  return bare ? unescapeSystemd(bare[1]) : null;
+}
+
+/** The launchd counterpart of {@link systemdEnvironmentValue}. */
+export function launchdEnvironmentValue(contents: string, key: string): string | null {
+  const match = contents.match(new RegExp(`<key>${escapeRegExp(key)}</key>\\s*<string>([^<]*)</string>`));
+  return match ? unescapeXml(match[1]) : null;
+}
+
+/**
+ * Whether a definition on disk is this manager's own unit, judged on the
+ * deployment identity the unit records rather than on its path.
+ *
+ * `definitionPath` is built from `os.homedir()` and the unit name from the
+ * instance id, so on the `default` instance both land on the live control-plane
+ * unit for every agent, sandbox, and e2e leg that shares the operator's
+ * account. `uninstall()` used to remove whatever sat there — `force: true`, no
+ * ownership check — which made "the file at that path" and "my file" the same
+ * claim, and turned a mis-scoped invocation into the deletion of the service
+ * every other agent on the control plane is running under.
+ *
+ * The discriminator has to be the **home**, not the name. A test, an agent, and
+ * the control plane all instantiate the `default` instance, so all three render
+ * the same `Description=`, the same unit name, and the same path; a marker built
+ * from the name cannot tell them apart. `PAPERCLIP_HOME` is the root the running
+ * process reads its state from, so a unit whose `PAPERCLIP_HOME` is not this
+ * manager's is a different deployment that happens to share one path — which is
+ * exactly the case the name cannot see. `PAPERCLIP_INSTANCE_ID` is checked too so
+ * a same-home, different-instance unit is also refused.
+ *
+ * A definition that records neither is refused as well. There is no way to tell
+ * a foreign unit from a Paperclip unit of an unrecognised vintage, and guessing
+ * wrong in the permissive direction is the failure this whole predicate exists
+ * to prevent.
+ */
+export function describeSystemdOwnership(
+  contents: string,
+  identity: { instanceId: string; homeDir: string },
+): DefinitionOwnership {
+  return describeOwnership(
+    {
+      instanceId: systemdEnvironmentValue(contents, "PAPERCLIP_INSTANCE_ID"),
+      homeDir: systemdEnvironmentValue(contents, "PAPERCLIP_HOME"),
+    },
+    identity,
+  );
+}
+
+/** See {@link describeSystemdOwnership}; the launchd side carries the same identity. */
+export function describeLaunchdOwnership(
+  contents: string,
+  identity: { instanceId: string; homeDir: string },
+): DefinitionOwnership {
+  return describeOwnership(
+    {
+      instanceId: launchdEnvironmentValue(contents, "PAPERCLIP_INSTANCE_ID"),
+      homeDir: launchdEnvironmentValue(contents, "PAPERCLIP_HOME"),
+    },
+    identity,
+  );
+}
+
+function describeOwnership(
+  found: { instanceId: string | null; homeDir: string | null },
+  expected: { instanceId: string; homeDir: string },
+): DefinitionOwnership {
+  const rendered = `instance ${JSON.stringify(expected.instanceId)}, home ${JSON.stringify(expected.homeDir)}`;
+  if (found.instanceId === null && found.homeDir === null) {
+    return { owned: false, detail: "it records no PAPERCLIP_INSTANCE_ID or PAPERCLIP_HOME, so it is not a Paperclip-managed definition" };
+  }
+  if (found.instanceId !== expected.instanceId) {
+    return {
+      owned: false,
+      detail: `it is instance ${JSON.stringify(found.instanceId)}, not ${rendered}`,
+    };
+  }
+  if (found.homeDir !== expected.homeDir) {
+    return {
+      owned: false,
+      detail: `it runs against home ${JSON.stringify(found.homeDir)}, not ${rendered} — a different deployment that resolves to the same path`,
+    };
+  }
+  return { owned: true, detail: rendered };
+}
+
+/**
+ * List the drop-ins systemd would load for a unit, or `[]` when there is no such
+ * directory.
+ *
+ * Only regular files and symlinks count. A stray subdirectory is not a drop-in
+ * and must not be reported as configuration `uninstall()` refused over, or the
+ * refusal stops being a statement about the operator's configuration.
+ */
+export async function listDropInFiles(directory: string): Promise<string[]> {
+  try {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile() || entry.isSymbolicLink())
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function renderSystemdUnit(input: { instanceId: string; shimPath: string; homeDir: string }): string {
@@ -484,10 +631,12 @@ export class SystemdServiceManager implements ServiceManager {
   readonly platform = "systemd" as const;
   readonly serviceName: string;
   readonly definitionPath: string;
+  readonly dropInDirectory: string;
 
   constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir()) {
     this.serviceName = systemdServiceName(instanceId);
     this.definitionPath = path.join(userHomeDir, ".config", "systemd", "user", this.serviceName);
+    this.dropInDirectory = path.join(userHomeDir, ".config", "systemd", "user", `${this.serviceName}.d`);
   }
 
   renderDefinition(): string {
@@ -541,13 +690,108 @@ export class SystemdServiceManager implements ServiceManager {
     return { changed };
   }
 
-  async uninstall(): Promise<void> {
+  async uninstall(options: ServiceUninstallOptions = {}): Promise<void> {
+    // Both refusals are raised ahead of every destructive step, so a refusal
+    // leaves the host byte-identical: no stop, no disable, no daemon-reload.
+    // That ordering is the whole point — a gate that runs after `stop()` has
+    // already taken the service down, which is the outage the gate exists to
+    // prevent.
+    await this.assertUninstallable(options.force === true);
     const status = await this.status();
-    if (status.active) await this.stop();
-    await this.runner("systemctl", ["--user", "disable", this.serviceName]).catch(() => undefined);
+    if (status.active) await this.stopOrRefuseToRemove();
+    // A failed `disable` is recorded, not swallowed: swallowed, the unit stays
+    // enabled and comes back on the next login, so an uninstall that reported
+    // success had in fact scheduled the service to return.
+    let disableFailure: unknown;
+    try {
+      await this.runner("systemctl", ["--user", "disable", this.serviceName]);
+    } catch (error) {
+      disableFailure = error;
+    }
     await fs.rm(this.definitionPath, { force: true });
     await this.runner("systemctl", ["--user", "daemon-reload"]);
+    // `reset-failed` only clears a start-limit counter for a unit that no longer
+    // exists, so its failure is genuinely inert and stays unlogged.
     await this.runner("systemctl", ["--user", "reset-failed", this.serviceName]).catch(() => undefined);
+    if (disableFailure) {
+      throw new Error(
+        `Removed ${this.definitionPath}, but could not disable ${this.serviceName}: ${describeError(disableFailure)}. `
+        + `The unit is no longer defined, but it may still be enabled and will be started again on the next login. `
+        + `Run \`systemctl --user disable ${this.serviceName}\` (or \`systemctl --user reset-failed ${this.serviceName}\` if the unit is already gone) to clear it.`,
+        { cause: disableFailure },
+      );
+    }
+  }
+
+  /**
+   * Refuse, before anything is touched, when the definition is not this
+   * instance's unit or when a drop-in directory is present.
+   *
+   * The drop-in case is the one that is quiet when it goes wrong. `uninstall()`
+   * removes the unit *file*; the directory systemd loads its overrides from is
+   * a separate path and survives. systemd stops reading it the moment the parent
+   * unit is gone, so the drop-ins are not deleted and not reported — they are
+   * orphaned, and the next `paperclipai service install` writes a bare unit that
+   * silently lost every one of them. The failure then surfaces much later, as an
+   * outage whose two error signatures point at unrelated causes. The CLI never
+   * writes to that directory, so it can never be "the one uninstall created":
+   * refusing is the only honest option, and the message names the files.
+   */
+  private async assertUninstallable(force: boolean): Promise<void> {
+    let contents: string | null = null;
+    try {
+      contents = await fs.readFile(this.definitionPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+
+    const ownership = contents === null
+      ? { owned: true, detail: "no definition is installed" }
+      : describeSystemdOwnership(contents, { instanceId: this.instanceId, homeDir: this.homeDir });
+    if (!ownership.owned && !force) {
+      throw new Error(
+        `Refusing to remove ${this.definitionPath}: ${ownership.detail}. `
+        + `This manager is the one for ${this.serviceName} at ${JSON.stringify(this.homeDir)}, and removing a unit file that is not its own `
+        + `deletes whatever is installed at that path — including a loaded unit, whose fragment the systemd user manager garbage-collects, stopping the service `
+        + `and every agent running under it. Inspect the file, or re-run with --force if you really mean to remove it.`,
+      );
+    }
+
+    const dropIns = await listDropInFiles(this.dropInDirectory);
+    if (dropIns.length > 0 && !force) {
+      throw new Error(
+        `Refusing to remove ${this.definitionPath}: ${this.dropInDirectory} holds ${dropIns.length} drop-in file${dropIns.length === 1 ? "" : "s"} (${dropIns.join(", ")}). `
+        + `Uninstalling removes the unit file only, and systemd stops loading that directory the moment the parent unit is gone — `
+        + `so the drop-ins would be orphaned rather than removed, \`doctor\` would report nothing, and the next \`paperclipai service install\` would write a bare unit that has quietly lost all of them. `
+        + `Move or delete ${this.dropInDirectory} yourself, or re-run with --force to leave it behind on purpose.`,
+      );
+    }
+  }
+
+  /**
+   * Stopping a unit is not allowed to fail quietly into a removal.
+   *
+   * `RefuseManualStop=` makes `systemctl --user stop` exit non-zero while the
+   * unit keeps running, and the old code let that error abort the uninstall by
+   * accident. That accident is the only reason a mis-scoped uninstall has not
+   * taken a control plane down: a drop-in written to stop outage-driven manual
+   * restarts happens to block the deletion of the unit the board runs on, and
+   * removing *that* drop-in — which its own header tells operators to do to
+   * restore normal service operation — would arm the deletion. A protection
+   * that depends on an unrelated setting is not a protection, so the refusal is
+   * now the stated behaviour and it names the blocker.
+   */
+  private async stopOrRefuseToRemove(): Promise<void> {
+    try {
+      await this.stop();
+    } catch (error) {
+      throw new Error(
+        `Refusing to remove ${this.definitionPath}: ${this.serviceName} is running and could not be stopped (${describeError(error)}). `
+        + `Removing the fragment of a running unit makes the systemd user manager garbage-collect it, which stops the service and takes down every agent on this control plane. `
+        + `Stop it by hand (\`systemctl --user stop ${this.serviceName}\`; a RefuseManualStop= drop-in will block that) and retry, or re-run with --force.`,
+        { cause: error },
+      );
+    }
   }
 
   async start(): Promise<void> { await this.ensureCurrent(); await this.runner("systemctl", ["--user", "start", this.serviceName]); }
@@ -581,6 +825,8 @@ export class LaunchdServiceManager implements ServiceManager {
   readonly platform = "launchd" as const;
   readonly serviceName: string;
   readonly definitionPath: string;
+  /** launchd has no drop-in directory; a plist is one file or it is nothing. */
+  readonly dropInDirectory: null = null;
   private readonly domain = `gui/${process.getuid?.() ?? 0}`;
   private readonly stdoutPath: string;
   private readonly stderrPath: string;
@@ -644,10 +890,44 @@ export class LaunchdServiceManager implements ServiceManager {
     return { changed };
   }
 
-  async uninstall(): Promise<void> {
+  async uninstall(options: ServiceUninstallOptions = {}): Promise<void> {
+    // Same gate and the same ordering as the systemd side: prove ownership
+    // before booting the agent out, so a refusal does not stop a LaunchAgent it
+    // has no claim to. A booted-out agent is an outage the operator did not ask
+    // for and cannot undo from the same command.
+    let contents: string | null = null;
+    try {
+      contents = await fs.readFile(this.definitionPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (contents !== null) {
+      const ownership = describeLaunchdOwnership(contents, { instanceId: this.instanceId, homeDir: this.homeDir });
+      if (!ownership.owned && options.force !== true) {
+        throw new Error(
+          `Refusing to remove ${this.definitionPath}: ${ownership.detail}. `
+          + `This manager is the one for ${this.serviceName} at ${JSON.stringify(this.homeDir)}, and removing a plist that is not its own `
+          + `deletes whatever is installed at that path — including the plist a running LaunchAgent was bootstrapped from. `
+          + `Inspect the file, or re-run with --force if you really mean to remove it.`,
+        );
+      }
+    }
     await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]).catch(() => undefined);
-    await this.runner("launchctl", ["disable", `${this.domain}/${this.serviceName}`]).catch(() => undefined);
+    let disableFailure: unknown;
+    try {
+      await this.runner("launchctl", ["disable", `${this.domain}/${this.serviceName}`]);
+    } catch (error) {
+      disableFailure = error;
+    }
     await fs.rm(this.definitionPath, { force: true });
+    if (disableFailure) {
+      throw new Error(
+        `Removed ${this.definitionPath}, but could not disable ${this.serviceName}: ${describeError(disableFailure)}. `
+        + `The agent is no longer defined, but it may still be enabled and will be loaded again on the next login. `
+        + `Run \`launchctl disable ${this.domain}/${this.serviceName}\` to clear it.`,
+        { cause: disableFailure },
+      );
+    }
   }
   async start(): Promise<void> { await this.install({ startNow: true, startOnLogin: await this.isEnabled() }); }
   async stop(): Promise<void> { await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]); }

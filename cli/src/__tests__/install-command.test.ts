@@ -29,6 +29,55 @@ import { systemdServiceName } from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
+/**
+ * An `uninstallCommand` override for a test that is about the install store, not
+ * about a service.
+ *
+ * `uninstallCommand()` with no overrides resolves the `default` instance
+ * against the real `os.homedir()`, so on any machine running Paperclip as a
+ * background service it addresses the live `paperclipai.service` and removes it.
+ * That is the defect `uninstall()`'s ownership gate now refuses — measured on
+ * this repo's own suite: with the gate in place, these two tests are the only
+ * thing that stood between `pnpm test` and the control plane's unit file, and
+ * they reached the real host unit rather than the temp `HOME` their
+ * `beforeEach` set. Passing no service at all is the only hermetic answer for a
+ * test with no service in it; `userHomeDir` alone is not, because the manager
+ * resolves its own path from `os.homedir()` and never sees that argument.
+ */
+function noInstalledService() {
+  return {
+    detectServiceManager: vi.fn(async () => ({
+      supported: true as const,
+      manager: {
+        platform: "systemd" as const,
+        instanceId: "default",
+        serviceName: "paperclipai.service",
+        definitionPath: path.join(process.env.HOME!, ".config", "systemd", "user", "paperclipai.service"),
+        dropInDirectory: null,
+        renderDefinition: () => "",
+        desiredDefinition: async () => "",
+        install: vi.fn(async () => ({ changed: false })),
+        uninstall: vi.fn(async () => undefined),
+        start: vi.fn(async () => undefined),
+        stop: vi.fn(async () => undefined),
+        restart: vi.fn(async () => undefined),
+        status: vi.fn(async () => ({
+          platform: "systemd" as const,
+          serviceName: "paperclipai.service",
+          installed: false,
+          active: false,
+          enabled: false,
+          pid: null,
+        })),
+        logs: vi.fn(async () => undefined),
+        installedExecutablePath: vi.fn(async () => null),
+      },
+    })),
+    platform: "linux" as NodeJS.Platform,
+    userHomeDir: process.env.HOME!,
+  };
+}
+
 describe("managed install commands", () => {
   let root: string;
 
@@ -408,7 +457,7 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    await expect(uninstallCommand(noInstalledService())).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
@@ -430,7 +479,7 @@ describe("managed install commands", () => {
 
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand(noInstalledService())).rejects.toThrow("already running");
       },
       paths,
     );
