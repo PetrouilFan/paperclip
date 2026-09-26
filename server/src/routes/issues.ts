@@ -354,7 +354,7 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
  * The handler never used to inspect the key set, so an unread key was dropped
  * silently and the caller received the *unfiltered* board — a typo like
  * `?assigneeId=` (the real key is `assigneeAgentId`) returned every issue in
- * the company instead of an error (PET-206). Rejecting unknown keys turns that
+ * the company instead of an error. Rejecting unknown keys turns that
  * maximally-wrong silent answer into a loud, self-describing 400.
  *
  * Two rules keep this set honest:

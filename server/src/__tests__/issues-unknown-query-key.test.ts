@@ -38,7 +38,7 @@ async function resetUnknownQueryKeyFixtures(db: Db) {
 }
 
 /**
- * Regression coverage for the silent-drop defect behind PET-206:
+ * Regression coverage for the silent-drop defect this suite guards:
  * `GET /companies/:companyId/issues` read a fixed set of query keys and never
  * inspected the key set, so a key it did not read was dropped with no trace and
  * the caller got the *unfiltered* board. `?assigneeId=` (the real key is
@@ -104,7 +104,7 @@ describeEmbeddedPostgres("issue list unknown query key rejection", () => {
     return (res.body as { id: string }[]).map((issue) => issue.id).sort();
   }
 
-  // 1. The PET-206 case itself, and the regression guard for it.
+  // 1. The missed-key case itself, and the regression guard for it.
   it("rejects ?assigneeId= with 400 instead of returning the unfiltered board", async () => {
     const seeded = await seed();
     const agentId = seeded.agentId;
