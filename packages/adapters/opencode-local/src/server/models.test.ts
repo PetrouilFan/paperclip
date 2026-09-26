@@ -8,6 +8,45 @@ import {
   resetOpenCodeModelsCacheForTests,
 } from "./models.js";
 
+// Verbatim stderr from `opencode models --refresh` on opencode v2.0.14:
+// a bare banner on one line, the actionable detail indented on the next.
+const UNSUPPORTED_REFRESH_STDERR =
+  "\nERROR\n  Unrecognized flag: --refresh in command opencode models\n";
+
+function childResult(over: {
+  exitCode?: number | null;
+  stdout?: string;
+  stderr?: string;
+}) {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: 1,
+    startedAt: new Date().toISOString(),
+    ...over,
+  };
+}
+
+/**
+ * Stubs `opencode models` by argv so a test does not have to care how many
+ * times discovery retries: `--refresh` answers every refresh attempt with
+ * `refresh`, and plain `models` enumerations are served from `plain()`.
+ */
+function stubModelsCli(opts: {
+  refresh: { exitCode?: number | null; stdout?: string; stderr?: string };
+  plain: () => { exitCode?: number | null; stdout?: string; stderr?: string };
+}) {
+  return vi
+    .spyOn(serverUtils, "runChildProcess")
+    .mockImplementation(async (_id, _command, args) => {
+      const isRefresh = Array.isArray(args) && args.includes("--refresh");
+      return childResult(isRefresh ? opts.refresh : opts.plain());
+    });
+}
+
 describe("openCode models", () => {
   afterEach(() => {
     delete process.env.PAPERCLIP_OPENCODE_COMMAND;
@@ -266,8 +305,84 @@ describe("openCode models", () => {
     expect(spy.mock.calls[2]?.[2]).toEqual(["models"]);
   });
 
-  it("still rejects from the original catalog when refresh fails", async () => {
+  it("still re-enumerates after a failed refresh and accepts a model the re-read finds", async () => {
+    vi.useFakeTimers();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let plainCalls = 0;
+    const spy = stubModelsCli({
+      // This is the opencode v2 shape verbatim: a bare `ERROR` banner with the
+      // actionable detail on the next line, and exit 1. A non-zero exit is
+      // retried, so this answers every refresh attempt.
+      refresh: { exitCode: 1, stderr: UNSUPPORTED_REFRESH_STDERR },
+      plain: () => {
+        plainCalls += 1;
+        return {
+          stdout:
+            plainCalls === 1
+              ? "openrouter/example/stale-model\n"
+              : "openrouter/example/stale-model\nopenrouter/deepseek/deepseek-v4-flash-0731\n",
+        };
+      },
+    });
+
+    const promise = ensureOpenCodeModelConfiguredAndAvailable({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
+    await vi.runAllTimersAsync();
+
+    await expect(promise).resolves.toContainEqual({
+      id: "openrouter/deepseek/deepseek-v4-flash-0731",
+      label: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
+    // The failed refresh must not skip the re-enumeration: that second plain
+    // read is the only chance to observe the model, and it used to be lost.
+    expect(plainCalls).toBe(2);
+    expect(spy.mock.calls[1]?.[2]).toEqual(["models", "--refresh"]);
+    expect(spy.mock.calls.at(-1)?.[2]).toEqual(["models"]);
+    // ...and the unsupported-flag reason must survive the generic `ERROR`
+    // banner, otherwise the log reads "refresh ... failed: ERROR".
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("Unrecognized flag: --refresh"),
+    );
+  });
+
+  it("proceeds with the configured model when the catalog is stale and the CLI cannot refresh it", async () => {
+    vi.useFakeTimers();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let plainCalls = 0;
+    const spy = stubModelsCli({
+      refresh: { exitCode: 1, stderr: UNSUPPORTED_REFRESH_STDERR },
+      plain: () => {
+        plainCalls += 1;
+        return { stdout: "openrouter/example/stale-model\n" };
+      },
+    });
+
+    // Without a refresh we have no fresh evidence that the model is gone, so
+    // the pre-flight must fail open. Rejecting would take every run for every
+    // agent down for as long as the cache stays stale.
+    const promise = ensureOpenCodeModelConfiguredAndAvailable({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
+    await vi.runAllTimersAsync();
+
+    await expect(promise).resolves.toEqual([
+      {
+        id: "openrouter/deepseek/deepseek-v4-flash-0731",
+        label: "openrouter/deepseek/deepseek-v4-flash-0731",
+      },
+    ]);
+    expect(plainCalls).toBe(2);
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("does not support `opencode models --refresh`"),
+    );
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it("still rejects when a refresh that works leaves the model absent", async () => {
+    // Guards the fix from over-reaching: when the CLI CAN refresh and the model
+    // is genuinely gone, the strict rejection must survive.
+    vi.spyOn(console, "warn").mockImplementation(() => {});
     const spy = vi
       .spyOn(serverUtils, "runChildProcess")
       .mockResolvedValueOnce({
@@ -279,20 +394,24 @@ describe("openCode models", () => {
         pid: 1,
         startedAt: new Date().toISOString(),
       })
-      .mockRejectedValueOnce(new Error("refresh unavailable"));
+      .mockResolvedValue({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "openrouter/example/current-model\n",
+        stderr: "",
+        pid: 1,
+        startedAt: new Date().toISOString(),
+      });
 
     await expect(
       ensureOpenCodeModelConfiguredAndAvailable({
         model: "openrouter/deepseek/deepseek-v4-flash-0731",
       }),
-    ).rejects.toThrow("Available models: openrouter/example/stale-model");
-    expect(spy).toHaveBeenCalledTimes(2);
-    expect(spy.mock.calls[1]?.[2]).toEqual(["models", "--refresh"]);
-    expect(warning).toHaveBeenCalledWith(
-      expect.stringContaining(
-        'refresh failed for "openrouter/deepseek/deepseek-v4-flash-0731"',
-      ),
+    ).rejects.toThrow(
+      "Configured OpenCode model is unavailable: openrouter/deepseek/deepseek-v4-flash-0731",
     );
+    expect(spy.mock.calls[1]?.[2]).toEqual(["models", "--refresh"]);
   });
 
   it("surfaces the last error once retries are exhausted", async () => {

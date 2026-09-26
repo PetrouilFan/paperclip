@@ -80,6 +80,35 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
+// Generic CLI banners that carry no diagnostic value on their own.
+const GENERIC_ERROR_BANNERS = new Set([
+  "error",
+  "error:",
+  "fatal",
+  "fatal:",
+  "usage",
+]);
+
+// `opencode models --refresh` on opencode v2 prints a bare `ERROR` banner and
+// puts the actionable detail on the following indented line:
+//
+//   ERROR
+//     Unrecognized flag: --refresh in command opencode models
+//
+// Reporting only the first non-empty line turns that into an opaque
+// "`opencode models` failed: ERROR", which hides the one fact an operator needs
+// (that the installed CLI cannot refresh at all). Prefer the first line that is
+// not a generic banner.
+function firstInformativeLine(text: string): string {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return (
+    lines.find((line) => !GENERIC_ERROR_BANNERS.has(line.toLowerCase())) ?? ""
+  );
+}
+
 export function parseOpenCodeModelsOutput(stdout: string): AdapterModel[] {
   const parsed: AdapterModel[] = [];
   for (const raw of stdout.split(/\r?\n/)) {
@@ -191,7 +220,7 @@ export async function discoverOpenCodeModels(
       );
     } else if ((result.exitCode ?? 1) !== 0) {
       const detail =
-        firstNonEmptyLine(result.stderr) || firstNonEmptyLine(result.stdout);
+        firstInformativeLine(result.stderr) || firstNonEmptyLine(result.stdout);
       lastError = new Error(
         detail
           ? `\`opencode models\` failed: ${detail}`
@@ -230,11 +259,22 @@ export async function discoverOpenCodeModelsCached(
   return models;
 }
 
+type RefreshedCatalog = {
+  models: AdapterModel[];
+  /**
+   * True when `opencode models --refresh` actually ran. When false the CLI
+   * cannot invalidate its own on-disk models.dev cache, so the re-enumeration
+   * below is NOT authoritative: it cannot distinguish a genuinely-absent model
+   * from a stale one.
+   */
+  refreshed: boolean;
+};
+
 async function refreshOpenCodeModelsCached(input: {
   command?: unknown;
   cwd?: unknown;
   env?: unknown;
-}): Promise<AdapterModel[]> {
+}): Promise<RefreshedCatalog> {
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
@@ -242,12 +282,27 @@ async function refreshOpenCodeModelsCached(input: {
   // models.dev cache. Its stdout is a confirmation message, not the refreshed
   // catalog, so enumerate once more after the refresh under the exact same
   // command/cwd/env before deciding whether the configured model exists.
-  await discoverOpenCodeModels({
-    command,
-    cwd,
-    env,
-    refresh: true,
-  });
+  //
+  // A failed refresh must not skip that second enumeration: the catalog may
+  // have been updated in the meantime by another process, and the re-read is
+  // also the only chance to observe the model. Report `refreshed: false` so the
+  // caller can tell an un-refreshable catalog apart from a definitive miss.
+  let refreshed = true;
+  try {
+    await discoverOpenCodeModels({
+      command,
+      cwd,
+      env,
+      refresh: true,
+    });
+  } catch (err) {
+    refreshed = false;
+    console.warn(
+      `[opencode-local] \`opencode models --refresh\` could not run (${
+        err instanceof Error ? err.message : String(err)
+      }); re-enumerating without a cache invalidation.`,
+    );
+  }
   const models = await discoverOpenCodeModels({ command, cwd, env });
   if (models.length > 0) {
     discoveryCache.set(discoveryCacheKey(command, cwd, env), {
@@ -255,7 +310,7 @@ async function refreshOpenCodeModelsCached(input: {
       models,
     });
   }
-  return models;
+  return { models, refreshed };
 }
 
 export function isTruthyEnvFlag(value: string | undefined): boolean {
@@ -324,15 +379,29 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     // cached miss as authoritative; a successful refresh that still omits the
     // model retains the strict availability rejection below.
     try {
-      const refreshedModels = await refreshOpenCodeModelsCached({
-        command: input.command,
-        cwd: input.cwd,
-        env: input.env,
-      });
+      const { models: refreshedModels, refreshed } =
+        await refreshOpenCodeModelsCached({
+          command: input.command,
+          cwd: input.cwd,
+          env: input.env,
+        });
       if (refreshedModels.some((entry) => entry.id === model)) {
         return refreshedModels;
       }
       if (refreshedModels.length > 0) models = refreshedModels;
+      if (!refreshed) {
+        // The catalog is stale AND we could not invalidate it, so this miss is
+        // not evidence that the model is gone. Rejecting here would make the
+        // guard fail closed on a cache the probe cannot refresh — and because
+        // opencode v2 rejects `models --refresh` outright, that is every run,
+        // for every agent, for as long as the cache stays stale. The real
+        // invocation is authoritative, so proceed exactly as for the
+        // probe-crash and empty-catalog cases above.
+        console.warn(
+          `[opencode-local] Could not confirm whether "${model}" is available: this OpenCode CLI does not support \`opencode models --refresh\`, so the model catalog could not be refreshed and the miss may be a stale cache. Proceeding with the configured model. Set OPENCODE_ALLOW_ALL_MODELS=true to silence this, or pin adapterConfig.model to an id listed by \`opencode models\`.`,
+        );
+        return [{ id: model, label: model }];
+      }
     } catch (err) {
       console.warn(
         `[opencode-local] Model availability refresh failed for "${model}" (${
