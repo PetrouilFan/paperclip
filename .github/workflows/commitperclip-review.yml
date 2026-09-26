@@ -162,12 +162,31 @@ jobs:
       # `always()` is load-bearing: the step above exits 1 on a gate failure,
       # which fails the job, and without it this step would be skipped in
       # precisely the case that matters most — publishing the `failure` verdict.
+      #
+      # `steps.quality.outcome` is deliberately NOT part of this condition.
+      # `Run quality gates` carries an `if:` with no status function, so
+      # GitHub evaluates it as `success() && …`, which means any failure
+      # earlier in the job leaves `steps.quality.outcome` at `skipped`. Guarding
+      # on it therefore skipped this step on the three pre-gate failure paths —
+      # `Dependency Review`, `Set up Node`, and `Generate commitperclip token`
+      # — so a re-gate whose run died early wrote no verdict at all and the
+      # pull request kept the superseded one. That is the exact defect the
+      # `workflow_dispatch` trigger exists to remove, reintroduced inside the
+      # step that removes it. The three outcomes are told apart in the shell
+      # below instead, where the "did not reach the gates" case records a
+      # `failure` verdict rather than staying silent.
+      #
+      # `head_sha` is the only guard here that has to be able to skip, and it
+      # cannot be the one that swallows a verdict: it is written by the resolve
+      # step, which runs before all three of those. It is empty only when the
+      # run died at or before the resolve step, and then there is no head SHA to
+      # publish to.
       - name: Publish verdict to the pull request head (manual runs only)
         if: >-
           always() &&
           github.event_name == 'workflow_dispatch' &&
           steps.pr.outputs.author != 'dependabot[bot]' &&
-          steps.quality.outcome != 'skipped'
+          steps.pr.outputs.head_sha != ''
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -175,14 +194,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$GATE_OUTCOME" = "failure" ]; then
-            conclusion=failure
-            title="Quality gates failed"
-          else
-            conclusion=success
-            title="Quality gates passed"
-          fi
-          summary="Re-run manually against the current gate code. The per-gate detail is in the commitperclip comment on this pull request."
+          # Every outcome other than a completed pass is a `failure` verdict.
+          # `skipped` and `cancelled` both mean the gates produced no verdict,
+          # so the head commit is unproven — and unproven must not render as
+          # green, or the rollup is lying in the same way this step's guard
+          # did. The comment the gate script would have written does not exist
+          # on those paths either, so the summary must not point a reviewer at
+          # it.
+          case "$GATE_OUTCOME" in
+            success)
+              conclusion=success
+              title="Quality gates passed"
+              summary="Re-run manually against the current gate code. The per-gate detail is in the commitperclip comment on this pull request."
+              ;;
+            failure)
+              conclusion=failure
+              title="Quality gates failed"
+              summary="Re-run manually against the current gate code. The per-gate detail is in the commitperclip comment on this pull request."
+              ;;
+            *)
+              conclusion=failure
+              title="Run did not reach the quality gates"
+              summary="This run failed before the quality gates produced a verdict, so this head commit is unproven. Read the run log for the failing step, then re-gate."
+              ;;
+          esac
 
           existing="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?name=review" \
             --jq '[.check_runs[] | select(.app.slug == "github-actions")] | first | .id // empty')"
