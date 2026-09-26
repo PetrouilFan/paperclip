@@ -105,7 +105,7 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
   });
 
-  const createGitCheckoutRunCommand = (sha: string, options: { serverFiles?: string[]; repoSkills?: boolean; onPack?: (checkout: string, packageDir: string) => void } = {}) => {
+  const createGitCheckoutRunCommand = (sha: string, options: { serverFiles?: string[]; repoSkills?: boolean; onPack?: (checkout: string, packageDir: string) => void; onNpmPack?: (args: string[]) => void } = {}) => {
     let checkoutRoot = "";
     return vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
@@ -144,6 +144,7 @@ describe("managed install commands", () => {
       }
       if (file === "bash") return { stdout: "", stderr: "" };
       if (file === "npm" && args[0] === "pack") {
+        options.onNpmPack?.(args);
         const packageName = args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai";
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
@@ -237,6 +238,27 @@ describe("managed install commands", () => {
     });
     await installGitPayload("paperclipai/paperclip", "f".repeat(40), runCommand, resolveInstallStorePaths());
     expect(observed.find((entry) => entry.packageDir === "server")?.skills).toEqual([]);
+  });
+
+  it("packs the staged bundled package with --ignore-scripts", async () => {
+    // The staged dir lives at stagingRoot/workspace-package-N, i.e. *outside* the
+    // pnpm workspace, and its package.json still carries the source `prepack`. So a
+    // bare `npm pack` re-ran `pnpm run prepare:ui-dist && pnpm run build` there and
+    // died with "Cannot resolve package from workspace because workspace packages
+    // were not loaded into the resolver" -- which is how `install --ref` stayed
+    // 100% broken through three earlier fixes. scripts/release.sh's
+    // run_bundled_npm_pack already passes --ignore-scripts on this same staged dir.
+    const observed: Array<{ target: string; args: string[] }> = [];
+    const runCommand = createGitCheckoutRunCommand("a".repeat(40), {
+      onNpmPack: (args) => { observed.push({ target: args[1] ?? "", args }); },
+    });
+    await installGitPayload("paperclipai/paperclip", "a".repeat(40), runCommand, resolveInstallStorePaths());
+    const staged = observed.find((entry) => entry.target.includes("workspace-package-"));
+    expect(staged, "a bundled workspace package must be staged and packed").toBeDefined();
+    expect(
+      staged?.args,
+      "the staged dir is already complete, and prepack cannot run outside the workspace",
+    ).toContain("--ignore-scripts");
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {

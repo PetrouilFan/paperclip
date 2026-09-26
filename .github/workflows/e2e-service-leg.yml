@@ -254,6 +254,25 @@ jobs:
               missing=1
             fi
           done
+          # Steps 3/5/6 are the git-install channel (`install --ref`, `update
+          # --rollback`, `reinstall`). This job already runs the whole script, so
+          # requiring them costs no extra time -- and until now it did not require
+          # them at all, which made this job report `success` on a run where
+          # 3a/3b/5a/6a/6b were all FAIL. A job that cannot go red on the defect
+          # it is cited as evidence for is not evidence, and reading its green as
+          # proof is what made two consecutive false "fixed" claims on this branch.
+          for leg in 3a 3b 3c 3d 5a 5b 5c 6a 6b; do
+            if ! grep -qE "^PASS +$leg " "$RUNNER_TEMP/e2e.clean.log"; then
+              echo "MISSING PASS: $leg (git-install channel)"
+              missing=1
+            fi
+          done
+          # Belt and braces: the script's own verdict must agree. If OVERALL is FAIL
+          # for any reason not covered by the leg lists above, this still goes red.
+          if grep -q "^OVERALL: FAIL" "$RUNNER_TEMP/e2e.clean.log"; then
+            echo "script reported OVERALL: FAIL"
+            missing=1
+          fi
           exit "$missing"
 
       - name: Assert the host unit was never activated, and the leg's unit is gone

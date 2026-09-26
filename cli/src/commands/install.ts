@@ -303,7 +303,18 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        // `--ignore-scripts` is not optional here, and the release pipeline already
+        // proves it: release-lib.sh's run_bundled_npm_pack packs this same staged
+        // directory with `--ignore-scripts`, and without it `install --ref` always dies.
+        // The staged dir sits at stagingRoot/workspace-package-N, i.e. *outside* the
+        // pnpm workspace, so npm's `prepack` -- which server/package.json defines as
+        // `pnpm run prepare:ui-dist && pnpm run build` -- runs a build with no workspace
+        // packages loaded ("Cannot resolve package from workspace because workspace
+        // packages were not loaded into the resolver") and no ../packages/paperclip-
+        // runner/dist to copy from. It is also pure waste: prepare-bundled-package.mjs
+        // has already cpSync'd every `files` entry, so dist/ui-dist/skills are present
+        // before the pack begins.
+        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
