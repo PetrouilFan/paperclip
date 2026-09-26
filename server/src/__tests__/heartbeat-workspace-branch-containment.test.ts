@@ -441,6 +441,16 @@ async function seedBranchContainmentRun(
     },
   ]);
 
+  // The queued run and its wakeup request are stamped with wall-clock time rather
+  // than the fixture's fixed `now`. `resumeQueuedRuns` ages out a run that is still
+  // `queued` with `startedAt IS NULL` once it is older than the admission window
+  // (see `never-dispatched-run.ts`), and the fixed fixture date is months in the
+  // past, so a `queued` row stamped with it reads as stranded and is cancelled
+  // before dispatch. This test exercises workspace branch containment and asserts
+  // only the run's terminal status, so the queue timestamp is free to be real:
+  // what the fixture has to model is a run that is waiting to be picked up now.
+  const queuedAt = new Date();
+
   await db.insert(agentWakeupRequests).values({
     id: wakeupRequestId,
     companyId,
@@ -451,8 +461,8 @@ async function seedBranchContainmentRun(
     payload: { issueId: sourceIssueId },
     status: "queued",
     runId,
-    requestedAt: now,
-    updatedAt: now,
+    requestedAt: queuedAt,
+    updatedAt: queuedAt,
   });
   await db.insert(heartbeatRuns).values({
     id: runId,
@@ -468,8 +478,8 @@ async function seedBranchContainmentRun(
       wakeReason: "issue_assigned",
     },
     responsibleUserId: "responsible-user",
-    createdAt: now,
-    updatedAt: now,
+    createdAt: queuedAt,
+    updatedAt: queuedAt,
   });
 
   await db.insert(issues).values([
