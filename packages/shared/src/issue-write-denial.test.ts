@@ -99,6 +99,18 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.title).toContain("no task to attribute");
   });
 
+  it("names the standing-watch config, because a watch owns no task to check out", () => {
+    // PET-397. "Check out the task this run is working on" is unfollowable for
+    // the one role that hits this wall on purpose: a scheduled watch has no
+    // task, so the only sanctioned path it can actually take is the standing
+    // host issue, or it produces nothing on the board in silence.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "no_context_source_and_target_unbound",
+    });
+    expect(copy.sanctionedPath).toContain("standingWatchIssueId");
+    expect(copy.description).toContain("no task by construction");
+  });
+
   it("keeps the run-header fix for the reasons where the run really is absent", () => {
     for (const runContextReason of ["malformed_run_id", "run_not_found"] as const) {
       const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {

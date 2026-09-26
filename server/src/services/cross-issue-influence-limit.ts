@@ -1,7 +1,11 @@
 import { and, asc, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
-import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
+import {
+  isUuidLike,
+  issueWriteDenialResponse,
+  STANDING_WATCH_HOST_ISSUE_STATUS_SET,
+} from "@paperclipai/shared";
 import type { CrossIssueRunContextReason } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -61,6 +65,24 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
     if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
   }
   return null;
+}
+
+/**
+ * The issue a watch role's timer wake is charged to, stamped by the scheduler
+ * from `runtimeConfig.heartbeat.standingWatchIssueId` at enqueue time.
+ *
+ * Read as its own key rather than as `contextSnapshot.issueId` on purpose: the
+ * standing host is a *source of attribution*, not the issue the run is working
+ * on. Folding it into `issueId` would make the wake issue-scoped, which drags
+ * in the tree-hold deferral, the workspace binding, and the
+ * `skipTimerWhenNoActionableWork` short-circuit — none of which a board-wide
+ * watch should inherit from one issue.
+ */
+function readRunStandingWatchIssueId(contextSnapshot: unknown) {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
+  const context = contextSnapshot as Record<string, unknown>;
+  const candidate = context.standingWatchIssueId;
+  return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -157,6 +179,7 @@ export async function observeCrossIssueInfluence(
     // Only a live run's binding counts. A stamp left behind by a terminal run
     // must not exempt a later write.
     let boundSourceIssueId: string | null = null;
+    let standingSourceIssueId: string | null = null;
     let targetIsBound = false;
     if (!contextSourceIssueId) {
       if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
@@ -181,6 +204,47 @@ export async function observeCrossIssueInfluence(
       // A run may always write to an issue it actually holds, so the target's
       // own binding is checked before the cap rather than after it.
       targetIsBound = boundIssues.some((row) => row.id === input.targetIssueId);
+
+      // A standing watch is the third and last way a run can have a source
+      // (PET-397). Without it a `heartbeat_timer` wake is mute by
+      // construction: it has no task, and the only two ways to manufacture a
+      // source — checking out an issue, or creating one — are unavailable to a
+      // watch whose entire job is writing to issues it does not own. Worse,
+      // the host is often exactly the issue that *cannot* be checked out, so
+      // the binding above can never resolve for it. Measured: PET-349's rules
+      // 1-3 and its daily report are all cross-issue writes, and every one of
+      // them returned `no_context_source_and_target_unbound` on a bare timer
+      // wake while the run produced nothing on the board, which is
+      // indistinguishable from a watch that never ran.
+      //
+      // Re-validated here rather than trusted from the snapshot: the config is
+      // operator-editable, the run outlives the config, and this is the last
+      // gate before an unattributed cross-issue write. A host that is not in
+      // this company, not assigned to this agent, or terminal is ignored and
+      // the write falls through to the fail-closed branch exactly as before.
+      const standingWatchIssueId = readRunStandingWatchIssueId(run.contextSnapshot);
+      if (standingWatchIssueId) {
+        const host = await tx
+          .select({
+            id: issues.id,
+            assigneeAgentId: issues.assigneeAgentId,
+            status: issues.status,
+          })
+          .from(issues)
+          .where(and(
+            eq(issues.id, standingWatchIssueId),
+            eq(issues.companyId, input.companyId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (
+          host &&
+          host.assigneeAgentId === input.agentId &&
+          STANDING_WATCH_HOST_ISSUE_STATUS_SET.has(host.status)
+        ) {
+          standingSourceIssueId = host.id;
+          if (host.id === input.targetIssueId) targetIsBound = true;
+        }
+      }
     }
 
     if (targetIsBound) return null;
@@ -188,7 +252,7 @@ export async function observeCrossIssueInfluence(
     // No context source and no binding anywhere: there is nothing to attribute
     // the write to, so fail closed. This is the guard the fleet-wide reports
     // exercised and it must keep refusing a run that is bound to nothing.
-    const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;
+    const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId ?? standingSourceIssueId;
     if (!sourceIssueId) {
       // The one target whose origin never needs a run to attribute it is the
       // caller's own assigned ticket. `authorization.ts` already allows

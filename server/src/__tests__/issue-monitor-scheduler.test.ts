@@ -273,6 +273,28 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity).toContain("issue.monitor_triggered");
   });
 
+  it("stamps the monitored issue on the run, so a monitor run is not a task-less wake", async () => {
+    // PET-397. A cross-issue write is refused unless the *run* carries a source
+    // issue, and the two wake paths differ here in a way that is easy to get
+    // backwards. An issue monitor already binds its watched issue as the run's
+    // context, so a monitor run can escalate onto another issue without a human
+    // in the loop; a bare `heartbeat_timer` wake does not, and that is the path
+    // `standingWatchIssueId` exists to serve. Pinned so the monitor path is not
+    // "fixed" a second time by someone reading the timer path as the norm.
+    const { agentId, issueId } = await seedFixture();
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    const [run] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect((run?.contextSnapshot ?? {})).toMatchObject({
+      issueId,
+      source: "issue.monitor",
+    });
+  });
+
   it.each(["unknown", "exhausted"] as const)("does not replay a quota monitor with %s execution evidence", async (kind) => {
     const sourceRunId = randomUUID();
     const { companyId, issueId, agentId } = await seedFixture({
