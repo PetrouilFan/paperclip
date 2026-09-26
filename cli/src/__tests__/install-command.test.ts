@@ -105,21 +105,27 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
   });
 
-  const createGitCheckoutRunCommand = (sha: string) =>
-    vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
+  const createGitCheckoutRunCommand = (sha: string, options: { serverFiles?: string[]; repoSkills?: boolean; onPack?: (checkout: string, packageDir: string) => void } = {}) => {
+    let checkoutRoot = "";
+    return vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
       if (file === "tar") {
         const checkout = args[args.indexOf("-C") + 1];
+        checkoutRoot = checkout;
         const packages = [
           { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: "0.3.1" } },
           { dir: "packages/db", name: "@paperclipai/db", packageJson: { name: "@paperclipai/db", version: "0.3.1", dependencies: { "@paperclipai/shared": "workspace:*" }, bundleDependencies: ["embedded-postgres"] } },
-          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" } } },
+          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" }, ...(options.serverFiles ? { files: options.serverFiles } : {}) } },
         ];
         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
+        if (options.repoSkills) {
+          fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
+          fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "skill");
+        }
         for (const workspacePackage of packages) {
           fs.mkdirSync(path.join(checkout, workspacePackage.dir), { recursive: true });
           fs.writeFileSync(path.join(checkout, workspacePackage.dir, "package.json"), JSON.stringify(workspacePackage.packageJson));
@@ -130,6 +136,7 @@ describe("managed install commands", () => {
         if (args.includes("pack")) {
           const destination = args[args.indexOf("--pack-destination") + 1];
           const packageDir = args[args.indexOf("--dir") + 1];
+          options.onPack?.(checkoutRoot, packageDir);
           const packageName = packageDir === "server" ? "paperclipai-server" : "paperclipai-shared";
           fs.writeFileSync(path.join(destination, `${packageName}-0.3.1.tgz`), "package");
         }
@@ -150,6 +157,7 @@ describe("managed install commands", () => {
       if (file === process.execPath) return { stdout: "0.3.1\n", stderr: "" };
       throw new Error(`Unexpected command: ${file} ${args.join(" ")}`);
     });
+  };
 
   it("installs a GitHub branch through codeload and reuses the resolved SHA", async () => {
     const sha = "c".repeat(40);
@@ -190,6 +198,45 @@ describe("managed install commands", () => {
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
+  });
+
+  it("materialises the repo-root skills/ into every package that ships it, before packing", async () => {
+    // `skills` is a `files` entry with no build step behind it: scripts/release.sh
+    // copies the repo-root skills/ into each shipping package and deletes it again
+    // afterwards, so a fresh checkout has no server/skills at all. Both packers then
+    // fail, which is why `install --ref <anything>` failed 100% of the time.
+    // Observed at pack time -- after the copy, before the tarball exists.
+    const observed: Array<{ packageDir: string; skills: string[] }> = [];
+    const runCommand = createGitCheckoutRunCommand("e".repeat(40), {
+      serverFiles: ["dist", "skills"],
+      repoSkills: true,
+      onPack: (checkout, packageDir) => {
+        const skillsDir = path.join(checkout, packageDir, "skills");
+        observed.push({
+          packageDir,
+          skills: fs.existsSync(skillsDir) ? fs.readdirSync(skillsDir).sort() : [],
+        });
+      },
+    });
+    await installGitPayload("paperclipai/paperclip", "e".repeat(40), runCommand, resolveInstallStorePaths());
+    const server = observed.find((entry) => entry.packageDir === "server");
+    expect(server?.skills, "server ships skills in files, so server/skills must exist at pack time").toContain("paperclip");
+  });
+
+  it("leaves a package that does not ship skills alone", async () => {
+    const observed: Array<{ packageDir: string; skills: string[] }> = [];
+    const runCommand = createGitCheckoutRunCommand("f".repeat(40), {
+      repoSkills: true,
+      onPack: (checkout, packageDir) => {
+        const skillsDir = path.join(checkout, packageDir, "skills");
+        observed.push({
+          packageDir,
+          skills: fs.existsSync(skillsDir) ? fs.readdirSync(skillsDir).sort() : [],
+        });
+      },
+    });
+    await installGitPayload("paperclipai/paperclip", "f".repeat(40), runCommand, resolveInstallStorePaths());
+    expect(observed.find((entry) => entry.packageDir === "server")?.skills).toEqual([]);
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {

@@ -288,8 +288,18 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
+      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[]; files?: string[] };
       const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
+      // `skills` is a `files` entry with no build step behind it. scripts/release.sh
+      // materialises it by copying the repo-root skills/ into each shipping package
+      // (and deletes it again afterwards), so a fresh checkout has no server/skills at
+      // all -- `git ls-files server/skills` is empty. Both packers then fail: the
+      // bundled path cpSync's every `files` entry, and `pnpm pack` with no `prepack`
+      // packs `files` as it finds them. Drive it off `files` rather than a hardcoded
+      // package list so the next package that ships skills cannot re-break this.
+      if (packageJson.files?.includes("skills") && !fs.existsSync(path.join(packageDir, "skills")) && fs.existsSync(path.join(checkoutPath, "skills"))) {
+        fs.cpSync(path.join(checkoutPath, "skills"), path.join(packageDir, "skills"), { recursive: true });
+      }
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
