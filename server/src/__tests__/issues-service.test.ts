@@ -5997,6 +5997,121 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
+  it("keeps the assignee when release clears the locks of a parked in_review issue", async () => {
+    // Regression for PET-228. release() cleared assigneeAgentId unconditionally while
+    // preserving the status of everything that is not in_progress, so releasing a parked
+    // review orphaned it: same status, no owner. An agent holding only that issue then has
+    // no way back, because the restoring PATCH nulls checkoutRunId and any later release
+    // discards the assignee again.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date("2026-06-10T10:06:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Parked review keeps its assignee",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
+    });
+
+    const released = await svc.release(issueId, agentId, runId);
+
+    expect(released).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("still re-queues in_progress work to todo and hands it back unassigned", async () => {
+    // The counterpart to the in_review case above: in_progress is the one status where
+    // clearing the assignee is the point, so release must keep doing it.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date("2026-06-10T10:06:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In-progress work is handed back",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
+    });
+
+    const released = await svc.release(issueId, agentId, runId);
+
+    expect(released).toMatchObject({
+      status: "todo",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
   it("checkout refuses to promote a 'done' issue when 'done' is not in expectedStatuses, even with a lingering executionRunId pointer", async () => {
     // Regression for PR #2482 checkout-adoption review finding: the original
     // patch's stale-executionRunId adoption SQL set `status: 'in_progress'`

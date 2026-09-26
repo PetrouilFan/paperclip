@@ -11810,14 +11810,19 @@ export function issueService(db: Db) {
           }
         }
 
-        // Release clears checkout/assignee locks; only in_progress work re-queues to todo.
+        // Release clears the checkout/execution locks. Only in_progress work re-queues to
+        // todo, and only in_progress work is handed back to the pool: every other status is
+        // a parked issue (in_review, blocked, ...) whose assignee is the only thing keeping
+        // it attached to a decision path, so the assignee survives the release.
         const releaseStatus =
           existing.status === "in_progress" ? "todo" : existing.status;
         const updated = await tx
           .update(issues)
           .set({
             status: releaseStatus,
-            assigneeAgentId: null,
+            ...(existing.status === "in_progress"
+              ? { assigneeAgentId: null }
+              : {}),
             checkoutRunId: null,
             executionRunId: null,
             executionAgentNameKey: null,
