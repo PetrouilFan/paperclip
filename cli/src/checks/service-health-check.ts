@@ -44,6 +44,20 @@ export async function serviceHealthChecks(
   config: PaperclipConfig,
   dependencies: Partial<ServiceCheckDependencies> = {},
 ): Promise<CheckResult[]> {
+  // The background service is a separate process. Its definition, runtime and
+  // health are a diagnostic about that process, not a precondition for this one
+  // to bind the port — `commands/run.ts` refuses to start the server on any
+  // `fail`, so a blocking result here gates the one command that could bring
+  // the service up. Advisory failures are still printed, still counted, and
+  // still carry their repair hint.
+  const results = await collectServiceHealthChecks(config, dependencies);
+  return results.map((result) => ({ ...result, blocking: false }));
+}
+
+async function collectServiceHealthChecks(
+  config: PaperclipConfig,
+  dependencies: Partial<ServiceCheckDependencies>,
+): Promise<CheckResult[]> {
   if (process.env.PAPERCLIP_SERVICE_MANAGED === "1") return [];
 
   const deps: ServiceCheckDependencies = {

@@ -171,6 +171,19 @@ describe("service health doctor checks", () => {
       }),
     );
   });
+
+  it("never returns a startup-blocking result, for any service state", async () => {
+    const drifted = managerFixture(false);
+    drifted.desiredDefinition = vi.fn(async () => "a different unit");
+    const results = await serviceHealthChecks(config, {
+      detect: vi.fn(async () => ({ supported: true as const, manager: drifted })),
+      probe: vi.fn(async () => ({ ok: false, version: null, error: "fetch failed" })),
+      shimPresent: vi.fn(async () => false),
+    });
+
+    expect(results.filter((result) => result.status === "fail").length).toBeGreaterThan(0);
+    expect(results.every((result) => result.blocking === false)).toBe(true);
+  });
 });
 
 describe("isExecutableFile", () => {

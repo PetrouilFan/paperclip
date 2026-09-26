@@ -163,6 +163,16 @@ reports a **blocking** `Managed install manifest` finding. It names both paths
 and the remedy, rather than asserting that "artifacts exist" at a store that
 does not exist.
 
+A store whose artifacts are present but whose `install.json` is missing is the
+one state the check cannot classify, so it reports a **non-blocking** finding
+instead. Artifacts can be present because a store is caught mid-update or
+because it lost its manifest; the heuristic that detects them cannot tell those
+apart, and a `fail` here keeps the instance from binding its port on restart.
+Nothing on the startup path reads the manifest, so the server starts without
+it. Re-running `paperclipai install` rebuilds it and silences the finding. The
+provable neighbours of this state — an unreadable manifest, a dangling
+`current`, a shim at the wrong root — still block.
+
 ## Install Sources
 
 Install the current stable release:

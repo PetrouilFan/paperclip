@@ -31,7 +31,7 @@ export async function doctor(opts: {
   config?: string;
   repair?: boolean;
   yes?: boolean;
-}): Promise<{ passed: number; warned: number; failed: number }> {
+}): Promise<CheckSummary> {
   await printUpdateNotice(opts.config);
   printPaperclipCliBanner();
   p.intro(pc.bgCyan(pc.black(" paperclip doctor ")));
@@ -199,25 +199,49 @@ async function runRepairableCheck(input: {
   return result;
 }
 
-function printSummary(results: CheckResult[]): { passed: number; warned: number; failed: number } {
-  const passed = results.filter((r) => r.status === "pass").length;
-  const warned = results.filter((r) => r.status === "warn").length;
-  const failed = results.filter((r) => r.status === "fail").length;
+export type CheckSummary = {
+  passed: number;
+  warned: number;
+  failed: number;
+  advisory: number;
+};
+
+// `failed` is the start-up gate. `commands/run.ts` exits on it, so only checks
+// that describe *this* process may contribute; an advisory failure is reported
+// but never keeps the instance from serving.
+export function summarizeChecks(results: CheckResult[]): CheckSummary {
+  return {
+    passed: results.filter((r) => r.status === "pass").length,
+    warned: results.filter((r) => r.status === "warn").length,
+    failed: results.filter((r) => r.status === "fail" && r.blocking !== false).length,
+    advisory: results.filter((r) => r.status === "fail" && r.blocking === false).length,
+  };
+}
+
+function printSummary(results: CheckResult[]): CheckSummary {
+  const { passed, warned, failed, advisory } = summarizeChecks(results);
 
   const parts: string[] = [];
   parts.push(pc.green(`${passed} passed`));
   if (warned) parts.push(pc.yellow(`${warned} warnings`));
   if (failed) parts.push(pc.red(`${failed} failed`));
+  if (advisory) parts.push(pc.yellow(`${advisory} advisory failures`));
 
   p.note(parts.join(", "), "Summary");
 
   if (failed > 0) {
     p.outro(pc.red("Some checks failed. Fix the issues above and re-run doctor."));
+  } else if (advisory > 0) {
+    p.outro(
+      pc.yellow(
+        "All critical checks passed. The advisory failures above do not block startup; see `paperclipai service status`.",
+      ),
+    );
   } else if (warned > 0) {
     p.outro(pc.yellow("All critical checks passed with some warnings."));
   } else {
     p.outro(pc.green("All checks passed!"));
   }
 
-  return { passed, warned, failed };
+  return { passed, warned, failed, advisory };
 }
