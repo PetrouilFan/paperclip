@@ -4,6 +4,8 @@ Operational note about a control plane whose `node_modules` no longer matches th
 
 Pairs with [dev-plane-restart-hygiene.md](./dev-plane-restart-hygiene.md), which covers the other way a dev plane stops matching its source: restarts that kill in-flight runs.
 
+This document is about the *installed files*. For the unit file — a different `ExecStart`, a lost `Environment=` key, a restart that skipped the preflight run-set recording — see [shadowed-service-unit.md](./shadowed-service-unit.md), which is the unit-side counterpart and ends where this one starts: by resolving the `ExecStart` target and handing off to the diff below.
+
 ## Why this matters
 
 A packaged install is normally the ground truth we stop reasoning about. `paperclipai --version` says a version, `package.json` says a version, and `node_modules/@paperclipai/server/dist` is assumed to be that release. **Nothing verifies that**, and hand-editing the installed files breaks it while leaving every version string intact.
