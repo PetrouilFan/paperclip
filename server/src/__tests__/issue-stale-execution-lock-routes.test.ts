@@ -217,9 +217,16 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0]);
+      // The locks always go. The assignee survives, because every status in
+      // this table is parked, and on a parked issue the assignee is the only
+      // thing still attached to a decision path: release used to clear it
+      // unconditionally, which silently orphaned a review with no agent able
+      // to reach it. Only `in_progress` is handed back to the pool, and that
+      // is asserted by "still re-queues in_progress work to todo and hands it
+      // back unassigned" in issues-service.test.ts.
       expect(row).toEqual({
         status,
-        assigneeAgentId: null,
+        assigneeAgentId: agentId,
         checkoutRunId: null,
         executionRunId: null,
         executionLockedAt: null,
