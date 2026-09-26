@@ -1431,6 +1431,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       permissions: {},
     });
 
+    // The queued run and its wakeup request are stamped with wall-clock time rather
+    // than the fixture's fixed `now`. `resumeQueuedRuns` ages out a run that is
+    // still `queued` with `startedAt IS NULL` once it is older than the admission
+    // window (see `never-dispatched-run.ts`), and the fixed fixture date is months
+    // in the past, so a `queued` row stamped with it reads as stranded and is
+    // cancelled before dispatch. These tests are about what happens after a run is
+    // picked up, and they assert the run's terminal state rather than its queue
+    // timestamp, so what the fixture has to model is a run waiting to be dispatched
+    // now -- not a row that has sat unclaimed since March.
+    const queuedAt = new Date();
+
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
       companyId,
@@ -1441,8 +1452,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       payload: { issueId },
       status: "queued",
       runId,
-      requestedAt: now,
-      updatedAt: now,
+      requestedAt: queuedAt,
+      updatedAt: queuedAt,
     });
 
     await db.insert(heartbeatRuns).values({
@@ -1458,8 +1469,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         taskId: issueId,
         wakeReason: "issue_assigned",
       },
-      updatedAt: now,
-      createdAt: now,
+      updatedAt: queuedAt,
+      createdAt: queuedAt,
     });
 
     await db.insert(issues).values({
