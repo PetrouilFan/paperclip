@@ -28,6 +28,7 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import {
   executionRecoveryDispositionMerge,
+  hasLiveMonitoredWatch,
   isExecutionRecoveryAlreadySettled,
   observeIssueForRecovery,
   readExecutionRecoveryDisposition,
@@ -551,6 +552,19 @@ export async function settleUnrecoverableExecutions(
             ? "Workspace repair required. Verify safe staging or repair before continuing. Saved work and approval decisions remain in force."
             : "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
+        // An actively watched ticket whose monitor has not been cleared is
+        // demonstrably live. `blocked` is not a safe answer for it: a monitor
+        // only dispatches from `in_progress`/`in_review`, so the pin silently
+        // stops the watch that exists to report this very failure, and
+        // `check-now` then answers 409 with nothing to explain why. The no-replay
+        // receipt is still written — nothing replays — but the pin is not.
+        const liveWatchExempt = current && await hasLiveMonitoredWatch(tx as unknown as Db, {
+          companyId: candidate.companyId,
+          issueId: task.id,
+        });
+        const settledNote = liveWatchExempt
+          ? `${note} This issue is under an active task watchdog with a live monitor, so recovery left its status alone and it stays runnable.`
+          : note;
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         let changedIssueState = false;
         // The state this settlement leaves behind. The receipt records the
@@ -560,7 +574,19 @@ export async function settleUnrecoverableExecutions(
         // would make every receipt stale the moment it was written and cost one
         // extra tick per run before the loop was recognised as closed.
         let settledIssue: typeof issues.$inferSelect = task;
-        if (current) {
+        if (current && liveWatchExempt) {
+          // The dead run held this issue's execution locks; releasing them is
+          // the whole of what the settle owes. It needs no exit, because the
+          // issue was never taken out of a runnable status.
+          changedIssueState = task.executionRunId === run.id || task.checkoutRunId === run.id;
+          if (changedIssueState) {
+            const [released] = await tx
+              .update(issues)
+              .set({ executionRunId: null, checkoutRunId: null, updatedAt: now })
+              .where(eq(issues.id, task.id)).returning();
+            settledIssue = released ?? task;
+          }
+        } else if (current) {
           // A dead run is not a hold. Before blocking, check whether the issue
           // already has a first-class reason to be blocked; if it does not, the
           // settle has to leave an exit behind, or `blocked` strands the ticket
@@ -620,7 +646,7 @@ export async function settleUnrecoverableExecutions(
                 existing: task.unblockDescriptor,
                 assigneeAgentId: task.assigneeAgentId,
                 assigneeUserId: task.assigneeUserId,
-                action: note,
+                action: settledNote,
               })
             : null;
           const ownsBlock =
@@ -671,8 +697,8 @@ export async function settleUnrecoverableExecutions(
             outcome,
             resolvedAt: now,
             updatedAt: now,
-            nextAction: note,
-            resolutionNote: note,
+            nextAction: settledNote,
+            resolutionNote: settledNote,
             wakePolicy: null,
             monitorPolicy: null,
             evidence: {
@@ -685,6 +711,10 @@ export async function settleUnrecoverableExecutions(
                 actionOutcome: "unknown",
                 recordedAt: now.toISOString(),
                 changedIssueState,
+                // Names the decision, not the no-replay guarantee: the receipt
+                // above is unchanged, and only the execution hold and the
+                // `blocked` write read this key.
+                ...(liveWatchExempt ? { liveWatchExempt: true } : {}),
               },
             },
           })
@@ -709,7 +739,13 @@ export async function settleUnrecoverableExecutions(
         // A settlement that changed nothing writes nothing. The action row and
         // the run's disposition already hold the receipt; an activity row and a
         // status re-broadcast would only re-report a non-event.
-        if (!changedIssueState) return;
+        //
+        // An exempt settlement is the exception even when it changed no column:
+        // "recovery deliberately did not pin this live watch" is a decision an
+        // operator has to be able to find, and it is the only trace that the
+        // dead run was disposed of at all. It still re-broadcasts nothing,
+        // because the issue status did not move.
+        if (!changedIssueState && !liveWatchExempt) return;
         await persistActivity(tx as unknown as Db, {
           companyId: run.companyId,
           actorType: "system",
@@ -722,12 +758,15 @@ export async function settleUnrecoverableExecutions(
             recoveryActionId: action.id,
             outcome,
             replay: "not_authorized",
+            ...(liveWatchExempt ? { liveWatchExempt: true } : {}),
           },
         });
-        await tx
-          .update(heartbeatRuns)
-          .set({ executionStatusDeliveryId: randomUUID() })
-          .where(eq(heartbeatRuns.id, run.id));
+        if (changedIssueState) {
+          await tx
+            .update(heartbeatRuns)
+            .set({ executionStatusDeliveryId: randomUUID() })
+            .where(eq(heartbeatRuns.id, run.id));
+        }
         await appendHeartbeatRunEvent(tx as unknown as Db, {
           companyId: run.companyId,
           agentId: run.agentId,
@@ -735,12 +774,13 @@ export async function settleUnrecoverableExecutions(
           eventType: "lifecycle",
           stream: "system",
           level: "warn",
-          message: note,
+          message: settledNote,
           payload: {
             recoveryActionId: action.id,
             cause: action.cause,
             automaticRecovery: "preserve_without_replay_v1",
             replay: "blocked",
+            ...(liveWatchExempt ? { liveWatchExempt: true } : {}),
           },
         });
         options.failpoint?.("persisted");
