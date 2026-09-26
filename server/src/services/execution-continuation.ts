@@ -104,6 +104,63 @@ export async function currentContinuationOrigins(
   ];
 }
 
+/**
+ * Fail-closed continuation codes. They surface as a `setup_failed` run, so each
+ * one carries an operator-readable message and a recovery action rather than
+ * reaching the board as a bare reason string.
+ */
+export const CONTINUATION_SOURCE_FAILURE_CODES = [
+  "continuation_source_context_missing",
+  "continuation_user_authorization_missing",
+  "continuation_task_ownership_changed",
+] as const;
+
+export type ContinuationSourceFailureCode =
+  (typeof CONTINUATION_SOURCE_FAILURE_CODES)[number];
+
+export function continuationSourceFailureCode(
+  message: string | null | undefined,
+): ContinuationSourceFailureCode | null {
+  const code = (message ?? "").trim();
+  return (CONTINUATION_SOURCE_FAILURE_CODES as readonly string[]).includes(code)
+    ? (code as ContinuationSourceFailureCode)
+    : null;
+}
+
+/** Human-readable summary and recovery action for a fail-closed continuation code. */
+export function continuationSourceFailureResultJson(
+  run: { companyId: string; agentId: string; contextSnapshot: unknown },
+  code: ContinuationSourceFailureCode,
+): { error: string; resultJson: Record<string, unknown>; nextAction: string } {
+  const context = object(run.contextSnapshot);
+  const error =
+    code === "continuation_task_ownership_changed"
+      ? "the issue is no longer assigned to this agent, or it reached a terminal status, so the wake cannot resume prior run context"
+      : code === "continuation_user_authorization_missing"
+        ? "a requested resume names a previous run that cannot be proven to belong to this issue, so the run was refused rather than claiming unproven context"
+        : "the run's recorded resume source is missing, or its context snapshot does not name this issue, so the run was refused rather than claiming unproven context";
+  return {
+    error,
+    resultJson: {
+      continuationSource: {
+        code,
+        error,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        issueId: string(context.issueId) ?? null,
+        requestedSourceRunId:
+          string(context.previousRunId) ??
+          string(context.retryOfRunId) ??
+          string(context.interruptedRunId) ??
+          null,
+        retryable: false,
+      },
+    },
+    nextAction:
+      "Re-wake the assignee with a fresh run (comment on the issue or reassign it). A resume source proven to belong to no issue is dropped from the new run's context; if this recurs, the issue's wake history names the run that carried it.",
+  };
+}
+
 /** Re-read task scope at dispatch, including messages already delivered to an earlier provider session. */
 export async function buildExecutionContinuation(input: {
   db: Db;
@@ -156,19 +213,28 @@ export async function buildExecutionContinuation(input: {
   );
   const explicitContinuation = object(input.context.explicitUserContinuation);
   const explicitUserSource = string(explicitContinuation.previousRunId);
-  const resumeSourceRunId =
+  const attributedResumeSourceRunId =
     explicitUserSource ??
     string(input.context.retryOfRunId) ??
-    string(input.context.previousRunId) ??
-    string(input.context.interruptedRunId);
+    string(input.context.previousRunId);
+  const interruptedSourceRunId = explicitUserSource ? null : string(input.context.interruptedRunId);
+  const requestedResumeSourceRunId = attributedResumeSourceRunId ?? interruptedSourceRunId;
   const producerRunId = triggerInteraction?.sourceRunId ?? null;
-  const sourceRunId = resumeSourceRunId ?? producerRunId;
+  const sourceRunId = requestedResumeSourceRunId ?? producerRunId;
   const loadRun = async (id: string) => (await db
     .select({ context: heartbeatRuns.contextSnapshot, result: heartbeatRuns.resultJson })
     .from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, id)))
   )[0];
-  const candidate = sourceRunId ? await loadRun(sourceRunId) : null;
+  const requestedResumeRun = requestedResumeSourceRunId ? await loadRun(requestedResumeSourceRunId) : null;
+  // A handoff source the dispatcher already rejected can still be advertised in
+  // the persisted context. Its own snapshot proves it belongs to no issue, so it
+  // carries no task scope to resume and cannot be a provenance claim. Ignore it
+  // instead of failing closed: a foreign-issue source still throws below.
+  const unattributedInterruptedRun = !!interruptedSourceRunId && !!requestedResumeRun &&
+    object(requestedResumeRun.context).issueId === undefined;
+  const resumeSourceRunId = unattributedInterruptedRun ? null : requestedResumeSourceRunId;
+  const candidate = resumeSourceRunId ? requestedResumeRun : sourceRunId ? await loadRun(sourceRunId) : null;
   // An interaction producer is provenance. Explicit resume history must still
   // belong to this task, and only task-scoped content can enter the envelope.
   const sourceRun = object(candidate?.context).issueId === issueId ? candidate : null;

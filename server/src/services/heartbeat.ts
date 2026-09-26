@@ -38,7 +38,7 @@ import {
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
-import { buildExecutionContinuation } from "./execution-continuation.js";
+import { buildExecutionContinuation, continuationSourceFailureCode, continuationSourceFailureResultJson } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -25864,6 +25864,14 @@ export function heartbeatService(
         const nonRetryablePreflightCode =
           nonRetryablePreflightFailureCode(outerErr);
         const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
+        // A fail-closed continuation code is an operator-actionable refusal, not
+        // an opaque setup failure: it must not reach the board as a bare string.
+        const continuationSourceCode = continuationSourceFailureCode(
+          outerErr instanceof Error ? outerErr.message : null,
+        );
+        const continuationSourceFailure = continuationSourceCode
+          ? continuationSourceFailureResultJson(run, continuationSourceCode)
+          : null;
         const setupFailureErrorCode =
           workspaceGitScanFailure?.code ??
           workspaceValidationSetupFailure?.code ??
@@ -25874,7 +25882,7 @@ export function heartbeatService(
             : null) ??
           recordedResponsibleUserDenialCode ??
           nonRetryablePreflightCode ??
-          "setup_failed";
+          (continuationSourceCode ?? "setup_failed");
         logger.error(
           { err: outerErr, runId },
           "heartbeat execution setup failed",
@@ -25883,8 +25891,8 @@ export function heartbeatService(
         // The structured failure payload drives the recovery notice and next
         // action, so it is persisted even when the agent lookup failed and the
         // agent-scoped stop metadata cannot be merged in.
-        const setupFailureDetails =
-          (workspaceGitScanFailure ? {
+        const setupFailureResultJson = {
+          ...((workspaceGitScanFailure ? {
             workspaceGitScan: {
               code: workspaceGitScanFailure.code,
               phase: "workspace_setup",
@@ -25904,14 +25912,19 @@ export function heartbeatService(
                 run,
                 sandboxProviderPluginNotReadySetupFailure,
               )
-            : null);
-        const setupFailureResultJson = {
-          ...setupFailureDetails,
+            : null) ??
+          continuationSourceFailure?.resultJson),
           executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
         };
+        const setupFailureMessage = continuationSourceFailure
+          ? `${message} — ${continuationSourceFailure.error}`
+          : message;
         const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
-          error: message,
+          error: setupFailureMessage,
           errorCode: setupFailureErrorCode,
+          ...(continuationSourceFailure
+            ? { nextAction: continuationSourceFailure.nextAction }
+            : {}),
           finishedAt: new Date(),
           ...(setupFailureAgent
             ? {
@@ -25920,7 +25933,7 @@ export function heartbeatService(
                   "failed",
                   {
                     errorCode: setupFailureErrorCode,
-                    errorMessage: message,
+                    errorMessage: setupFailureMessage,
                     resultJson: setupFailureResultJson,
                   },
                 ),
@@ -28118,6 +28131,20 @@ export function heartbeatService(
                   or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, issue.id)),
                 )).then(rows => rows[0] ?? null)
               : null;
+          // A rejected handoff source is still advertised to the continuation
+          // builder, which fails closed on it and kills the run during setup.
+          // Drop it only when the source row itself proves it belongs to no
+          // issue at all (a taskless timer run). A source naming a different
+          // issue stays in the context so the fail-closed check is preserved.
+          const rejectedTasklessHandoff = Boolean(
+            interruptedRunId && isUuidLike(interruptedRunId) &&
+            !handoffSource && !explicitContinuation &&
+            await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, interruptedRunId), eq(heartbeatRuns.companyId, issue.companyId),
+              sql`(${heartbeatRuns.contextSnapshot}->>'issueId') IS NULL`,
+            )).then(rows => rows.length > 0),
+          );
+          if (rejectedTasklessHandoff) delete enrichedContextSnapshot.interruptedRunId;
           const pendingComments =
             !isConversation(issue) && opts.allowRunCoalescing !== false &&
             !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id))
