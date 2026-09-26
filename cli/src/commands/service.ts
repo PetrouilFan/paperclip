@@ -211,7 +211,10 @@ export async function writeHotRestartIntent(
       + "replaces. A pid alone cannot distinguish the running server from an unrelated process that "
       + "inherited the number, which is how a restart misclassifies another instance's runs. The server's "
       + "own intent writer refuses the same record, so the CLI must not be the path that produces one. "
-      + "Retry once /api/health reports serverInfo, or restart the unit directly with systemctl.",
+      + "The identity comes from two places and both came up empty: /api/health reports serverInfo "
+      + "unauthenticated, so it is only readable on a local_trusted deployment, and the operating system "
+      + "would not report a start time for that pid. Restart the unit directly only if you accept that it "
+      + "records no intent, leaving the replaced incarnation's runs unreportable.",
     );
   }
   const preflightActiveRunIds = drainRequired

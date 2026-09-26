@@ -21,8 +21,17 @@ function asDateString(value: string | null | undefined): string | null {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
 }
 
+// These options are the server's, verbatim, and must stay so: `windowsHide` is
+// the difference between a visible console flash on every Windows restart and
+// none, and a file whose stated purpose is faithful duplication is the wrong
+// place for an unexplained timeout. The timeout is 1.5s because a `ps` that has
+// not answered in 1.5s is not going to answer before the intent is written.
 const defaultRunCommand: ProcessCommandRunner = async (file, args) => {
-  const { stdout } = await execFileAsync(file, args, { timeout: 5_000 });
+  const { stdout } = await execFileAsync(file, args, {
+    encoding: "utf8",
+    timeout: 1_500,
+    windowsHide: true,
+  });
   return { stdout };
 };
 
