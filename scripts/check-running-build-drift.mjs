@@ -50,8 +50,15 @@ export function runningServerDistCandidates(env = process.env) {
     // A pnpm/npm workspace install of the repo itself.
     join(home, "Projects", "paperclipai", "paperclip", "node_modules", "@paperclipai", "server", "dist"),
     // A repo checkout is a legitimate running build for a source install, but
-    // it is listed last: it is the tree a developer edits, so it drifts ahead
-    // of the deployed one and would mask a stale deploy.
+    // it is listed last because it is the tree a developer edits, and an edited
+    // tree is not the deployed one in either direction. Preferring it does not
+    // "mask" a stale deploy — measured on this host it manufactures false drift:
+    // ~/Projects/paperclipai/paperclip/server/dist is behind the installed
+    // artifact, and resolving it first reports 4 findings where the running
+    // build has 2, the extra 2 being sentinels that are genuinely deployed.
+    // The ordering exists so the report means "what the server loads", and
+    // blaming a healthy deploy on a developer's stale tree is the more dangerous
+    // direction to get wrong.
     resolve(join(home, "Projects", "paperclipai", "paperclip", "server", "dist")),
   ];
 }

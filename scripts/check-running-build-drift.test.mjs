@@ -103,9 +103,17 @@ test("resolveRunningServerDist picks the first candidate that holds a server dis
 test("candidate roots do not contain duplicates, so one artifact is not checked twice", () => {
   const candidates = runningServerDistCandidates({ HOME: "/home/tester" });
   assert.equal(new Set(candidates).size, candidates.length);
-  // The CLI's nested install must be preferred over a repo checkout, which a
-  // developer edits and which therefore drifts ahead of what is deployed.
+  // The CLI's nested install must be preferred over a repo checkout. The reason
+  // is not that a checkout "drifts ahead": measured, a checkout can also be
+  // behind, and preferring it then reports sentinels as drifted that the
+  // running build genuinely has. The order exists so the report describes what
+  // the server loads.
   assert.ok(candidates[0].includes(path.join("node_modules", "@paperclipai", "server", "dist")));
+  // ...and the bare repo checkout stays last, behind every installed tree.
+  assert.equal(
+    candidates[candidates.length - 1],
+    path.resolve(path.join("/home/tester", "Projects", "paperclipai", "paperclip", "server", "dist")),
+  );
 });
 
 test("the report names the drift and says a reinstall is not a deploy", () => {
