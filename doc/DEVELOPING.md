@@ -282,6 +282,29 @@ would SIGTERM detached local-agent runs and embedded PostgreSQL concurrently
 with the coordinated shutdown, which defeats run adoption and takes the database
 away before the snapshot.
 
+The same unit sets `TimeoutStartSec=600`, and boot duration is deliberately not
+the control plane's to enforce. A `Type=notify` unit cannot send `READY=1` until
+the server has actually come up, and the server cannot finish coming up until the
+embedded postmaster is accepting connections and migrations have run — the
+postmaster lives inside this unit's cgroup, so "ready" genuinely means "the
+database is up too". How long that takes is a property of the host: disk, page
+cache, a cold JIT, a concurrent migration, or a loaded machine deciding to run
+backups now. systemd's 90s default is not a measurement of any of those hosts.
+When a boot overruns it, the failure is maximally expensive and entirely
+self-inflicted: systemd SIGTERMs the whole cgroup, which destroys the embedded
+database and every detached local-agent run the new server had only just
+started, and `Restart=always` does it again on the next attempt. Ten minutes is
+well above any boot measured on a real host, and the cost of being wrong is
+asymmetric — a slow boot that completes is merely slow, while a killed boot takes
+the board offline and loses in-flight work. So the budget is set generously
+rather than tuned, and it is emitted by the renderer so a freshly onboarded host
+inherits it instead of each operator rediscovering the outage.
+
+Override it the same way as any other operator setting — a systemd drop-in such as
+`20-start-timeout.conf` — rather than by editing the generated unit. The renderer
+owns that file, so an edit there is reverted on the next re-render and reported as
+drift by `paperclipai doctor`.
+
 The request command records the preflight set of running heartbeat IDs and writes
 an instance-scoped marker plus a PID-targeted legacy home-root handoff marker.
 This lets a previous server version capture its snapshot at the old path while

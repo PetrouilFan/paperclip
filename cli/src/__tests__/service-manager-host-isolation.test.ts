@@ -34,6 +34,19 @@ async function temporaryDirectory(): Promise<string> {
   return directory;
 }
 
+// An onboarded host has an executable shim at the path the unit's ExecStart
+// names, and the renderer depends on that: it refuses to write a unit whose
+// ExecStart target is missing rather than install a `203/EXEC` crash loop. A
+// fixture that names a shim it never created therefore fails in the guard
+// before reaching the isolation assertions these tests exist to make.
+async function isolatedHomeWithShim(): Promise<{ home: string; shimPath: string }> {
+  const home = await temporaryDirectory();
+  const shimPath = path.join(home, ".local/bin/paperclipai");
+  await fs.mkdir(path.dirname(shimPath), { recursive: true });
+  await fs.writeFile(shimPath, "#!/bin/sh\nexit 0\n", { encoding: "utf8", mode: 0o755 });
+  return { home, shimPath };
+}
+
 type Invocation = { command: string; args: string[] };
 
 /** Records every invocation and answers `show` as an active unit would. */
@@ -112,9 +125,9 @@ describe("PET-52 host isolation", () => {
   });
 
   it("start/stop/status of a distinct instance never name the production unit", async () => {
-    const isolatedHome = await temporaryDirectory();
+    const { home: isolatedHome, shimPath } = await isolatedHomeWithShim();
     const invocations: Invocation[] = [];
-    const manager = new SystemdServiceManager("smoke", recordingRunner(invocations), path.join(isolatedHome, ".paperclip"), path.join(isolatedHome, ".local/bin/paperclipai"), isolatedHome);
+    const manager = new SystemdServiceManager("smoke", recordingRunner(invocations), path.join(isolatedHome, ".paperclip"), shimPath, isolatedHome);
 
     await manager.install({ startNow: true, startOnLogin: true });
     await manager.status();
@@ -128,9 +141,9 @@ describe("PET-52 host isolation", () => {
   });
 
   it("the unit file a distinct instance writes lands in the isolated home", async () => {
-    const isolatedHome = await temporaryDirectory();
+    const { home: isolatedHome, shimPath } = await isolatedHomeWithShim();
     const invocations: Invocation[] = [];
-    const manager = new SystemdServiceManager("e2e", recordingRunner(invocations), path.join(isolatedHome, ".paperclip"), path.join(isolatedHome, ".local/bin/paperclipai"), isolatedHome);
+    const manager = new SystemdServiceManager("e2e", recordingRunner(invocations), path.join(isolatedHome, ".paperclip"), shimPath, isolatedHome);
 
     await manager.install({ startNow: false, startOnLogin: false });
 

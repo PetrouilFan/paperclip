@@ -21,6 +21,11 @@ import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors
 
 const COMMENT_SIGNATURE = '— commitperclip';
 
+// Logins that may own a gate comment. The app identity is the norm; the extra
+// entry covers a repository where the commitperclip app is not installed and
+// the gates therefore run under the workflow's own GITHUB_TOKEN instead.
+export const COMMITPERCLIP_LOGINS = ['commitperclip[bot]', 'commitperclip'];
+
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
     return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${COMMENT_SIGNATURE}`;
@@ -49,7 +54,9 @@ function buildComment(author, failures, informational) {
   return lines.join('\n');
 }
 
-export async function findExistingComment(fetchFromGitHub, token, repo, prNumber) {
+export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, commenterLogins = COMMITPERCLIP_LOGINS) {
+  const owners = new Set(commenterLogins);
+
   for (let page = 1; ; page += 1) {
     const comments = await fetchFromGitHub(
       `/repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
@@ -57,8 +64,7 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
-           c.body.includes(COMMENT_SIGNATURE)
+      (c) => owners.has(c.user?.login) && c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
 
@@ -153,7 +159,11 @@ async function main() {
   const commentBody = buildComment(author, allFailures, informational);
 
   // Post comment if there are failures/informational, or update existing comment
-  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
+  const commenter = process.env.GH_COMMENTER_LOGIN?.trim();
+  const ownerLogins = commenter
+    ? [...new Set([...COMMITPERCLIP_LOGINS, commenter])]
+    : COMMITPERCLIP_LOGINS;
+  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber, ownerLogins);
   if (allFailures.length > 0 || informational.length > 0 || existing) {
     await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
   }
