@@ -188,7 +188,15 @@ export function renderSystemdUnit(input: { instanceId: string; shimPath: string;
   return `[Unit]
 Description=Paperclip AI (${escapeSystemd(input.instanceId)})
 After=network.target
-StartLimitIntervalSec=60
+# A fast-failing start must not be able to exhaust the burst. With
+# RestartSec=5 the previous 60s interval allowed five attempts inside 25
+# seconds, so any transient startup fault (a doctor check that failed on
+# ambiguous filesystem state, a shim mid-update) reached start-limit-hit
+# inside half a minute and left the unit down until a human intervened. Five
+# minutes keeps the same five attempts but spaces them across the window a
+# real recovery needs. StartLimitAction stays systemd's default (none), so
+# exhausting the burst still parks the unit rather than rebooting the host.
+StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]

@@ -46,6 +46,29 @@ describe("service definition generation", () => {
     expect(unit).not.toContain("API_KEY");
   });
 
+  it("keeps retrying for longer than the outage this was filed for", () => {
+    const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
+    // The failure this guards is measured, not opinionated. On 2026-09-25 a
+    // doctor check that failed on ambiguous filesystem state produced five
+    // attempts inside StartLimitIntervalSec=60, hit start-limit-hit at 16:16:13
+    // and left the board down until 16:19:44 — 211 seconds, with six in-flight
+    // runs closed by the reconciler. A window shorter than the outage it was
+    // filed for reproduces the outage.
+    const interval = Number(unit.match(/^StartLimitIntervalSec=(\d+)$/m)?.[1]);
+    const burst = Number(unit.match(/^StartLimitBurst=(\d+)$/m)?.[1]);
+    const restartSec = Number(unit.match(/^RestartSec=(\d+)$/m)?.[1]);
+    expect(interval).toBeGreaterThan(211);
+    expect(interval).toBe(300);
+    // A window the burst drains inside RestartSec on its own is not a retry
+    // budget, it is a countdown, so the arithmetic floor is asserted too.
+    expect(burst).toBeGreaterThan(1);
+    expect(restartSec).toBeGreaterThan(0);
+    expect(interval).toBeGreaterThan((burst - 1) * restartSec);
+    // And the guard must not have grown into a reboot: systemd's default
+    // StartLimitAction is `none`, which parks the unit for a human.
+    expect(unit).not.toMatch(/^StartLimitAction=/m);
+  });
+
   it("signals only the server process so adoption and the embedded database survive a stop", () => {
     const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
     // KillMode=control-group (systemd's default) would SIGTERM every process in
