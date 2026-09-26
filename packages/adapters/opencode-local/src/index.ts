@@ -95,6 +95,13 @@ Core fields:
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config with \`permission=allow\` for all tools and connections; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
+- expectedMajorVersion (number, optional): require the resolved \`opencode\` binary to report this major \
+  version; defaults to unset, which logs the resolved engine on every run without pinning it. Also \
+  settable per install via the PAPERCLIP_OPENCODE_EXPECTED_MAJOR environment variable. Prefer an \
+  absolute \`command\` over a version pin where both are possible: the pin detects a wrong engine, an \
+  absolute path prevents one. With two engines installed, PATH order alone picks one per spawn, and \
+  a mismatch here is reported with the resolved path and both versions rather than surfacing later \
+  as an unrelated model-catalog or background-service failure.
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
 
