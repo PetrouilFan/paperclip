@@ -334,11 +334,21 @@ jobs:
           # request — the exact confusion this step used to cause with its 403.
           # On the paths where the gate script did run, the run conclusion and
           # the commitperclip comment already carry the verdict twice over.
+          # `context` is not optional here. `POST /repos/{o}/{r}/statuses/{sha}`
+          # names the context `default` when the field is omitted, and `default`
+          # is the one generic context GitHub treats specially: it is what
+          # branch protection matches required status checks against, and it is
+          # what a reviewer sees labelled just "status". Recording the verdict
+          # there would put the signal under a name that is neither the
+          # documented one nor distinguishable from other tooling, so the
+          # `commitperclip/quality-gates` context the header and CONTRIBUTING.md
+          # tell a reviewer to look for would never exist.
           if ! printf '%s' "$(jq -n \
               --arg state "$state" \
+              --arg context "commitperclip/quality-gates" \
               --arg description "$description" \
               --arg target_url "$RUN_URL" \
-              '{state: $state, description: $description, target_url: $target_url}')" \
+              '{state: $state, context: $context, description: $description, target_url: $target_url}')" \
             | gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" --input - > /dev/null; then
             echo "::warning::Could not record the commitperclip/quality-gates status on ${HEAD_SHA}."
             echo "::warning::The run conclusion above is still the gate verdict, and the commitperclip comment on the pull request still carries the per-gate detail."

@@ -128,6 +128,69 @@ function publishVerdict(step, gateOutcome) {
 
 const RECORD_STEP = 'Record the re-gate verdict on the pull request head (manual runs only)';
 
+/**
+ * The JSON body the step would POST to the commit-status endpoint, produced by
+ * running the step's own `jq` program under `bash` with a stub `gh` that
+ * captures stdin.
+ *
+ * This exists because the field this asserts on is the one a regex over the
+ * workflow text cannot see. `POST /repos/{o}/{r}/statuses/{sha}` silently names
+ * the context `default` when `context` is absent from the body, so a payload
+ * that simply forgot the field still *looks* correct in the YAML — the string
+ * `commitperclip/quality-gates` is right there in the surrounding comment. The
+ * first version of this step did exactly that, and a green re-gate run wrote
+ * its verdict to `default` while the header told reviewers to look for
+ * `commitperclip/quality-gates`. Only executing the payload catches it.
+ */
+function statusPayload(step, gateOutcome) {
+  const block = runBlock(step);
+  assert.match(block, /if ! printf/, 'the record step must guard the status write with `if !`');
+
+  // The `jq` program as written in the step, from `jq -n \` up to the closing
+  // `')"`, so the object literal under test is the step's own and not a copy.
+  const jqProgram = /jq -n \\\n([\s\S]*?)'\)"/.exec(block);
+  assert.ok(jqProgram, 'the record step must build its payload with `jq -n`');
+
+  // `state`, `detail` and `note` come from the step's own case statement, and
+  // `description` is the step's own truncation, so every value asserted on is
+  // the one the step would actually send.
+  const verdict = block.slice(
+    block.indexOf('case "$GATE_OUTCOME"'),
+    block.indexOf('esac') + 'esac'.length,
+  );
+  const truncation = block.slice(
+    block.indexOf('description="${detail}'),
+    block.indexOf('fi', block.indexOf('description="${detail}')) + 'fi'.length,
+  );
+
+  const program = [
+    'set -euo pipefail',
+    verdict,
+    truncation,
+    'jq -n \\',
+    jqProgram[1],
+    "'",
+  ].join('\n');
+
+  const result = spawnSync('bash', ['-c', program], {
+    env: {
+      ...process.env,
+      GATE_OUTCOME: gateOutcome,
+      // Bound from the step's own `env:` block, as the workflow does. A
+      // payload that read an unbound name would not be the one the step sends.
+      RUN_URL: 'https://github.com/PetrouilFan/paperclip/actions/runs/1',
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(
+    result.status,
+    0,
+    `the payload program must succeed for GATE_OUTCOME=${JSON.stringify(gateOutcome)}: ${result.stderr}`,
+  );
+
+  return JSON.parse(result.stdout);
+}
+
 test('the review workflow can be re-run manually against an open pull request', async () => {
   const contents = await readWorkflow();
 
@@ -431,6 +494,21 @@ test('the recorded status is named so it cannot be read as the review check', as
     /commitperclip\/quality-gates/,
     'the status context must be documented and used',
   );
+
+  // Asserted on the executed payload, not on the workflow text. The first
+  // version of this step omitted `context` entirely, so the endpoint named it
+  // `default` — and this assertion, written as a `contents.includes` check for
+  // the documented name, passed anyway because the name was in the comment
+  // right above the payload. Run 36266821030 is what caught it: a green re-gate
+  // whose verdict landed on `default` while the header pointed reviewers at
+  // `commitperclip/quality-gates`.
+  for (const outcome of ['success', 'failure', 'skipped', 'cancelled']) {
+    assert.equal(
+      statusPayload(step, outcome).context,
+      'commitperclip/quality-gates',
+      `GATE_OUTCOME=${JSON.stringify(outcome)} must record the documented context`,
+    );
+  }
 });
 
 test('the workflow header names the signal a reviewer should trust', async () => {
