@@ -137,12 +137,30 @@ jobs:
           # The smoke keeps its isolated home on the success path (cleanup() is
           # a no-op when SMOKE_CLEANUP=false), so the shim that owns the unit
           # is still on disk and can be asked to uninstall it.
+          #
+          # The shim is NOT inside the isolated home. That mktemp'd dir has been
+          # DATA isolation only since the HOME/XDG_CONFIG_HOME override was
+          # dropped -- resolveServiceShimPath() is keyed to os.homedir() -- so
+          # the unit's ExecStart is $HOME/.local/bin/paperclipai. Looking for
+          # $iso/.local/bin/... (run 36221631375) always misses, `|| true`
+          # swallows it, and the job ends with paperclipai-smoke.service still
+          # active and on disk while still reporting success.
           iso="$(ls -d "${TMPDIR:-/tmp}"/paperclip-smoke-iso.* /tmp/paperclip-smoke-iso.* 2>/dev/null | head -1 || true)"
           echo "smoke_isohome=$iso"
-          if [ -n "$iso" ] && [ -x "$iso/.local/bin/paperclipai" ]; then
-            "$iso/.local/bin/paperclipai" service uninstall --instance smoke || true
+          smoke_shim="$HOME/.local/bin/paperclipai"
+          if [ -x "$smoke_shim" ]; then
+            "$smoke_shim" service uninstall --instance smoke || true
           else
-            echo "could not locate the smoke isolated home to uninstall through"
+            echo "no executable shim at $smoke_shim to uninstall through"
+          fi
+          # Require the unit to actually be gone. `|| true` above is there
+          # because teardown is best-effort; this is the assertion that the
+          # best-effort attempt succeeded, so it must not be best-effort too.
+          if systemctl --user show paperclipai-smoke.service -p LoadState --value 2>/dev/null | grep -qx "not-found"; then
+            echo "smoke unit removed"
+          else
+            echo "SMOKE UNIT SURVIVED THE TEARDOWN"
+            exit 1
           fi
           {
             echo "== after uninstall =="
@@ -448,6 +466,25 @@ jobs:
           echo "sentinel_activations_after=$after_lines"
           if [ "$after_lines" != "1" ]; then
             echo "the sentinel was activated $after_lines times; the leg started the host unit"
+            exit 1
+          fi
+          # The sentinel's unit FILE must also survive. Run 36221631375 measured
+          # it destroyed: LoadState went loaded -> not-found and FragmentPath went
+          # set -> empty, while 8f still printed PASS. 8f compares MainPID and
+          # ActiveEnterTimestamp, and both are empty for ANY stopped unit, so it
+          # cannot see a deletion -- the check that would have caught this is
+          # exactly the one the leg does not make. Assert it here so the next run
+          # is red until the underlying uninstall path stops removing a unit it
+          # did not create.
+          sentinel_unit="$HOME/.config/systemd/user/paperclipai.service"
+          if [ -f "$sentinel_unit" ] \
+             && grep -q "^LoadState=loaded" "$RUNNER_TEMP/sentinel-after.txt" \
+             && grep -q "^FragmentPath=$sentinel_unit$" "$RUNNER_TEMP/sentinel-after.txt"; then
+            echo "sentinel unit file intact: $sentinel_unit"
+          else
+            echo "THE LEG DELETED THE HOST UNIT FILE"
+            echo "  exists: $([ -f "$sentinel_unit" ] && echo yes || echo no)"
+            echo "  after:  $(grep -E '^(LoadState|FragmentPath)=' "$RUNNER_TEMP/sentinel-after.txt" | tr '\n' ' ')"
             exit 1
           fi
 
