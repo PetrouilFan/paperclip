@@ -69,12 +69,12 @@ on:
       slow_boot_levers:
         description: probe mode only - the levers to measure, in order
         required: false
-        default: "idle cpu:x8 cpuset:1 mem:768 mem:512+2048 io:8m swap:6144"
+        default: "idle cpuset:1 io:8m mem:768 cpuset:1,io:8m"
         type: string
       slow_boot_lever:
-        description: proof mode only - the lever that gets boot 2 over the bar
+        description: "proof mode only - the lever that gets boot 2 over the bar. Comma-separate to combine (e.g. cpuset:1,io:8m)"
         required: false
-        default: io:8m
+        default: "cpuset:1,io:8m"
         type: string
 
 permissions:

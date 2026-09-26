@@ -67,6 +67,12 @@ set -euo pipefail
 #            swapfile. Requires a swapfile; the workflow creates one and the
 #            lever reports itself skipped when there is none.
 #
+# A spec may also be a comma-separated list, applied left to right, and it
+# counts as available only if every part of it is. The bar needs about
+# eighteen-fold and no single controller gives that much on its own --
+# cpuset:1 is 4x by arithmetic -- so the combination is the expected shape of
+# the answer. All the parts are still properties of the machine.
+#
 # Every one of these reports itself SKIP when the host cannot provide it, rather
 # than passing vacuously -- io needs the `io` controller delegated down to the
 # unit's cgroup, memory and cpuset need theirs, swap needs a swapfile. Run
@@ -143,14 +149,14 @@ set -euo pipefail
 #   SLOW_BOOT_KEEP_LEVER        1 = leave the lever applied for inspection
 
 SLOW_BOOT_MODE="${SLOW_BOOT_MODE:-proof}"
-SLOW_BOOT_LEVERS="${SLOW_BOOT_LEVERS:-idle cpu:x8 cpuset:1 mem:768 mem:512+2048 io:8m swap:6144}"
-SLOW_BOOT_LEVER="${SLOW_BOOT_LEVER:-io:8m}"
+SLOW_BOOT_LEVERS="${SLOW_BOOT_LEVERS:-idle cpuset:1 io:8m mem:768 cpuset:1,io:8m}"
+SLOW_BOOT_LEVER="${SLOW_BOOT_LEVER:-cpuset:1,io:8m}"
 SLOW_BOOT_REPO="${SLOW_BOOT_REPO:-PetrouilFan/paperclip}"
 SLOW_BOOT_REF="${SLOW_BOOT_REF:-}"
 SLOW_BOOT_INSTANCE="${SLOW_BOOT_INSTANCE:-pet296}"
 SLOW_BOOT_MIN_BOOT_SECONDS="${SLOW_BOOT_MIN_BOOT_SECONDS:-90}"
 SLOW_BOOT_READY_TIMEOUT="${SLOW_BOOT_READY_TIMEOUT:-420}"
-SLOW_BOOT_PROBE_CAP="${SLOW_BOOT_PROBE_CAP:-240}"
+SLOW_BOOT_PROBE_CAP="${SLOW_BOOT_PROBE_CAP:-200}"
 SLOW_BOOT_KEEP_LEVER="${SLOW_BOOT_KEEP_LEVER:-0}"
 
 UNIT="paperclipai-${SLOW_BOOT_INSTANCE}.service"
@@ -191,6 +197,11 @@ summarize() {
     exit 1
   fi
   echo; echo "OVERALL: PASS"
+  # Terminal. A probe that printed its table and then carried on into the proof
+  # would report the probe's rows and the proof's abort as one result, which is
+  # how run 36252674012 ended on `ABORT the lever 'io:8m' is not available` --
+  # a complaint about a default the probe had already reported as unusable.
+  exit 0
 }
 
 # --- systemd helpers ------------------------------------------------------
@@ -319,10 +330,23 @@ cg_write() {
 # failures here are expected on some hosts and are reported, never assumed
 # either way. $1 controller, $2 target cgroup, $3 the file the controller must
 # then create in the target (io.max, memory.max, cpuset.cpus).
+#
+# The target cgroup is CREATED if it is not there. cgroup v2 prunes a cgroup as
+# soon as it has no members, and a stopped unit has no members, so by the time a
+# lever runs the unit's own cgroup has been removed -- which is exactly how run
+# 36252674012 reported all four cgroup levers "unavailable" without testing any
+# of them: the guard below saw a missing directory and returned before the
+# subtree_control walk. systemd derives the same path from the unit name, so
+# recreating it here puts the limits in place before the boot's first
+# instruction, and they apply to the process systemd then puts in it.
 cg_enable() {
   local controller="$1" target="$2" probe_file="$3" chain=() cur c
-  [ -d "/sys/fs/cgroup$target" ] || { info "$controller: no cgroup at $target"; return 1; }
-  cur="$target"
+  if [ ! -d "/sys/fs/cgroup$target" ]; then
+    local parent
+    parent="$(dirname "$target")"
+    [ -d "/sys/fs/cgroup$parent" ] || { info "$controller: no parent cgroup at $parent"; return 1; }
+  fi
+  cur="${target:-/}"
   while [ "$cur" != "/" ] && [ -d "/sys/fs/cgroup$cur" ]; do
     chain=("$cur" "${chain[@]+"${chain[@]}"}")
     cur="$(dirname "$cur")"
@@ -333,6 +357,16 @@ cg_enable() {
     grep -qw "$controller" "$sc" 2>/dev/null && continue
     cg_write "$sc" "+$controller" || true
   done
+  if [ ! -d "/sys/fs/cgroup$target" ]; then
+    if ! mkdir -p "/sys/fs/cgroup$target" 2>/dev/null \
+      && ! sudo mkdir -p "/sys/fs/cgroup$target" 2>/dev/null; then
+      info "$controller: could not create the unit's cgroup at $target"
+      info "$controller: (its parent has no processes and the $controller controller,"
+      info "$controller:  so it cannot be enabled for that cgroup's children)"
+      return 1
+    fi
+    info "$controller: recreated the unit's empty cgroup at $target"
+  fi
   if [ ! -f "/sys/fs/cgroup$target/$probe_file" ]; then
     info "$controller: the $controller controller is not available for $target on this host"
     info "$controller: (a cgroup holding processes directly cannot enable it for its children)"
@@ -468,7 +502,26 @@ cleanup() {
 
 # lever_apply <spec>. Returns 1 when the lever is not available on this host,
 # which the caller reports as SKIP rather than as a pass.
+#
+# A spec may be a comma-separated list, applied left to right, and it counts as
+# available only if every part of it is. The combination is the point: the boot
+# has to be stretched about eighteen-fold and no single controller does that
+# much on its own -- cpuset:1 is 4x by arithmetic, and the bar needs more than
+# arithmetic. All the parts are still properties of the machine, so DoD 4 is
+# untouched by combining them.
 lever_apply() {
+  local spec="$1" part rc=0
+  local IFS=','
+  # shellcheck disable=SC2086
+  set -- $spec
+  unset IFS
+  for part in "$@"; do
+    if ! lever_apply_one "$part"; then rc=1; fi
+  done
+  return "$rc"
+}
+
+lever_apply_one() {
   local spec="$1" n
   case "$spec" in
     idle) info "lever: nothing applied (control)"; return 0 ;;
