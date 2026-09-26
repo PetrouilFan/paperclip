@@ -22,6 +22,20 @@ jobs:
         with:
           ref: master
 
+      # Left gating on purpose. This step is a real security gate, and this
+      # repository carries open Dependabot alerts that it is the thing meant to
+      # catch, so it must not be demoted to advisory by a CI change.
+      #
+      # It is also *intermittently* unreliable here: `GET /dependency-graph/sbom`
+      # returns a real SPDX document on this fork, but the action has failed
+      # without analysing anything on roughly one push in twelve (run
+      # 36225657885). That intermittency is a separate defect, tracked on its
+      # own; it is not a reason to weaken the gate, and fixing it does not
+      # require this change.
+      #
+      # Making the quality gates reachable is done below instead, at the token
+      # step, which was the unconditional hard failure that skipped every
+      # later step on any repository without the commitperclip App installed.
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
@@ -36,11 +50,26 @@ jobs:
       - name: Generate commitperclip token
         id: token
         run: |
-          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          set -euo pipefail
+          if [ -n "${COMMITPERCLIP_KEY:-}" ]; then
+            TOKEN="$(node .github/scripts/get-bot-token.mjs)"
+            COMMENTER='commitperclip[bot]'
+          else
+            # The commitperclip app is not installed on every repository that
+            # runs this workflow (a fork has no app installation and therefore
+            # no COMMITPERCLIP_KEY). Hard-failing here used to skip every
+            # later step, so the quality gates below never ran at all. The
+            # gates only need to read the PR and write one issue comment, and
+            # this job already declares exactly that in `permissions`.
+            TOKEN="${GITHUB_TOKEN}"
+            COMMENTER='github-actions[bot]'
+          fi
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
+          echo "commenter=$COMMENTER" >> $GITHUB_OUTPUT
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Run quality gates
         id: quality
@@ -49,6 +78,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.token.outputs.value }}
+          GH_COMMENTER_LOGIN: ${{ steps.token.outputs.commenter }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
