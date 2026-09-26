@@ -205,16 +205,16 @@ export async function observeCrossIssueInfluence(
       // own binding is checked before the cap rather than after it.
       targetIsBound = boundIssues.some((row) => row.id === input.targetIssueId);
 
-      // A standing watch is the third and last way a run can have a source
-      // (PET-397). Without it a `heartbeat_timer` wake is mute by
-      // construction: it has no task, and the only two ways to manufacture a
+      // A standing watch is the third and last way a run can have a source.
+      // Without a standing-watch config entry a `heartbeat_timer` wake is mute
+      // by construction: it has no task, and the only two ways to manufacture a
       // source — checking out an issue, or creating one — are unavailable to a
       // watch whose entire job is writing to issues it does not own. Worse,
       // the host is often exactly the issue that *cannot* be checked out, so
-      // the binding above can never resolve for it. Measured: PET-349's rules
-      // 1-3 and its daily report are all cross-issue writes, and every one of
-      // them returned `no_context_source_and_target_unbound` on a bare timer
-      // wake while the run produced nothing on the board, which is
+      // the binding above can never resolve for it. Measured: a watch role's
+      // staleness rules and its daily report are all cross-issue writes, and
+      // every one of them returned `no_context_source_and_target_unbound` on a
+      // bare timer wake while the run produced nothing on the board, which is
       // indistinguishable from a watch that never ran.
       //
       // Re-validated here rather than trusted from the snapshot: the config is

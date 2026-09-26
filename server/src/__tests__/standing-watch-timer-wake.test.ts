@@ -35,11 +35,11 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 /**
- * PET-397. A `heartbeat_timer` wake is created with no issue in its context, so
+ * A `heartbeat_timer` wake is created with no issue in its context, so
  * every cross-issue write from it was refused with
  * `no_context_source_and_target_unbound` — which is most of a watch role's job
- * (PET-349's rules 1-3 and its daily board report). The run produced nothing and
- * said nothing, so the failure was invisible.
+ * (its staleness rules and its daily board report). The run produced nothing
+ * and said nothing, so the failure was invisible.
  *
  * These cases cover the scheduler half only: the host is resolved and stamped
  * onto the wake, and a bad configuration is reported instead of silently
@@ -200,8 +200,8 @@ describeEmbeddedPostgres("standing watch host on timer wakes", () => {
 
   it("resolves a blocked host, which is the case checkout can never serve", async () => {
     // `checkout` refuses a blocked issue, so a watch hosted on one could never
-    // reach the issue-side binding. PET-399 was re-homed off PET-72 for
-    // precisely this reason.
+    // reach the issue-side binding, which is why a watch is pointed at a
+    // blocked host in the first place.
     const { agentId, hostIssueId, tickAt } = await seedFixture({ hostStatus: "blocked" });
 
     await heartbeatService(db).tickTimers(tickAt);

@@ -274,7 +274,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   });
 
   it("stamps the monitored issue on the run, so a monitor run is not a task-less wake", async () => {
-    // PET-397. A cross-issue write is refused unless the *run* carries a source
+    // A cross-issue write is refused unless the *run* carries a source
     // issue, and the two wake paths differ here in a way that is easy to get
     // backwards. An issue monitor already binds its watched issue as the run's
     // context, so a monitor run can escalate onto another issue without a human

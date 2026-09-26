@@ -209,7 +209,7 @@ export const INBOX_MINE_ISSUE_STATUS_FILTER = INBOX_MINE_ISSUE_STATUSES.join(","
 
 /**
  * Statuses that can still host a standing watch
- * (`runtimeConfig.heartbeat.standingWatchIssueId`, PET-397).
+ * (`runtimeConfig.heartbeat.standingWatchIssueId`).
  *
  * `blocked` is deliberately included and is the case that matters: a blocked
  * issue can never be checked out, so a watch hosted on one can never reach the

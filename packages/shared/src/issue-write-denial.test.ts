@@ -100,7 +100,7 @@ describe("describeIssueWriteDenial", () => {
   });
 
   it("names the standing-watch config, because a watch owns no task to check out", () => {
-    // PET-397. "Check out the task this run is working on" is unfollowable for
+    // "Check out the task this run is working on" is unfollowable for
     // the one role that hits this wall on purpose: a scheduled watch has no
     // task, so the only sanctioned path it can actually take is the standing
     // host issue, or it produces nothing on the board in silence.

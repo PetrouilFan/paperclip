@@ -504,16 +504,16 @@ describe("cross-issue influence: the target's own assignee is not cross-issue in
 });
 
 /**
- * PET-397. The two fallbacks above both require the run to *hold* an issue, and
- * a watch role holds none: its whole job is writing to issues assigned to a
- * human or to another agent (PET-349's rules 1-3 and its daily report). On a
+ * A watch role holds no issue: its whole job is writing to issues assigned to
+ * a human or to another agent (its staleness rules and its daily report). On a
  * bare `heartbeat_timer` wake that left the mandate structurally mute, and
  * mute silently — a run that computed a correct sweep and could not record it
  * is indistinguishable from one that never ran.
  *
- * The host is frequently the one issue a watch *cannot* check out. PET-399 was
- * re-homed off PET-72 only because PET-72 is `blocked` and `checkout` refuses a
- * blocked issue, so the checkout-derived source can never resolve for it.
+ * The host is frequently the one issue a watch *cannot* check out: a watch is
+ * often pointed at a `blocked` issue precisely because that is where the
+ * staleness lives, and `checkout` refuses a blocked issue, so the
+ * checkout-derived source can never resolve for it.
  *
  * `standingWatchIssueId` is a third source, re-validated at the gate. It buys
  * attribution, not capacity: the 20-write per-run cap still applies to every

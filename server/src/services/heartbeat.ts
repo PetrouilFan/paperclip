@@ -16755,10 +16755,11 @@ export function heartbeatService(
           heartbeat.dailySpendCentsLimit ??
           heartbeat.dailyBudgetCents,
       ),
-      // The issue a bare `heartbeat_timer` wake is charged to. Accepts a UUID or
-      // an identifier (`PET-349`); `tickTimers` resolves and re-validates it on
-      // every wake, and `cross-issue-influence-limit.ts` re-validates again at
-      // write time, so a stale value can never widen a run's write surface.
+      // The issue a bare `heartbeat_timer` wake is charged to. Accepts an issue
+      // UUID or an issue identifier such as `PROJ-123`; `tickTimers` resolves
+      // and re-validates it on every wake, and `cross-issue-influence-limit.ts`
+      // re-validates again at write time, so a stale value can never widen a
+      // run's write surface.
       standingWatchIssueId: readNonEmptyString(heartbeat.standingWatchIssueId),
     };
   }
@@ -16933,16 +16934,16 @@ export function heartbeatService(
   /**
    * Resolve the issue a bare `heartbeat_timer` wake is charged to.
    *
-   * A watch role's job is cross-issue by definition: PET-349's rules 1-3 comment
-   * on issues assigned to a human or to another agent, and rule 5 reports to
+   * A watch role's job is cross-issue by definition: its staleness rules comment
+   * on issues assigned to a human or to another agent, and its report goes to
    * the board owner. A timer wake carries no task, so every one of those writes
    * is refused with `no_context_source_and_target_unbound` unless the run first
    * manufactures a source — by checking out an issue it owns, or by opening a
    * new one. A watch can do neither: it owns no task, and opening filler
    * tickets to unlock its own writes is the exact failure mode the cap exists
    * to prevent. The host is often the one issue it *cannot* check out, because
-   * `checkout` refuses a blocked issue (PET-399 was re-homed off PET-72 for
-   * precisely that reason), so the checkout-derived source can never resolve.
+   * `checkout` refuses a blocked issue, which is precisely why a watch is often
+   * hosted on one, so the checkout-derived source can never resolve.
    *
    * Naming the host in `runtimeConfig.heartbeat.standingWatchIssueId` gives the
    * wake a source to attribute cross-issue writes to. The 20-write per-run cap
