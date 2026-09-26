@@ -12,6 +12,7 @@ import {
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createRequire } from "node:module";
 import { runInNewContext } from "node:vm";
@@ -227,6 +228,54 @@ test("this checkout is not in lockstep, which is why the dependent's version is 
       );
     }
   }
+});
+
+test("every staged workspace dep specifier names the version its tarball will carry", () => {
+  // The invariant behind the ETARGET fix, asserted across the whole shipping set rather
+  // than on server alone. The git payload is installed as a set of local tarballs, so a
+  // staged specifier that disagrees with the packed version cannot be satisfied from the
+  // payload and falls through to the registry, where a source-tree version does not
+  // exist. Before the fix this found 6 disagreeing edges across 5 packages; `install
+  // --ref` only ever reported the first one, so the rest were a fifth cause waiting to
+  // be discovered by a 20-minute CI round trip.
+  //
+  // A new package added to the workspace at a version that is not its dependents' will
+  // now fail here rather than at install time.
+  const manifest = JSON.parse(
+    readFileSync(fileURLToPath(new URL("./release-package-manifest.json", import.meta.url)), "utf8"),
+  );
+  const versions = readWorkspacePackageVersions();
+  const tarballVersionByBareName = new Map(
+    manifest
+      .filter((entry) => versions.has(entry.name))
+      .map((entry) => [entry.name.replace(/^@[^/]+\//, ""), versions.get(entry.name)]),
+  );
+
+  const disagreements = [];
+  let edges = 0;
+  for (const entry of manifest) {
+    const packageJsonPath = fileURLToPath(new URL(`../${entry.dir}/package.json`, import.meta.url));
+    if (!existsSync(packageJsonPath)) continue;
+    const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    const staged = materializePublishManifest(pkg, {
+      resolveWorkspaceVersion: (name) => versions.get(name),
+    });
+    for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+      for (const [name, specifier] of Object.entries(staged[section] ?? {})) {
+        if (!name.startsWith("@paperclipai/")) continue;
+        edges += 1;
+        const bare = name.replace(/^@[^/]+\//, "");
+        const packed = tarballVersionByBareName.get(bare);
+        const wanted = String(specifier).replace(/^[\^~]/, "");
+        if (packed !== wanted) {
+          disagreements.push(`${entry.name} -> ${name}: staged ${specifier}, tarball ${packed}`);
+        }
+      }
+    }
+  }
+
+  assert.ok(edges > 0, "expected the shipping set to declare workspace dependency edges");
+  assert.deepEqual(disagreements, [], "staged workspace dep specifiers must name the packed version");
 });
 
 test("bundled package staging installs only dependencies included in the tarball", () => {
