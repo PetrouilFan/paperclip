@@ -2678,8 +2678,10 @@ describe("agent issue mutation checkout ownership", () => {
       mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
       mockTaskWatchdogService.revalidateMutationScope.mockResolvedValueOnce({
         allowed: false,
+        // The reason a `live` classification actually produces, so this fixture
+        // cannot drift away from the message the service emits.
         reason:
-          "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
+          "Task-watchdog review is stale because the watched subtree now has a live execution path; another run owns that work, so stop mutating the watched subtree and close the review with that finding.",
         classification: { state: "live", liveIssueIds: [issueId] },
       });
 
@@ -2697,7 +2699,7 @@ describe("agent issue mutation checkout ownership", () => {
       mockTaskWatchdogService.revalidateMutationScope.mockResolvedValueOnce({
         allowed: false,
         reason:
-          "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
+          "Task-watchdog review is stale because the watched subtree now has a live execution path; another run owns that work, so stop mutating the watched subtree and close the review with that finding.",
         classification: { state: "live", liveIssueIds: [issueId] },
       });
 
