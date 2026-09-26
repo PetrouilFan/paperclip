@@ -1919,8 +1919,8 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     continuationPolicy: issueThreadInteractionContinuationPolicySchema
       .optional()
       .default("wake_assignee"),
-    payload: suggestTasksPayloadSchema,
-  }),
+    payload: suggestTasksPayloadSchema.strict(),
+  }).strict(),
   z.object({
     ...createIssueThreadInteractionCommon,
     kind: z.literal("ask_user_questions"),
@@ -1932,8 +1932,8 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     continuationPolicy: issueThreadInteractionContinuationPolicySchema
       .optional()
       .default("wake_assignee"),
-    payload: createAskUserQuestionsPayloadSchema,
-  }),
+    payload: createAskUserQuestionsPayloadSchema.strict(),
+  }).strict(),
   z.object({
     ...createIssueThreadInteractionCommon,
     kind: z.literal("request_confirmation"),
@@ -1945,8 +1945,8 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     continuationPolicy: issueThreadInteractionContinuationPolicySchema
       .optional()
       .default("none"),
-    payload: requestConfirmationPayloadSchema,
-  }),
+    payload: requestConfirmationPayloadSchema.strict(),
+  }).strict(),
   z.object({
     ...createIssueThreadInteractionCommon,
     kind: z.literal("request_checkbox_confirmation"),
@@ -1958,8 +1958,8 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     continuationPolicy: issueThreadInteractionContinuationPolicySchema
       .optional()
       .default("wake_assignee"),
-    payload: requestCheckboxConfirmationPayloadSchema,
-  }),
+    payload: requestCheckboxConfirmationPayloadSchema.strict(),
+  }).strict(),
   z.object({
     ...createIssueThreadInteractionCommon,
     kind: z.literal("request_item_verdicts"),
@@ -1971,8 +1971,8 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     continuationPolicy: issueThreadInteractionContinuationPolicySchema
       .optional()
       .default("wake_assignee"),
-    payload: requestItemVerdictsPayloadSchema,
-  }),
+    payload: requestItemVerdictsPayloadSchema.strict(),
+  }).strict(),
 ]);
 
 export type CreateIssueThreadInteraction = z.infer<

@@ -11,11 +11,41 @@ import {
   askUserQuestionsPayloadSchema,
   createIssueThreadInteractionSchema,
   paperclipQuestionSetPayloadSchema,
+  requestCheckboxConfirmationPayloadSchema,
   requestConfirmationPayloadSchema,
   requestConfirmationResultSchema,
+  requestItemVerdictsPayloadSchema,
   requestItemVerdictsResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
+  suggestTasksPayloadSchema,
 } from "./validators/issue.js";
+
+/** One minimal payload per interaction kind, keyed by the kind discriminator. */
+const minimalValidPayloads = {
+  suggest_tasks: { version: 1, tasks: [{ clientKey: "a", title: "Do the thing" }] },
+  ask_user_questions: {
+    version: 1,
+    questions: [
+      {
+        id: "q1",
+        prompt: "Which one?",
+        selectionMode: "single" as const,
+        options: [{ id: "o1", label: "This one" }],
+      },
+    ],
+  },
+  request_confirmation: { version: 1, prompt: "Proceed?" },
+  request_checkbox_confirmation: {
+    version: 1,
+    prompt: "Pick the ones to keep",
+    options: [{ id: "o1", label: "Keep this" }],
+  },
+  request_item_verdicts: {
+    version: 1,
+    prompt: "Review the items",
+    items: [{ id: "i1", label: "The first item" }],
+  },
+} as const;
 
 describe("issue thread interaction schemas", () => {
   it("defines canonical resolver policies and normalizes compatibility aliases", () => {
@@ -599,5 +629,110 @@ describe("issue thread interaction schemas", () => {
         { id: "api", verdict: "reject", reason: "Needs revision" },
       ],
     })).toThrow("verdict item ids must be unique");
+  });
+
+  // A policy field nested in `payload` used to be stripped by zod's default
+  // object behaviour: the request came back 201 with
+  // `effectiveResolverPolicy: "anyone"`, so a board-only decision was in fact
+  // answerable by any agent, including the one that raised it.
+  it("rejects resolver and continuation policies nested inside the payload", () => {
+    const nestedCases = [
+      { resolverPolicy: "human_only" },
+      { continuationPolicy: "wake_assignee" },
+      { resolverPolicy: "human_only", continuationPolicy: "wake_assignee" },
+      { addresseeAgentId: "11111111-1111-4111-8111-111111111111" },
+    ];
+    // Every kind carries its own payload schema, so every kind must reject.
+    for (const [kind, payload] of Object.entries(minimalValidPayloads)) {
+      for (const nested of nestedCases) {
+        const result = createIssueThreadInteractionSchema.safeParse({
+          kind,
+          payload: { ...payload, ...nested },
+        });
+        expect(result.success, `${kind} accepted ${Object.keys(nested).join(",")}`).toBe(false);
+        if (result.success) continue;
+        const issue = result.error.issues[0];
+        expect(issue.code).toBe("unrecognized_keys");
+        // The issue must name the misplaced field and point at `payload`, not the
+        // request root, so the author can see the field was read and discarded.
+        expect(issue.path).toEqual(["payload"]);
+        for (const key of Object.keys(nested)) {
+          expect(issue.message).toContain(key);
+        }
+      }
+    }
+  });
+
+  it("still accepts each kind's own minimal payload", () => {
+    // The strictness must not cost a kind its valid minimum: if `.strict()`
+    // cannot be applied to a refined schema, this is where it shows.
+    for (const [kind, payload] of Object.entries(minimalValidPayloads)) {
+      const result = createIssueThreadInteractionSchema.safeParse({ kind, payload });
+      expect(result.success, `${kind}: ${JSON.stringify(result.error?.issues)}`).toBe(true);
+    }
+  });
+
+  it("rejects unknown payload keys instead of discarding them", () => {
+    const result = createIssueThreadInteractionSchema.safeParse({
+      kind: "request_confirmation",
+      payload: { version: 1, prompt: "Proceed?", resolverPolcy: "human_only" },
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues[0].code).toBe("unrecognized_keys");
+    expect(result.error.issues[0].message).toContain("resolverPolcy");
+  });
+
+  it("rejects unknown top-level request keys instead of discarding them", () => {
+    const result = createIssueThreadInteractionSchema.safeParse({
+      kind: "request_confirmation",
+      // `requestedResolverPolicy` is a response field, not a request field.
+      requestedResolverPolicy: "human_only",
+      payload: { version: 1, prompt: "Proceed?" },
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues[0].code).toBe("unrecognized_keys");
+    expect(result.error.issues[0].message).toContain("requestedResolverPolicy");
+  });
+
+  it("keeps the per-kind payload schemas lenient so stored rows still parse", () => {
+    // The read paths call these schemas directly on historical rows. A stored
+    // payload written by an older build may carry keys this build no longer
+    // knows, and that must not turn into a throw on read. Only the *create*
+    // schemas are strict, so `.strict()` there cannot leak into these.
+    const readSchemas = [
+      [suggestTasksPayloadSchema, minimalValidPayloads.suggest_tasks],
+      [askUserQuestionsPayloadSchema, minimalValidPayloads.ask_user_questions],
+      [requestConfirmationPayloadSchema, minimalValidPayloads.request_confirmation],
+      [
+        requestCheckboxConfirmationPayloadSchema,
+        minimalValidPayloads.request_checkbox_confirmation,
+      ],
+      [requestItemVerdictsPayloadSchema, minimalValidPayloads.request_item_verdicts],
+    ] as const;
+    for (const [schema, payload] of readSchemas) {
+      const parsed = schema.safeParse({
+        ...payload,
+        resolverPolicy: "human_only",
+        legacyField: true,
+      });
+      expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true);
+      if (!parsed.success) continue;
+      expect(parsed.data).not.toHaveProperty("resolverPolicy");
+      expect(parsed.data).not.toHaveProperty("legacyField");
+    }
+  });
+
+  it("still honours resolver and continuation policies at the top level", () => {
+    const parsed = createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      resolverPolicy: "human_only",
+      continuationPolicy: "wake_assignee_on_accept",
+      payload: { version: 1, prompt: "Proceed?" },
+    });
+    expect(parsed.resolverPolicy).toBe("human_only");
+    if (parsed.kind !== "request_confirmation") return;
+    expect(parsed.continuationPolicy).toBe("wake_assignee_on_accept");
   });
 });
