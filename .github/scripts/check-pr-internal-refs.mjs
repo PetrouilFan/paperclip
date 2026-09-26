@@ -22,16 +22,37 @@
  * checked". So the default list is the instance prefix alone, and a deployment
  * that wants more prefixes names them.
  *
- * ## What is deliberately NOT checked
+ * ## Instance-local addresses: why authored text only
  *
- * CONTRIBUTING.md's section also bans `localhost`, private-IP and tailnet URLs.
- * That rule is left to review, on the evidence: `\b(localhost|127\.0\.0\.1)` is
- * a legal, load-bearing part of this repository's own e2e and dev surface and
- * appears in 664 files on master. A mechanical check of it would fail on
- * correct work. `agent://` is likewise a canonical product feature (structured
- * agent mentions, `packages/shared/src/project-mentions.ts`), so only
- * `agent://` followed by a configured instance prefix is treated as a link to
- * an internal issue — a bare `agent://` is not.
+ * CONTRIBUTING.md's section also bans `localhost`, private-IP and tailnet URLs,
+ * and that rule *is* checked here — but only in the text an author writes: the
+ * PR title, the description, the branch name, the commit subjects. It is
+ * deliberately not applied to the diff, and the difference is the whole
+ * design.
+ *
+ * The evidence for the restriction is the measurement this file's identifier
+ * half already records: `\b(localhost|127\.0\.0\.1)` matches 664 files on
+ * master, and every one of them is the code working. A test asserting a
+ * service binds `127.0.0.1` is a test doing its job; the e2e harness reaches
+ * its fixtures over loopback by design. Scan the source and the gate is born
+ * failing on correct work, and a gate that fails on correct work gets
+ * disabled within a day — and a disabled gate reads as "we checked".
+ *
+ * The same string in a PR *body* is never correct. Nobody needs `127.0.0.1` to
+ * understand a change, and a reviewer on github.com cannot use the coordinate
+ * anyway. So the shape is split by surface: prose that merely names the
+ * loopback interface passes, and a URL that points at it fails.
+ *
+ * Replayed over the 60 most recent pull requests on this fork, the matcher
+ * below flags exactly two — #22 (`http://127.0.0.1:8099/v1` in the body) and
+ * #25 (`http://localhost:3101/api/companies/...` in the body) — and no
+ * correctly-authored body. Both are the class this rule exists for: an
+ * instance coordinate, copy-pasted, permanent.
+ *
+ * `agent://` is likewise a canonical product feature (structured agent
+ * mentions, `packages/shared/src/project-mentions.ts`), so only `agent://`
+ * followed by a configured instance prefix is treated as a link to an internal
+ * issue — a bare `agent://` is not.
  *
  * ## Failing closed
  *
@@ -179,6 +200,87 @@ function findAll(text, pattern) {
   return [...found];
 }
 
+/**
+ * The instance-local hosts this gate knows how to name.
+ *
+ * Split by why each entry is here, because the two groups are treated
+ * differently below and conflating them is what makes this rule unusable:
+ *
+ * - loopback and RFC1918 (`127.0.0.0/8`, `::1`, `10/8`, `172.16/12`,
+ *   `192.168/16`): the address space a single-node instance lives in. None of
+ *   it routes anywhere public, so a body that names it is naming one machine.
+ * - `100.64.0.0/10`: the CGNAT block Tailscale hands out. A tailnet node is
+ *   routinely addressed by its `100.x` address, so the tailnet rule is not
+ *   only about MagicDNS names.
+ * - `localhost`: the name, and the one people paste.
+ * - `0.0.0.0`: the wildcard bind, which is a *target* in a URL and a *socket
+ *   description* in prose. The distinction matters, so it appears in one
+ *   matcher and not the other (see `HOST_WITH_PORT`).
+ * - `*.ts.net`: MagicDNS. No legitimate appearance in a public PR body.
+ */
+const INSTANCE_HOST = String.raw`(?:localhost|127\.(?:\d{1,3}\.){2}\d{1,3}|\[::1\]|10\.(?:\d{1,3}\.){2}\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}|[A-Za-z0-9-]+(?:-[A-Za-z0-9-]+)*\.ts\.net|0\.0\.0\.0)`;
+
+/** Schemes whose authority component is a host: the http family, the wire
+ *  protocols an instance is reached over, and the URL schemes that appear in
+ *  a config snippet. `file:` is absent on purpose — a `file://` path is a local
+ *  filesystem path, not an instance coordinate. */
+const URL_SCHEME = String.raw`(?:https?|wss?|ssh|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?|grpc|git\+https?)`;
+
+/**
+ * A host in the authority of a URL: `http://localhost:3101/api/...`.
+ *
+ * The optional `user:pass@` is consumed so that a credentialed DSN
+ * (`postgres://agent:hunter2@10.0.0.7:5432/paperclip`) reports the address
+ * rather than stopping at the userinfo.
+ */
+const HOST_IN_URL = new RegExp(
+  String.raw`\b${URL_SCHEME}://(?:[^\s/@]+@)?${INSTANCE_HOST}`,
+  'gi',
+);
+
+/**
+ * A bare authority: `localhost:3101`, `192.168.1.20:8080`.
+ *
+ * `host:port` with no scheme is a URL reference in every reading — it is the
+ * authority form, and a reader copies it into a browser. The lookbehind refuses
+ * to start inside a word, a path or a dotted name, which also keeps this
+ * matcher from re-reporting the `localhost` that `HOST_IN_URL` already
+ * reported (that one is preceded by `//`).
+ *
+ * `0.0.0.0` is the one host excluded here and kept in `HOST_IN_URL`. "The unit
+ * binds 0.0.0.0:3100" is a true and load-bearing sentence about a socket, and
+ * this repository has a whole class of pull requests that need to say it;
+ * "curl http://0.0.0.0:3100" is a client reaching for an instance. A wildcard
+ * is a description in one position and a target in the other.
+ */
+const HOST_WITH_PORT = new RegExp(
+  String.raw`(?<![\w./-])(?:localhost|127\.(?:\d{1,3}\.){2}\d{1,3}|\[::1\]|10\.(?:\d{1,3}\.){2}\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}|[A-Za-z0-9-]+(?:-[A-Za-z0-9-]+)*\.ts\.net):\d{1,5}\b`,
+  'gi',
+);
+
+/**
+ * A MagicDNS name with no scheme and no port: `box.tail1234.ts.net`.
+ *
+ * Unqualified, because there is no reading of a tailnet hostname in a public
+ * PR body that is not a leak, and requiring a scheme around it would let the
+ * bare form through.
+ */
+const TAILNET_NAME = new RegExp(String.raw`\b[A-Za-z0-9-]+\.ts\.net\b`, 'gi');
+
+/**
+ * Every instance-local address reference in one string, de-duplicated.
+ *
+ * Exported for the tests and for any caller that wants the finding without the
+ * surrounding report text. A bare `localhost` in prose is deliberately not a
+ * match — see the header's note on why the shape is split by surface.
+ */
+export function findInstanceHosts(text) {
+  if (typeof text !== 'string' || text.length === 0) return [];
+  return [
+    ...new Set([...findAll(text, HOST_IN_URL), ...findAll(text, HOST_WITH_PORT), ...findAll(text, TAILNET_NAME)]),
+  ];
+}
+
 /** True when the line is the added half of a unified-diff body. */
 function isAddedLine(line) {
   return line.startsWith('+') && !line.startsWith('+++');
@@ -269,12 +371,40 @@ export function checkInternalRefs({
     }
   };
 
+  /**
+   * The instance-local-address half of the same rule, on the same four
+   * authored surfaces and nowhere else.
+   *
+   * Its own report text, because the fix is not "restate the context in plain
+   * English" — a reviewer can read `http://<host>:<port>` perfectly well. The
+   * fix is to write the endpoint as a shape instead of an address, and the
+   * failure has to say that or the author removes the sentence instead.
+   */
+  const hostReport = (surface, location, text, extra = '') => {
+    const hits = findInstanceHosts(text);
+    if (hits.length === 0) return;
+    const listed = [...hits].slice(0, 8).map((h) => `\`${h}\``).join(', ');
+    failures.push(
+      `${surface} carries ${listed}${hits.length > 8 ? ` (and ${hits.length - 8} more)` : ''} — ` +
+      'an address that resolves to one machine, not to a repository. ' +
+      'CONTRIBUTING.md ("No Internal Issue References") bans `localhost`, private-IP and tailnet URLs ' +
+      'pointing at your own instance, because a reviewer on github.com has no route to them. ' +
+      'Write the endpoint as a shape — `scheme://<host>:<port>` — and say what it is, not where it happened to run.' +
+      (extra ? ` ${extra}` : '')
+    );
+    if (location) {
+      failures.push(`  ↳ found in ${location}`);
+    }
+  };
+
   // --- Surface 1: PR title -------------------------------------------------
   const titleHits = [...findAll(prTitle, separated), ...findAll(prTitle, compact), ...findAll(prTitle, link)];
   if (titleHits.length > 0) {
     report('The PR title', null, titleHits,
       'A squash merge takes the PR title as the commit subject, so this becomes permanent history and cannot be cleaned up afterwards without a rewrite.');
   }
+  hostReport('The PR title', null, prTitle,
+    'A squash merge takes the PR title as the commit subject, so an instance address in a title is permanent history.');
 
   // --- Surface 2: PR body --------------------------------------------------
   const bodyHits = [...findAll(prBody, separated), ...findAll(prBody, compact), ...findAll(prBody, link)];
@@ -282,6 +412,8 @@ export function checkInternalRefs({
     report('The PR description', null, bodyHits,
       'The description should carry the reasoning, not the coordinates of a ticket nobody outside this instance can open.');
   }
+  hostReport('The PR description', null, prBody,
+    'A curl line or a config snippet pasted verbatim is where these arrive: the endpoint is the one thing a reader cannot reconstruct.');
 
   // --- Surface 3: branch name ---------------------------------------------
   const branchHits = [...findAll(prBranch, separated), ...findAll(prBranch, compact)];
@@ -289,6 +421,8 @@ export function checkInternalRefs({
     report(`The branch name \`${prBranch}\``, null, branchHits,
       'CONTRIBUTING.md ("Branch Naming") asks for a name describing the change, and ships the rename snippet for exactly this case.');
   }
+  hostReport(`The branch name \`${prBranch}\``, null, prBranch,
+    'A branch name is published on the PR and outlives the merge.');
 
   // --- Surface 4: commit subjects ----------------------------------------
   // A squash collapses the branch into the PR title, but a merge or a rebase
@@ -309,8 +443,24 @@ export function checkInternalRefs({
     report('A commit subject', commitLocations[0], commitHits,
       'Rewrite the subject (`git rebase -i`, `reword`); a merged subject is permanent history.');
   }
+  for (const commit of commits ?? []) {
+    const message = commit?.commit?.message;
+    if (typeof message !== 'string') continue;
+    const firstLine = message.split('\n')[0];
+    if (findInstanceHosts(firstLine).length > 0) {
+      hostReport('A commit subject', firstLine.trim().slice(0, 80), firstLine,
+        'Rewrite the subject (`git rebase -i`, `reword`); a merged subject is permanent history.');
+    }
+  }
 
   // --- Surface 5: the diff, and the paths it touches -----------------------
+  //
+  // The instance-address rule stops here, on purpose. 664 files on master use
+  // `localhost` in the e2e and dev surface, and a test that asserts a service
+  // binds `127.0.0.1` is the code working. Authored text is where the address
+  // is a leak; a diff line is where it is usually the subject matter. Only the
+  // identifier half of the rule applies to the diff.
+
   const allowReasons = new Map(ALLOWLIST.filter((e) => e && e.path && e.reason).map((e) => [e.path, e.reason]));
   const allowless = ALLOWLIST.filter((e) => !e || !e.path || !e.reason);
   if (allowless.length > 0) {
