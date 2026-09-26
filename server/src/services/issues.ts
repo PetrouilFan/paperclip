@@ -95,8 +95,6 @@ import {
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
-  ISSUE_ORIGIN_KINDS,
-  ISSUE_STATUSES,
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
@@ -1788,58 +1786,6 @@ export function parseStatusFilter(
     .flatMap((entry) => (typeof entry === "string" ? entry.split(",") : []))
     .map((status) => status.trim())
     .filter(Boolean);
-}
-
-/**
- * Members of a `?status=` filter that are not canonical issue statuses.
- *
- * The list and count routes 400 every other enum-bearing key they accept
- * (`sortField`, `sortDir`, `view`, `attention`), but `status` reached the
- * filter unvalidated, so a value the board cannot contain answered `200` with
- * an empty list. That is the quiet failure: a caller asking for a status that
- * does not exist is told the board has no work in it. A comma list with one bad
- * member was worse — the valid members applied and the bad one vanished, so the
- * caller got a narrower answer than it asked for with no signal anything was
- * dropped.
- *
- * Reads the canonical set from `ISSUE_STATUSES` rather than retyping it, so the
- * day a status is added here it is accepted without a second edit.
- */
-export function findUnknownIssueStatusValues(
-  input: string | readonly string[] | undefined,
-): string[] {
-  const known = ISSUE_STATUSES as readonly string[];
-  return [...new Set(parseStatusFilter(input).filter((s) => !known.includes(s)))];
-}
-
-/**
- * `?originKind=` value that is neither a built-in origin kind nor a plugin kind.
- *
- * Unlike `status`, the filter applies `originKind` with an exact match rather
- * than a comma list, so this deliberately does not split on commas: doing so
- * would turn today's `eq(origin_kind, "manual,routine_execution")` (which
- * matches nothing) into a two-member filter, i.e. a silent behaviour change on
- * top of a validation change.
- *
- * `IssueOriginKind` is `BuiltInIssueOriginKind | \`plugin:${string}\`` and the
- * column is unconstrained `text`, so the `plugin:` namespace is accepted by
- * design and is matched by prefix here.
- */
-export function findUnknownIssueOriginKindValues(
-  input: string | string[] | undefined,
-): string[] {
-  const values = (Array.isArray(input) ? input : [input])
-    .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  const known = ISSUE_ORIGIN_KINDS as readonly string[];
-  return [
-    ...new Set(
-      values.filter(
-        (kind) => !known.includes(kind) && !kind.startsWith("plugin:"),
-      ),
-    ),
-  ];
 }
 
 export interface IssueFilters {

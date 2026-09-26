@@ -165,8 +165,6 @@ import {
   inboxAgentPolicyService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
-  findUnknownIssueOriginKindValues,
-  findUnknownIssueStatusValues,
   issueReferenceService,
   issueService,
   type ActivityPublication,
@@ -684,6 +682,70 @@ function readObject(value: unknown): Record<string, unknown> {
 
 function hasOwn(record: Record<string, unknown>, key: string) {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * Members of a `?status=` filter that are not canonical issue statuses.
+ *
+ * The list and count routes 400 every other enum-bearing key they accept
+ * (`sortField`, `sortDir`, `view`, `attention`), but `status` reached the filter
+ * unvalidated, so a value the board cannot contain answered `200` with an empty
+ * list.
+ *
+ * Reads the canonical set from `ISSUE_STATUSES` rather than retyping it, so the
+ * day a status is added there it is accepted without a second edit.
+ *
+ * Defined here rather than re-exported from the service barrel on purpose: the
+ * route layer's only job is to read and reject query values, and a pure helper
+ * exported through `services/index.js` becomes a member of a barrel that 37 test
+ * files hand-enumerate under `vi.mock`. Adding to that barrel turns every one of
+ * those mocks into a 500 on the list route, which is a much larger blast radius
+ * than the fix warrants.
+ */
+function findUnknownIssueStatusValues(
+  input: string | string[] | undefined,
+): string[] {
+  const known = ISSUE_STATUSES as readonly string[];
+  const entries = Array.isArray(input) ? input : [input];
+  return [
+    ...new Set(
+      entries
+        .filter((entry): entry is string => typeof entry === "string")
+        .flatMap((entry) => entry.split(","))
+        .map((status) => status.trim())
+        .filter(Boolean)
+        .filter((status) => !known.includes(status)),
+    ),
+  ];
+}
+
+/**
+ * `?originKind=` value that is neither a built-in origin kind nor a plugin kind.
+ *
+ * Unlike `status`, the filter applies `originKind` with an exact match rather
+ * than a comma list, so this deliberately does not split on commas: doing so
+ * would turn today's `eq(origin_kind, "manual,routine_execution")` (which matches
+ * nothing) into a two-member filter, i.e. a silent behaviour change on top of a
+ * validation change.
+ *
+ * `IssueOriginKind` is `BuiltInIssueOriginKind | \`plugin:${string}\``, so the
+ * `plugin:` namespace is accepted by design and matched by prefix here.
+ */
+function findUnknownIssueOriginKindValues(
+  input: string | string[] | undefined,
+): string[] {
+  const known = ISSUE_ORIGIN_KINDS as readonly string[];
+  const values = (Array.isArray(input) ? input : [input])
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return [
+    ...new Set(
+      values.filter(
+        (kind) => !known.includes(kind) && !kind.startsWith("plugin:"),
+      ),
+    ),
+  ];
 }
 
 /**
