@@ -3,9 +3,30 @@ name: commitperclip PR Review
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
+  # Manual re-gate. `pull_request_target` only fires on a push to the head
+  # branch, so it cannot notice two things, both of which leave an open PR
+  # carrying a verdict that describes nothing:
+  #
+  #   1. A dropped `opened`/`synchronize` event. A PR whose first event was
+  #      never dispatched stays ungated forever, and GitHub still reports it
+  #      `mergeStateStatus: CLEAN`.
+  #   2. A change to the gates themselves. When this workflow's own logic
+  #      changes on master, every open PR keeps the verdict its last push
+  #      produced, which was computed by the *previous* version of the gates.
+  #
+  # This trigger closes both: run it against an open PR to get the current
+  # verdict from the current gate code.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Open pull request number to (re-)run the quality gates against'
+        required: true
+        type: string
 
 # Always runs from base branch context — never executes PR code.
 # pull_request_target gives access to secrets for untrusted fork PRs.
+# workflow_dispatch carries the same secret access, and resolves the PR over
+# the API rather than from the event, so it also never checks out PR code.
 
 permissions:
   pull-requests: write
@@ -22,6 +43,41 @@ jobs:
         with:
           ref: master
 
+      # Single source of PR context for both triggers. `pull_request_target`
+      # carries the pull request in the event payload; `workflow_dispatch`
+      # carries only the number, so it is resolved over the API. Every later
+      # step reads this step's outputs rather than `github.event.pull_request.*`,
+      # which is empty on a dispatch and would silently blank the base/head
+      # refs and the PR number.
+      - name: Resolve pull request context
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_PR: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          pr_number="${REQUESTED_PR:-}"
+          if ! [[ "$pr_number" =~ ^[0-9]+$ ]] || [ "$pr_number" -le 0 ]; then
+            echo "::error::pr_number must be a positive integer, got '${pr_number:-<empty>}'"
+            exit 1
+          fi
+
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")"
+          state="$(printf '%s' "$pr" | jq -r '.state')"
+          if [ "$state" != "open" ]; then
+            echo "::error::PR #${pr_number} is '${state}'. The quality gates describe an open pull request; re-run against an open PR."
+            exit 1
+          fi
+
+          {
+            echo "number=${pr_number}"
+            printf '%s' "$pr" | jq -r '"author=\(.user.login)"'
+            printf '%s' "$pr" | jq -r '"head_ref=\(.head.ref)"'
+            printf '%s' "$pr" | jq -r '"head_sha=\(.head.sha)"'
+            printf '%s' "$pr" | jq -r '"base_sha=\(.base.sha)"'
+          } >> "$GITHUB_OUTPUT"
+
       # Left gating on purpose. This step is a real security gate, and this
       # repository carries open Dependabot alerts that it is the thing meant to
       # catch, so it must not be demoted to advisory by a CI change.
@@ -35,12 +91,14 @@ jobs:
       #
       # Making the quality gates reachable is done below instead, at the token
       # step, which was the unconditional hard failure that skipped every
-      # later step on any repository without the commitperclip App installed.
+      # later step on any repository without the commitperclip App installed,
+      # and at the `workflow_dispatch` trigger above, which re-runs them on
+      # demand for a PR that no longer carries a trustworthy verdict.
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
-          base-ref: ${{ github.event.pull_request.base.sha }}
-          head-ref: ${{ github.event.pull_request.head.sha }}
+          base-ref: ${{ steps.pr.outputs.base_sha }}
+          head-ref: ${{ steps.pr.outputs.head_sha }}
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -73,21 +131,71 @@ jobs:
 
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        if: steps.pr.outputs.author != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.token.outputs.value }}
           GH_COMMENTER_LOGIN: ${{ steps.token.outputs.commenter }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_AUTHOR: ${{ steps.pr.outputs.author }}
+          PR_BRANCH: ${{ steps.pr.outputs.head_ref }}
 
       - name: Fail if quality gates failed
         if: >-
-          github.event.pull_request.user.login != 'dependabot[bot]' &&
+          steps.pr.outputs.author != 'dependabot[bot]' &&
           steps.quality.outcome == 'failure'
         run: |
           echo "One or more quality gates failed. See commitperclip comment on the PR for details."
           exit 1
+
+      # A `workflow_dispatch` run's own check attaches to the ref it was
+      # dispatched on, not to the pull request head, so the PR's `review` check
+      # is left holding whatever its last push produced — which on a manual
+      # re-gate is precisely the stale verdict this trigger exists to replace.
+      # Write the new verdict onto the head SHA so the PR's check rollup stops
+      # reporting the superseded one. `checks: write` is already declared above.
+      #
+      # Reuses the existing check run when there is one, so repeated re-gates
+      # update a single check instead of stacking duplicates on the head commit.
+      # `always()` is load-bearing: the step above exits 1 on a gate failure,
+      # which fails the job, and without it this step would be skipped in
+      # precisely the case that matters most — publishing the `failure` verdict.
+      - name: Publish verdict to the pull request head (manual runs only)
+        if: >-
+          always() &&
+          github.event_name == 'workflow_dispatch' &&
+          steps.pr.outputs.author != 'dependabot[bot]' &&
+          steps.quality.outcome != 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          GATE_OUTCOME: ${{ steps.quality.outcome }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GATE_OUTCOME" = "failure" ]; then
+            conclusion=failure
+            title="Quality gates failed"
+          else
+            conclusion=success
+            title="Quality gates passed"
+          fi
+          summary="Re-run manually against the current gate code. The per-gate detail is in the commitperclip comment on this pull request."
+
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?name=review" \
+            --jq '[.check_runs[] | select(.app.slug == "github-actions")] | first | .id // empty')"
+
+          if [ -n "$existing" ]; then
+            payload="$(jq -n --arg conclusion "$conclusion" --arg title "$title" --arg summary "$summary" \
+              '{conclusion: $conclusion, output: {title: $title, summary: $summary}}')"
+            printf '%s' "$payload" \
+              | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${existing}" --input - > /dev/null
+          else
+            payload="$(jq -n --arg head_sha "$HEAD_SHA" --arg conclusion "$conclusion" \
+              --arg title "$title" --arg summary "$summary" \
+              '{name: "review", head_sha: $head_sha, status: "completed", conclusion: $conclusion, output: {title: $title, summary: $summary}}')"
+            printf '%s' "$payload" \
+              | gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" --input - > /dev/null
+          fi
