@@ -249,7 +249,7 @@ jobs:
             sed -n '/^RESULTS /,/^OVERALL/p' "$RUNNER_TEMP/proof.clean.log" || true
           } 2>&1 | tee "$RUNNER_TEMP/assertions.log"
           missing=0
-          for id in 1e 2a 3a 4a 4b 4c 4d 4e 4f 5a 6a 6b 6c 6d 6e 6f 7a 7b; do
+          for id in 1e 2a 3a 4a 4b 4c 4d 4e 4f 5a 6a 6b 6c 6d 6e 6f 7a 7b 7c; do
             if ! grep -qE "^PASS +$id " "$RUNNER_TEMP/proof.clean.log"; then
               echo "MISSING PASS: $id"
               missing=1

@@ -688,6 +688,56 @@ lever_apply_one() {
   esac
 }
 
+# lever_aim <spec>. Asserts every cgroup-scoped lever in the spec is pointed at
+# a cgroup that belongs to $UNIT, and reports what it read back.
+#
+# This exists because every cgroup lever verifies itself by reading its own
+# value back out of "$IO_CG", so a stale $IO_CG makes that self-check succeed
+# against the WRONG cgroup and report a lever that was never applied. That is
+# not hypothetical: the control leg repointed $UNIT and left $IO_CG behind, so
+# the control booted unthrottled in 23s while the script believed it was under
+# the same 8%-of-a-core pressure as the 476s proof. A boot that is fast for the
+# wrong reason and a boot that is fast for the right reason are indistinguishable
+# from the result alone, so the aim has to be asserted, not inferred.
+#
+# cpu:, swap: and idle are host-side and touch no cgroup; they are skipped here
+# and carry no aim to check. $IO_CG must be re-resolved whenever $UNIT changes.
+lever_aim() {
+  local spec="$1" part file kind value
+  local IFS=','
+  # shellcheck disable=SC2086
+  set -- $spec
+  unset IFS
+  LEVER_AIM=""
+  for part in "$@"; do
+    case "$part" in
+      io:*)        kind=io;        file="/sys/fs/cgroup$IO_CG/io.max" ;;
+      mem:*)       kind=mem;       file="/sys/fs/cgroup$IO_CG/memory.max" ;;
+      cpuset:*)    kind=cpuset;    file="/sys/fs/cgroup$IO_CG/cpuset.cpus" ;;
+      bandwidth:*) kind=bandwidth; file="/sys/fs/cgroup$IO_CG/cpu.max" ;;
+      *)           continue ;;
+    esac
+    if [ -z "$IO_CG" ]; then
+      info "$part: IO_CG is empty, so this lever has no cgroup to aim at"
+      return 1
+    fi
+    # The cgroup leaf is named after the unit, which is what makes this a check
+    # on $IO_CG rather than a tautology.
+    if [ "$(basename "$IO_CG")" != "$UNIT" ]; then
+      info "$part: IO_CG is '$IO_CG', whose leaf is not $UNIT; this lever would land on some other unit"
+      return 1
+    fi
+    if [ ! -f "$file" ]; then
+      info "$part: aimed at $file, which does not exist"
+      return 1
+    fi
+    value="$(cat "$file" 2>/dev/null || true)"
+    LEVER_AIM="${LEVER_AIM}${LEVER_AIM:+, }${kind}=${value}"
+  done
+  [ -n "$LEVER_AIM" ] || LEVER_AIM="$spec (not cgroup-scoped)"
+  return 0
+}
+
 # --- host CPU accounting --------------------------------------------------
 # Sampled across a boot, so a boot that was "slow" while the host sat idle can
 # be told apart from one that was slow because the lever was actually biting.
@@ -1160,6 +1210,15 @@ note "6. boot 2, THE PROOF: $SLOW_BOOT_LEVER applied, then start"
 if ! lever_apply "$SLOW_BOOT_LEVER"; then
   die "the lever '$SLOW_BOOT_LEVER' is not available on this host, so boot 2 cannot be made slow. Run SLOW_BOOT_MODE=probe to find one that is."
 fi
+# 6a, before the boot rather than after it: a boot measured without a lever
+# aimed at it cannot be rescued by a later assertion, it can only be explained
+# away. The workflow gate requires 6a, and until this existed the gate could not
+# go green on any host.
+if lever_aim "$SLOW_BOOT_LEVER"; then
+  pass "6a the lever is applied on $UNIT's own cgroup: $LEVER_AIM"
+else
+  fail_ "6a the lever is not applied on $UNIT's cgroup (IO_CG='${IO_CG:-empty}', unit=$UNIT); a lever that misses the unit under test proves nothing"
+fi
 set +e
 measure_boot "proof" $(( SLOW_BOOT_READY_TIMEOUT + 60 ))
 PROOF_RC=$?
@@ -1240,13 +1299,29 @@ CONTROL_EFF_SECS="$(timespan_to_seconds "$CONTROL_EFF" || echo -1)"
 info "control unit: $CONTROL_FILE (TimeoutStartSec line removed)"
 info "control effective TimeoutStartUSec=$CONTROL_EFF (${CONTROL_EFF_SECS}s)"
 # The control is a different unit name, so point the measurement helpers at it
-# for the length of this boot and put them back afterwards.
+# for the length of this boot and put them back afterwards. IO_CG is one of
+# those helpers and is NOT re-derived from $UNIT anywhere later, so it has to be
+# re-resolved here: every cgroup lever reads its own read-back from it, and a
+# stale one throttles the unit under test a second time and leaves the control
+# running unthrottled.
+PROOF_IO_CG="$IO_CG"
 UNIT="$CONTROL_UNIT"
+IO_CG="$(prop ControlGroup)"
 if [ "$CONTROL_EFF_SECS" != "90" ]; then
   fail_ "7a the control really does run on the 90s default (got ${CONTROL_EFF_SECS}s); without that the control proves nothing"
   systemctl --user stop "$CONTROL_UNIT" >/dev/null 2>&1 || true
 else
   pass "7a the control runs on systemd's 90s default (TimeoutStartUSec=$CONTROL_EFF)"
+fi
+
+# Asserted before the control boots, not read off its result afterwards. A
+# control that comes up fast because it was never throttled looks exactly like a
+# control that came up fast because 90s is enough, and 7b would then be
+# reporting a healthy control as a broken proof.
+if [ -n "$IO_CG" ] && [ "$(basename "$IO_CG")" = "$CONTROL_UNIT" ]; then
+  pass "7c the control's lever is aimed at the control's own cgroup, not the unit under test"
+else
+  fail_ "7c the control's cgroup is '${IO_CG:-empty}', which is not $CONTROL_UNIT; the lever would land on the proof unit and the control would prove nothing"
 fi
 
 if lever_apply "$SLOW_BOOT_LEVER"; then :; else
@@ -1278,6 +1353,7 @@ rm -f "$CONTROL_FILE"
 systemctl --user daemon-reload
 systemctl --user reset-failed "$CONTROL_UNIT" >/dev/null 2>&1 || true
 UNIT="paperclipai-${SLOW_BOOT_INSTANCE}.service"
+IO_CG="$PROOF_IO_CG"
 
 # DoD 4, re-checked: the unit the proof ran is byte-for-byte the one the
 # installer wrote. If anything had hand-edited it to buy the result, the hash
