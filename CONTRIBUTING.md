@@ -112,6 +112,22 @@ If your change adds, removes, or modifies emitted telemetry events, update the [
 
 All Paperclip CI gates (lint, typecheck, tests, build, and any other required checks) must be satisfied before a PR can be merged. Don't ask for a merge while gates are red — fix them first.
 
+### Re-gating an Open Pull Request by Hand
+
+`pull_request_target` only fires when someone pushes to the head branch, so a pull request can end up carrying a verdict that describes nothing: a dropped event, a later revision that was never gated, or a change to the gates themselves after the last push. Run the **commitperclip PR Review** workflow with the pull request number to get a verdict from the current gate code.
+
+**Read the verdict from these, in this order:**
+
+1. **The run itself.** A re-gate that passes is a green run; one that fails is red. This is the gate verdict, and it is the only signal that is never stale.
+2. **The `commitperclip` comment on the pull request.** It carries the per-gate detail and is stamped with the timestamp, gate revision, and run that produced it — so you can tell a fresh verdict from the one the head commit is still carrying.
+3. **The `commitperclip/quality-gates` status on the head commit.** The link in it opens the run.
+
+**What a re-gate cannot do, and why this matters when it looks like a failure:**
+
+The `review` check on a pull request head is *always* whatever its last push produced. A workflow can no longer change it: GitHub removed workflow-token mutation of an Actions-created check run on 2025-03-31, so the call answers `HTTP 403`. A dispatch run's own check also attaches to `master`, not to the pull request head.
+
+So **a manual re-gate never turns a pull request mergeable**, and a red `review` check on an open pull request is not a gate verdict. Read the run and the comment before concluding the pull request is broken. If a re-gate is red, the *run* tells you why: open it and read the failing step.
+
 ### Greptile Review
 
 We use [Greptile](https://greptile.com) for automated code review. Your PR must achieve a **5/5 Greptile score** before it can be merged, with:

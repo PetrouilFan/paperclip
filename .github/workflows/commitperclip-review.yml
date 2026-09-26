@@ -4,7 +4,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
   # Manual re-gate. `pull_request_target` only fires on a push to the head
-  # branch, so it cannot notice two things, both of which leave an open PR
+  # branch, so it cannot notice three things, all of which leave an open PR
   # carrying a verdict that describes nothing:
   #
   #   1. A dropped `opened`/`synchronize` event. A PR whose first event was
@@ -13,9 +13,38 @@ on:
   #   2. A change to the gates themselves. When this workflow's own logic
   #      changes on master, every open PR keeps the verdict its last push
   #      produced, which was computed by the *previous* version of the gates.
+  #   3. A dropped `synchronize` event on a later push, leaving the head
+  #      commit's `review` check describing an earlier revision.
   #
-  # This trigger closes both: run it against an open PR to get the current
-  # verdict from the current gate code.
+  # This trigger closes all three: run it against an open PR to get the
+  # current verdict from the current gate code.
+  #
+  # ## Which signal a reviewer should read
+  #
+  # A manual run cannot write a verdict onto the pull request head, and this
+  # is a platform limit rather than a bug to work around. A `workflow_dispatch`
+  # run's own check attaches to the ref it was dispatched on (`master`), not
+  # to the PR head. To move the PR head's `review` check the workflow would
+  # have to mutate a check run it does not own, which GitHub removed on
+  # 2025-03-31: "developers will soon lose the ability to modify the
+  # conclusion and status of an Actions-created check run using the GitHub
+  # token from a workflow run"
+  # (https://github.blog/changelog/2025-02-12-notice-of-upcoming-deprecations-and-breaking-changes-for-github-actions/#changes-to-check-run-status-modification).
+  # Any such call now answers `HTTP 403`.
+  #
+  # So the `review` check on an open PR head is *always* whatever its last
+  # push produced. A re-gate never moves it, and a re-gate cannot make an
+  # open PR mergeable. Read the re-gate verdict from these instead, in order:
+  #
+  #   1. The run itself. A re-gate that passes is a green run; a re-gate that
+  #      fails is a red one. `Fail if quality gates failed` is what decides
+  #      that, and it runs on every trigger.
+  #   2. The `commitperclip` comment on the PR. It carries the per-gate detail
+  #      and is stamped with the run and the gate revision that produced it, so
+  #      a fresh verdict is distinguishable from a stale one.
+  #   3. The `commitperclip/quality-gates` commit status on the head SHA. This
+  #      is the one machine-readable verdict that still lands on the head
+  #      commit, and its link points back at the run.
   workflow_dispatch:
     inputs:
       pr_number:
@@ -30,7 +59,13 @@ on:
 
 permissions:
   pull-requests: write
+  # `checks: write` is still needed by `actions/dependency-review-action`,
+  # which calls the check-runs API itself. This workflow's own steps do not
+  # write check runs: see the `workflow_dispatch` comment above.
   checks: write
+  # The manual re-gate records its verdict as a commit status, which is the
+  # one head-commit signal a workflow token is still allowed to write.
+  statuses: write
   contents: read
 
 jobs:
@@ -141,6 +176,14 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           PR_AUTHOR: ${{ steps.pr.outputs.author }}
           PR_BRANCH: ${{ steps.pr.outputs.head_ref }}
+          # Stamped into the commitperclip comment so a reviewer can tell a
+          # verdict this run just produced from one left by an earlier push,
+          # and which revision of the gates produced it. `GATE_BASE_SHA` is
+          # the commit the gates were read from, which is the ref this job
+          # checks out rather than the PR head.
+          GATE_RUN_ID: ${{ github.run_id }}
+          GATE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GATE_BASE_SHA: ${{ github.sha }}
 
       - name: Fail if quality gates failed
         if: >-
@@ -154,14 +197,24 @@ jobs:
       # dispatched on, not to the pull request head, so the PR's `review` check
       # is left holding whatever its last push produced — which on a manual
       # re-gate is precisely the stale verdict this trigger exists to replace.
-      # Write the new verdict onto the head SHA so the PR's check rollup stops
-      # reporting the superseded one. `checks: write` is already declared above.
+      # This step used to try to move that check, and could not: GitHub removed
+      # workflow-token mutation of an Actions-created check run on 2025-03-31,
+      # so the call answered `HTTP 403` on every manual run and turned every
+      # re-gate red. A red run cannot be a re-gate remedy, and it is also
+      # unreadable: a reviewer cannot tell a broken publisher from a broken
+      # pull request. See the `workflow_dispatch` comment above for the full
+      # reasoning and the signals to read instead.
       #
-      # Reuses the existing check run when there is one, so repeated re-gates
-      # update a single check instead of stacking duplicates on the head commit.
+      # What this step writes is a commit status on the head SHA under the
+      # `commitperclip/quality-gates` context. That is the one head-commit
+      # signal a workflow token is still allowed to write, and it is named so it
+      # cannot be mistaken for the `review` check. `target_url` sends a
+      # reviewer straight to this run, which is what makes the status usable as
+      # a pointer rather than just a colour.
+      #
       # `always()` is load-bearing: the step above exits 1 on a gate failure,
       # which fails the job, and without it this step would be skipped in
-      # precisely the case that matters most — publishing the `failure` verdict.
+      # precisely the case that matters most — recording the `failure` verdict.
       #
       # `steps.quality.outcome` is deliberately NOT part of this condition.
       # `Run quality gates` carries an `if:` with no status function, so
@@ -180,8 +233,8 @@ jobs:
       # cannot be the one that swallows a verdict: it is written by the resolve
       # step, which runs before all three of those. It is empty only when the
       # run died at or before the resolve step, and then there is no head SHA to
-      # publish to.
-      - name: Publish verdict to the pull request head (manual runs only)
+      # record a verdict against.
+      - name: Record the re-gate verdict on the pull request head (manual runs only)
         if: >-
           always() &&
           github.event_name == 'workflow_dispatch' &&
@@ -191,46 +244,76 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           GATE_OUTCOME: ${{ steps.quality.outcome }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
 
           # Every outcome other than a completed pass is a `failure` verdict.
           # `skipped` and `cancelled` both mean the gates produced no verdict,
           # so the head commit is unproven — and unproven must not render as
-          # green, or the rollup is lying in the same way this step's guard
+          # green, or the status is lying in the same way this step's guard
           # did. The comment the gate script would have written does not exist
           # on those paths either, so the summary must not point a reviewer at
           # it.
           case "$GATE_OUTCOME" in
             success)
-              conclusion=success
-              title="Quality gates passed"
-              summary="Re-run manually against the current gate code. The per-gate detail is in the commitperclip comment on this pull request."
+              state=success
+              detail="Quality gates passed"
+              note="The per-gate detail is in the commitperclip comment on this pull request."
               ;;
             failure)
-              conclusion=failure
-              title="Quality gates failed"
-              summary="Re-run manually against the current gate code. The per-gate detail is in the commitperclip comment on this pull request."
+              state=failure
+              detail="Quality gates failed"
+              note="The per-gate detail is in the commitperclip comment on this pull request."
               ;;
             *)
-              conclusion=failure
-              title="Run did not reach the quality gates"
-              summary="This run failed before the quality gates produced a verdict, so this head commit is unproven. Read the run log for the failing step, then re-gate."
+              state=failure
+              detail="Run did not reach the quality gates"
+              note="This run failed before the quality gates produced a verdict, so this head commit is unproven. Read the run log for the failing step, then re-gate."
               ;;
           esac
 
-          existing="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?name=review" \
-            --jq '[.check_runs[] | select(.app.slug == "github-actions")] | first | .id // empty')"
-
-          if [ -n "$existing" ]; then
-            payload="$(jq -n --arg conclusion "$conclusion" --arg title "$title" --arg summary "$summary" \
-              '{conclusion: $conclusion, output: {title: $title, summary: $summary}}')"
-            printf '%s' "$payload" \
-              | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${existing}" --input - > /dev/null
-          else
-            payload="$(jq -n --arg head_sha "$HEAD_SHA" --arg conclusion "$conclusion" \
-              --arg title "$title" --arg summary "$summary" \
-              '{name: "review", head_sha: $head_sha, status: "completed", conclusion: $conclusion, output: {title: $title, summary: $summary}}')"
-            printf '%s' "$payload" \
-              | gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" --input - > /dev/null
+          # A commit status `description` is capped at 140 characters, so this
+          # stays a headline that links through to the run rather than
+          # restating the gate detail the comment already holds.
+          description="${detail} — manual re-gate"
+          if [ "${#description}" -gt 140 ]; then
+            description="$detail"
           fi
+
+          {
+            echo "### commitperclip quality gates — ${detail}"
+            echo
+            echo "- Pull request: #${PR_NUMBER} (head \`${HEAD_SHA}\`)"
+            echo "- Run: ${RUN_URL}"
+            if [ "$GATE_OUTCOME" = success ] || [ "$GATE_OUTCOME" = failure ]; then
+              echo "- Per-gate detail: the \`commitperclip\` comment on this pull request."
+            else
+              echo "- Per-gate detail: none. ${note}"
+            fi
+            echo
+            echo "The \`review\` check on this head commit is **not** this verdict."
+            echo "It is whatever the last push produced, and a workflow can no longer"
+            echo "change it. A manual re-gate never turns a pull request green; read the"
+            echo "signals above."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Recording the verdict must not decide the run. `Fail if quality
+          # gates failed` already exits 1 on a genuine gate failure, and a run
+          # that died before the gates is already red from the step that died.
+          # Failing here as well would report the same verdict a second time,
+          # and would make any future write failure look like a broken pull
+          # request — the exact confusion this step used to cause with its 403.
+          # On the paths where the gate script did run, the run conclusion and
+          # the commitperclip comment already carry the verdict twice over.
+          if ! printf '%s' "$(jq -n \
+              --arg state "$state" \
+              --arg description "$description" \
+              --arg target_url "$RUN_URL" \
+              '{state: $state, description: $description, target_url: $target_url}')" \
+            | gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" --input - > /dev/null; then
+            echo "::warning::Could not record the commitperclip/quality-gates status on ${HEAD_SHA}."
+            echo "::warning::The run conclusion above is still the gate verdict, and the commitperclip comment on the pull request still carries the per-gate detail."
+          fi
+

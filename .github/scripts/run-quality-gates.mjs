@@ -26,32 +26,70 @@ const COMMENT_SIGNATURE = '— commitperclip';
 // the gates therefore run under the workflow's own GITHUB_TOKEN instead.
 export const COMMITPERCLIP_LOGINS = ['commitperclip[bot]', 'commitperclip'];
 
-function buildComment(author, failures, informational) {
-  if (failures.length === 0 && informational.length === 0) {
-    return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${COMMENT_SIGNATURE}`;
-  }
+/**
+ * The provenance line stamped under the gate detail.
+ *
+ * The comment is upserted, so on its own it cannot tell a reader whether it was
+ * rewritten by the push they are looking at or left behind by an earlier one.
+ * That matters most for a `workflow_dispatch` re-gate: its whole purpose is to
+ * replace a verdict the head commit is still carrying, and if the comment is
+ * not stamped it is indistinguishable from the verdict it is replacing. Naming
+ * the run and the gate revision makes the recency checkable instead of assumed.
+ *
+ * Returns null when the caller supplied nothing to stamp, which is the case
+ * for any invocation outside the workflow. The line is placed above the
+ * signature, so the comment still contains exactly one `— commitperclip` and
+ * `findExistingComment` still recognises it.
+ */
+export function buildProvenanceLine({ runId, runUrl, baseSha, ranAt } = {}) {
+  if (!runId && !runUrl && !baseSha) return null;
 
-  const lines = [
-    `Hey @${author}! Before this PR can be reviewed, a few things need attention:\n`,
-  ];
+  const parts = [];
+  if (ranAt) parts.push(`Gates ran ${ranAt}`);
+  else parts.push('Gates ran');
 
-  if (failures.length > 0) {
-    lines.push('**Missing or incomplete:**');
-    for (const f of failures) lines.push(`- [ ] ${f}`);
-  }
+  if (baseSha) parts.push(`from gate revision \`${String(baseSha).slice(0, 9)}\``);
+  if (runUrl) parts.push(`[run ${runId ?? '?'}](${runUrl})`);
+  else if (runId) parts.push(`(run ${runId})`);
 
-  if (informational.length > 0) {
-    if (failures.length > 0) lines.push('');
-    lines.push('**Informational:**');
-    for (const i of informational) lines.push(`- ${i}`);
-  }
+  return `${parts.join(' ')}.`;
+}
 
-  lines.push(
-    '\nOnce updated, push a new commit and these checks will re-run automatically.\n',
-    COMMENT_SIGNATURE
-  );
+function withProvenance(body, provenance) {
+  if (!provenance) return body;
+  // The signature is the last line of every body this function builds.
+  const at = body.lastIndexOf(COMMENT_SIGNATURE);
+  if (at === -1) return `${body}\n\n${provenance}\n${COMMENT_SIGNATURE}`;
+  return `${body.slice(0, at)}${provenance}\n\n${body.slice(at)}`;
+}
 
-  return lines.join('\n');
+export function buildComment(author, failures, informational, provenance = null) {
+  const body = (() => {
+    if (failures.length === 0 && informational.length === 0) {
+      return '✅ All checks passing — ready for Greptile review and maintainer approval.';
+    }
+
+    const lines = [
+      `Hey @${author}! Before this PR can be reviewed, a few things need attention:\n`,
+    ];
+
+    if (failures.length > 0) {
+      lines.push('**Missing or incomplete:**');
+      for (const f of failures) lines.push(`- [ ] ${f}`);
+    }
+
+    if (informational.length > 0) {
+      if (failures.length > 0) lines.push('');
+      lines.push('**Informational:**');
+      for (const i of informational) lines.push(`- ${i}`);
+    }
+
+    lines.push('\nOnce updated, push a new commit and these checks will re-run automatically.');
+
+    return lines.join('\n');
+  })();
+
+  return withProvenance(`${body}\n\n${COMMENT_SIGNATURE}`, provenance);
 }
 
 export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, commenterLogins = COMMITPERCLIP_LOGINS) {
@@ -163,7 +201,12 @@ async function main() {
   ];
   const allPassed = allFailures.length === 0;
 
-  const commentBody = buildComment(author, allFailures, informational);
+  const commentBody = buildComment(author, allFailures, informational, buildProvenanceLine({
+    runId: process.env.GATE_RUN_ID,
+    runUrl: process.env.GATE_RUN_URL,
+    baseSha: process.env.GATE_BASE_SHA,
+    ranAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+  }));
 
   // Post comment if there are failures/informational, or update existing comment
   const commenter = process.env.GH_COMMENTER_LOGIN?.trim();
