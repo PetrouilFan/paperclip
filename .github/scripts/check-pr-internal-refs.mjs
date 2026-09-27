@@ -211,9 +211,9 @@
  *
  * CONTRIBUTING.md's section also bans `localhost`, private-IP and tailnet URLs,
  * and that rule *is* checked here — but only in the text an author writes: the
- * PR title, the description, the branch name, the commit subjects, the commit
- * message bodies and the pull request comments. It is deliberately not applied
- * to the diff, and the difference is the whole design.
+ * PR title, the description, the branch name, the commit subjects and the pull
+ * request comments. It is deliberately not applied to the diff or to the commit
+ * message body, and the difference is the whole design.
  *
  * The evidence for the restriction is the measurement this file's identifier
  * half already records: `\b(localhost|127\.0\.0\.1)` matches 664 files on
@@ -223,10 +223,10 @@
  * failing on correct work, and a gate that fails on correct work gets
  * disabled within a day — and a disabled gate reads as "we checked".
  *
- * The same string in a PR *body* is never correct. Nobody needs `127.0.0.1` to
- * understand a change, and a reviewer on github.com cannot use the coordinate
- * anyway. So the shape is split by surface: prose that merely names the
- * loopback interface passes, and a URL that points at it fails.
+ * The same string in a PR *body* is usually not correct. Nobody needs
+ * `127.0.0.1` to understand a change, and a reviewer on github.com cannot use
+ * the coordinate anyway. So the shape is split by surface: prose that merely
+ * names the loopback interface passes, and a URL that points at it fails.
  *
  * Replayed over the 60 most recent pull requests on this fork, the matcher
  * below flags exactly two — #22 (`http://127.0.0.1:8099/v1` in the body) and
@@ -235,6 +235,43 @@
  * instance coordinate, copy-pasted, permanent. The same matcher on the comment
  * surface over the 100 most recently updated pull requests adds two more, on
  * #105: `http://localhost` twice, both in the same comment.
+ *
+ * ### the address half stops before the commit body
+ *
+ * The commit message body is the one authored surface this half does not
+ * reach, and the reason is the same as the diff's, arrived at separately.
+ *
+ * On a diff line an instance address is the code working. In a commit body it
+ * is the *change* working: a commit that documents a port collision, a pinned
+ * test port, a loopback smoke URL or a tailnet hostname exists in order to
+ * name that address, and the remedy this gate would ask for — write the
+ * endpoint as a shape — deletes the sentence that makes the commit worth
+ * having. `b83e14ad` is "stop the readiness probe from stealing the guest
+ * exposure port"; its body is the `127.0.0.1:42000` that collided. There is no
+ * rewording that keeps that commit.
+ *
+ * The identifier half does not have this problem, which is why the two halves
+ * diverge here rather than the rule being dropped. `PET-9001/PET-9002 were the
+ * live instance of this` and `the delegation-guard issue was the live instance
+ * of this` say the same thing. Rewording is always available for an identifier
+ * and is never available for an address, so an identifier is a finding on every
+ * authored surface and an address is a finding only on the ones that are not
+ * describing one.
+ *
+ * The measurement, replayed over the 4670 commits on `master`: the address
+ * half flags **31** commit bodies and the identifier half flags 15. All 31
+ * were read, and all 31 are the case above — a pinned loopback port, a curl
+ * repro, a fictional MagicDNS name, one dependabot release-notes body quoting
+ * upstream's own `ws://localhost:${port}` example. None of the 15 is that
+ * case. That is the whole argument for the split: the identifier half gains
+ * real coverage on this surface and the address half acquires only noise.
+ *
+ * What the split costs is stated rather than left to be discovered: on a merge
+ * or rebase, a branch commit body naming an instance address is no longer
+ * flagged, because the PR description is a different string. Every other
+ * authored surface keeps the half, including the commit subject — which under
+ * a squash merge *is* the PR title, so the text that becomes permanent history
+ * is covered on the surface it was written on and the surface it lands on.
  *
  * `agent://` is likewise a canonical product feature (structured agent
  * mentions, `packages/shared/src/project-mentions.ts`), so only `agent://`
@@ -1064,12 +1101,10 @@ export function checkInternalRefs({
   // preserves these messages whole, and a reviewer reading `git log` before
   // merging reads the body today, not just the subject.
   //
-  // The body is scanned, and the two halves of the rule both apply to it. The
-  // header's own principle says the reason: "Authored text is where the
-  // address is a leak; a diff line is where it is usually the subject matter."
-  // A commit body is authored text by any reading — it is not a test fixture
-  // and not a diff line — so an identifier *or* an instance address in one is
-  // a leak on the same terms as the same string in the subject.
+  // The body is scanned for identifiers, and the identifier half applies to it
+  // as it does to every other authored surface. The address half does not —
+  // see the note where the body scan is written, and the header's "the address
+  // half stops before the commit body".
   //
   // This is not hypothetical. The three identifier literals that the gate
   // reported `passed: true` alongside sat in commit bodies on the branch that
@@ -1125,8 +1160,29 @@ export function checkInternalRefs({
     }
   }
 
-  // The body, on both halves. `lines.slice(1)` deliberately excludes the
-  // subject, so one identifier in the subject is one finding and not two.
+  // The body, on the identifier half only. `lines.slice(1)` deliberately
+  // excludes the subject, so one identifier in the subject is one finding and
+  // not two.
+  //
+  // The address half stops before this surface, and the reason is the one the
+  // header states for the diff: a commit body is where an instance address is
+  // usually the *subject matter*. `b83e14ad` is "stop the readiness probe from
+  // stealing the guest exposure port" and its body is the sentence describing
+  // the `127.0.0.1:42000` that collided. There is no rewording that keeps that
+  // commit, which is the test the address half fails and the identifier half
+  // passes — "the delegation-guard issue was the live instance" loses nothing,
+  // "the loopback port was the live instance" is not the same commit. Measured
+  // over the 4670 commits on `master`, the address half flags 31 bodies and
+  // every one of them is that case; the identifier half's bodies are real ids.
+  // See the header's "the address half stops before the commit body".
+  //
+  // What that costs, stated rather than assumed: a branch commit body naming an
+  // instance address on a merge or rebase PR is no longer flagged, because the
+  // PR description is a different string. Every other authored surface keeps
+  // the half — title, description, branch, and the commit subject, which under
+  // a squash merge *is* the PR title, so the string that becomes permanent
+  // history is still covered on both the surface it is written on and the
+  // surface it lands on.
   //
   // Same one-pass shape as the subject, and for the same reason: the open tier
   // needs the configured tier's hits *for this body*. A body that says
@@ -1156,9 +1212,6 @@ export function checkInternalRefs({
   }
   for (const [body, { hits, location }] of bodies) {
     unknownReport('A commit message body', location, body, owned, hits, BODY_REMEDY);
-    if (findInstanceHosts(body).length > 0) {
-      hostReport('A commit message body', location, body, BODY_REMEDY);
-    }
   }
 
   // --- Surface 5: pull request comments ------------------------------------
@@ -1228,9 +1281,11 @@ export function checkInternalRefs({
   //
   // The instance-address rule stops here, on purpose. 664 files on master use
   // `localhost` in the e2e and dev surface, and a test that asserts a service
-  // binds `127.0.0.1` is the code working. Authored text is where the address
-  // is a leak; a diff line is where it is usually the subject matter. Only the
-  // identifier half of the rule applies to the diff.
+  // binds `127.0.0.1` is the code working. A diff line is where the address is
+  // usually the subject matter. Only the identifier half of the rule applies to
+  // the diff — and the address half's other two stopping points are this one
+  // and the commit body, each for the same reason reached separately. See the
+  // header's "the address half stops before the commit body".
 
   const allowReasons = new Map(ALLOWLIST.filter((e) => e && e.path && e.reason).map((e) => [e.path, e.reason]));
   const allowless = ALLOWLIST.filter((e) => !e || !e.path || !e.reason);
