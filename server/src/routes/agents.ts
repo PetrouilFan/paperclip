@@ -7393,7 +7393,17 @@ export function agentRoutes(
       eq(heartbeatRuns.companyId, issue.companyId),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
     )).orderBy(sql`case when ${heartbeatRuns.id} = ${issue.executionRunId} then 0 when ${heartbeatRuns.status} = 'running' then 1 else 2 end`, desc(heartbeatRuns.createdAt)).limit(1);
-    res.json(run ? { runId: run.id, agentId: run.agentId, recoveryAction: await issueRecoveryActionService(db).getActiveForIssue(issue.companyId, issue.id), execution: await executionProjectionForRun(db, issue.companyId, run.id) } : null);
+    res.json(run ? {
+      runId: run.id,
+      agentId: run.agentId,
+      recoveryAction: await issueRecoveryActionService(db).getActiveForIssue(issue.companyId, issue.id),
+      // `recoveryAction` is the active action. A resolved action can still be the
+      // hold this issue is under, and that hold is what dispatch enforces, so it
+      // needs its own field: without it this route reports no action and no owner
+      // for an issue the write path is refusing to move.
+      executionHold: await getExecutionBlocker(db, issue.companyId, issue.id),
+      execution: await executionProjectionForRun(db, issue.companyId, run.id),
+    } : null);
   });
 
   router.get("/issues/:issueId/active-run", async (req, res) => {

@@ -85,6 +85,52 @@ describe("execution truth projection", () => {
     expect(source.status).toBe("failed");
   });
 
+  it("reports a resolved automatic-recovery row the gate still holds as a board-owned hold", () => {
+    const stopped = run({ id: "held", status: "failed", errorCode: "interrupted" });
+    const resolvedHold = {
+      id: "action-1",
+      status: "resolved" as const,
+      cause: "legacy_execution_requires_reconciliation",
+      nextAction: "Automatic recovery stopped. Recorded work is preserved.",
+      evidence: {
+        runId: "held",
+        automaticRecovery: { replay: "blocked", policy: "preserve_without_replay_v1" },
+      },
+    };
+    // The gate counts this resolved row, so the projection must name an owner and
+    // permit recovery inspection rather than reading as having nothing to inspect.
+    expect(projectExecution(stopped, undefined, [], resolvedHold, now, new Set(["action-1"])))
+      .toMatchObject({
+        phase: "recovery_needed",
+        label: "Stopped",
+        cause: "legacy_execution_requires_reconciliation",
+        recoveryOwner: "board",
+        permittedActions: ["inspect_run", "inspect_recovery"],
+      });
+    // Negative control: the same resolved row once the gate stops counting it is
+    // closed bookkeeping, so it must claim no owner and no recovery affordance.
+    expect(projectExecution(stopped, undefined, [], resolvedHold, now, new Set()))
+      .toMatchObject({
+        phase: "recovery_needed",
+        label: "Stopped",
+        recoveryOwner: null,
+        permittedActions: ["inspect_run"],
+      });
+    // A delivered explicit continuation outranks the hold bookkeeping: the user
+    // already decided, so the newer attempt must not read as blocked.
+    expect(projectExecution(stopped, undefined, [], {
+      ...resolvedHold,
+      evidence: {
+        ...resolvedHold.evidence,
+        explicitUserContinuation: { previousRunId: "held", runId: "next" },
+      },
+    }, now, new Set(["action-1"]))).toMatchObject({
+      phase: "completed",
+      label: "Continued in another run",
+      successorRunId: "next",
+    });
+  });
+
   it("shows a reconciled continuation as queued until its durable delivery is recorded", () => {
     const action = {
       cause: "native_session_retry_exhausted",

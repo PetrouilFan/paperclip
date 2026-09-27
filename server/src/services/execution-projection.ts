@@ -8,6 +8,7 @@ import {
 } from "@paperclipai/db";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
+import { executionBlockerPredicate } from "./execution-blocker.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 const text = (v: unknown) => (typeof v === "string" ? v : null);
 const executionRunColumns = {
@@ -39,7 +40,7 @@ type Recovery = Pick<
   "cause" | "nextAction"
 > &
   Partial<
-    Pick<typeof issueRecoveryActions.$inferSelect, "status" | "evidence">
+    Pick<typeof issueRecoveryActions.$inferSelect, "id" | "status" | "evidence">
   >;
 
 /** Batched reads; list consumers do not perform per-task polling. */
@@ -95,6 +96,7 @@ export async function executionProjectionsForRuns(
     ? await db
         .select({
           issueId: issueRecoveryActions.sourceIssueId,
+          id: issueRecoveryActions.id,
           cause: issueRecoveryActions.cause,
           nextAction: issueRecoveryActions.nextAction,
           evidence: issueRecoveryActions.evidence,
@@ -114,6 +116,26 @@ export async function executionProjectionsForRuns(
         )
         .orderBy(desc(issueRecoveryActions.updatedAt))
     : [];
+  // The rows dispatch actually refuses on, read through the enforcement predicate
+  // itself rather than a second statement of the same rule. A resolved action can
+  // still be the hold, and the projection has to agree with the gate that blocks
+  // the issue rather than re-derive what the gate believes.
+  const holdingActionIds = new Set(
+    issueIds.length
+      ? (
+          await db
+            .select({ id: issueRecoveryActions.id })
+            .from(issueRecoveryActions)
+            .where(
+              and(
+                eq(issueRecoveryActions.companyId, companyId),
+                inArray(issueRecoveryActions.sourceIssueId, issueIds),
+                executionBlockerPredicate(),
+              ),
+            )
+        ).map((row) => row.id)
+      : [],
+  );
   const coordinatorByRun = new Map(coordinators.map((row) => [row.runId, row]));
   for (const run of runs) {
     const issueId = run.nativeIssueId ?? text(run.contextSnapshot?.issueId);
@@ -133,6 +155,7 @@ export async function executionProjectionsForRuns(
         pending.filter((row) => row.issueId === issueId),
         action,
         now,
+        holdingActionIds,
       ),
     );
   }
@@ -156,6 +179,12 @@ export function projectExecution(
   pending: Array<{ kind: string }>,
   recoveryAction: Recovery | undefined,
   now = new Date(),
+  /**
+   * Ids of the recovery actions the execution gate is currently enforcing, read
+   * through `executionBlockerPredicate`. A resolved action can be in this set, and
+   * that is the only thing that makes it a hold rather than closed bookkeeping.
+   */
+  holdingActionIds: ReadonlySet<string> = new Set(),
 ): ExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
@@ -194,6 +223,14 @@ export function projectExecution(
       projection.successorRunId = explicitSuccessor;
       projection.nextAction = null;
       return set("completed", "Continued in another run");
+    }
+    // A resolved automatic-recovery row is not automatically free. When the gate
+    // still counts it as a hold, this projection has to name an owner and permit
+    // recovery inspection too, or the payload reports no owner and nothing to
+    // inspect for an issue dispatch is refusing to move.
+    if (recoveryAction.id && holdingActionIds.has(recoveryAction.id)) {
+      projection.recoveryOwner = "board";
+      projection.permittedActions.push("inspect_recovery");
     }
     // Diagnostic projection only: no user decision or replay affordance.
     return set("recovery_needed", "Stopped");

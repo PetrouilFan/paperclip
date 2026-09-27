@@ -638,6 +638,15 @@ const heartbeatRunIdParamSchema = z.string()
 
 const ErrorSchema = registry.register("Error", z.object({ error: z.string() }));
 
+const executionBlockerResponseShape = z.object({
+  recoveryActionId: z.string().nullable(),
+  runId: z.string().nullable(),
+  agentId: z.string().nullable(),
+  cause: z.string(),
+  nextAction: z.string(),
+});
+registry.register("ExecutionBlocker", executionBlockerResponseShape);
+
 const responses = {
   ok: (schema: z.ZodTypeAny = z.record(z.string(), z.unknown())) => ({
     description: "Success",
@@ -6731,9 +6740,19 @@ registry.registerPath({
   path: "/api/issues/{issueId}/execution",
   tags: ["runs"],
   summary: "Get the current issue execution and permitted recovery actions",
+  description:
+    "`recoveryAction` is the active recovery action. `executionHold` is the hold dispatch " +
+    "actually enforces, which a resolved action can still carry; the two differ whenever a " +
+    "resolved action closed with automatic recovery replay blocked.",
   request: { params: z.object({ issueId: z.string() }) },
   responses: {
-    200: r.ok(),
+    200: r.ok(z.object({
+      runId: z.string(),
+      agentId: z.string(),
+      recoveryAction: z.record(z.string(), z.unknown()).nullable(),
+      executionHold: executionBlockerResponseShape.nullable(),
+      execution: z.record(z.string(), z.unknown()).nullable(),
+    }).nullable()),
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
