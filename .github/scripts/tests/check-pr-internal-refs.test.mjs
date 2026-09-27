@@ -426,6 +426,86 @@ test('a commit subject is de-duplicated like every other surface', () => {
   );
 });
 
+test('a commit message body is de-duplicated like every other surface', () => {
+  // The subject/author that split the body off to give it its own remedy also
+  // left it handing the open tier an empty `alreadyFound`, so the same
+  // collision that was fixed on the subject was still live one line below it.
+  // A body is authored text on exactly the terms a subject is, so `fix:` — both
+  // a conventional-commit type and a reference verb — reaches both matchers here
+  // too, and the second paragraph is the same false one.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ sha: 'a1b2c3d4', commit: { message: 'chore(shared): tidy\n\ncarries on from fix: PET-9003' } }],
+  });
+  assert.equal(result.passed, false);
+  assert.equal(
+    result.failures.filter((f) => f.includes('A commit message body')).length,
+    1,
+    `one id is one finding on every surface, the body included:\n${result.failures.join('\n')}`,
+  );
+  assert.doesNotMatch(
+    result.failures.join('\n'),
+    /namespace this repository has no exemption/,
+    `a configured prefix must never be reported as unconfigured:\n${result.failures.join('\n')}`,
+  );
+  // The handoff subtracts; it does not mute the surface. An id past the
+  // configured list is still reported from a body.
+  const past = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ sha: 'a1b2c3d4', commit: { message: 'chore(shared): tidy\n\ncarries on from fix: TASK-482' } }],
+  });
+  assert.equal(past.passed, false);
+  assert.match(past.failures.join('\n'), /A commit message body/);
+  assert.match(past.failures.join('\n'), /TASK-482/);
+});
+
+test('two commits carrying the same text are one finding, not two', () => {
+  // The subject list is keyed by the subject text, so a rebase that replays
+  // `fix: <same subject>` across a series — the common shape for a fix-up
+  // series, not an exotic one — does not produce one paragraph per commit. The
+  // same holds for the body. Before the key was the text, each commit in the
+  // series reported separately and the author was told the same thing N times.
+  const shared = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'aaaaaaaa', commit: { message: 'fix: PET-9003 edge case' } },
+      { sha: 'bbbbbbbb', commit: { message: 'fix: PET-9003 edge case' } },
+      { sha: 'cccccccc', commit: { message: 'fix: PET-9003 edge case' } },
+    ],
+  });
+  assert.equal(shared.passed, false);
+  assert.equal(
+    shared.failures.filter((f) => f.includes('A commit subject')).length,
+    1,
+    `a repeated subject is one finding:\n${shared.failures.join('\n')}`,
+  );
+  const sharedBody = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'aaaaaaaa', commit: { message: 'chore: tidy\n\ncarries on from PET-9003' } },
+      { sha: 'bbbbbbbb', commit: { message: 'chore: tidy\n\ncarries on from PET-9003' } },
+    ],
+  });
+  assert.equal(sharedBody.passed, false);
+  assert.equal(
+    sharedBody.failures.filter((f) => f.includes('A commit message body')).length,
+    1,
+    `a repeated body is one finding:\n${sharedBody.failures.join('\n')}`,
+  );
+  // Collapsing is not muting: an id that appears on only one of the two
+  // commits is still found, and it is still attributed to that commit.
+  const oneOf = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'aaaaaaaa', commit: { message: 'chore: tidy\n\nnothing here' } },
+      { sha: 'bbbbbbbb', commit: { message: 'chore: tidy\n\ncarries on from PET-9004' } },
+    ],
+  });
+  assert.equal(oneOf.passed, false);
+  assert.match(oneOf.failures.join('\n'), /PET-9004/);
+  assert.match(oneOf.failures.join('\n'), /bbbbbbbb/);
+});
+
 test('every reference position fires, and each is one an id is written into', () => {
   const cases = [
     ['#TASK-482', 'a `#` reference'],

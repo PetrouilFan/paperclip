@@ -853,7 +853,6 @@ export function checkInternalRefs({
 
   // --- Surface 4: commit messages, subject and body -----------------------
   // A squash collapses the branch into the PR title, but a merge or a rebase
-  // A squash collapses the branch into the PR title, but a merge or a rebase
   // preserves these messages whole, and a reviewer reading `git log` before
   // merging reads the body today, not just the subject.
   //
@@ -881,34 +880,38 @@ export function checkInternalRefs({
 
   // One pass builds the subject list, because the open tier has to be handed
   // the configured tier's hits *for the same subject*. `fix:` is a reference
-  // verb, so `fix: PET-9003` is visible to both matchers; without the handoff
-  // the author gets two paragraphs, and the second is false — it calls a
-  // namespace this repository has an exemption for one it has none for.
-  // `alreadyFound` is subtracted, so one id is one finding on every surface.
-  const subjectHits = new Map();
-  const subjectOrder = [];
+  // verb, so a conventional-commit type that is also a verb is visible to both
+  // matchers; without the handoff the author gets two paragraphs, and the
+  // second is false — it calls a namespace this repository has an exemption for
+  // one it has none for. `alreadyFound` is subtracted, so one id is one finding
+  // on every surface.
+  //
+  // The Map is keyed by the subject text and iterated in insertion order: the
+  // key is what makes two commits that share a subject one finding rather than
+  // two, and the order is what the report reads for its location. Keying on the
+  // text rather than on the index is deliberate — `git rebase -i` and a rebase
+  // -merge both replay a whole series of `fix: <same subject>`, and that is the
+  // common case, not the exotic one.
+  const subjects = new Map();
   for (const commit of commits ?? []) {
     const message = commit?.commit?.message;
     if (typeof message !== 'string') continue;
     const firstLine = message.split('\n')[0];
-    const hits = [...findAll(firstLine, separated), ...findAll(firstLine, compact)];
-    subjectOrder.push(firstLine);
-    if (hits.length === 0) continue;
-    subjectHits.set(firstLine, hits);
+    if (subjects.has(firstLine)) continue;
+    subjects.set(firstLine, [...findAll(firstLine, separated), ...findAll(firstLine, compact)]);
   }
-  const commitHits = [...subjectHits.values()].flat();
+  const commitHits = [...subjects.values()].flat();
   if (commitHits.length > 0) {
-    report('A commit subject', subjectOrder.find((l) => subjectHits.has(l))?.trim().slice(0, 80),
-      commitHits, SUBJECT_REMEDY);
+    const first = [...subjects.entries()].find(([, hits]) => hits.length > 0);
+    report('A commit subject', first?.[0].trim().slice(0, 80), commitHits, SUBJECT_REMEDY);
   }
-  for (const firstLine of subjectOrder) {
+  for (const [firstLine, hits] of subjects) {
     // Re-derived here rather than carried from a per-commit loop: the one-pass
-    // shape above no longer binds a `location`, and the three calls below all
+    // shape above no longer binds a `location`, and the two calls below both
     // need one. Omit it and the file still parses and the suite still passes —
     // the address check on this surface just stops firing.
     const location = firstLine.trim().slice(0, 80);
-    unknownReport('A commit subject', location, firstLine, owned,
-      subjectHits.get(firstLine) ?? [], SUBJECT_REMEDY);
+    unknownReport('A commit subject', location, firstLine, owned, hits, SUBJECT_REMEDY);
     if (findInstanceHosts(firstLine).length > 0) {
       hostReport('A commit subject', location, firstLine, SUBJECT_REMEDY);
     }
@@ -916,28 +919,35 @@ export function checkInternalRefs({
 
   // The body, on both halves. `lines.slice(1)` deliberately excludes the
   // subject, so one identifier in the subject is one finding and not two.
-  const commitBodyHits = [];
-  const commitBodyLocations = [];
+  //
+  // Same one-pass shape as the subject, and for the same reason: the open tier
+  // needs the configured tier's hits *for this body*. A body that says
+  // `chore: tidy\n\ncarries on from the configured prefix` is visible to both
+  // matchers exactly as the subject is, and handing the open tier an empty
+  // `alreadyFound` there produces the same second, false paragraph this surface
+  // was split off to avoid. The split that #105 made is subject-versus-body for
+  // the *remedy*; it is not a licence for the two surfaces to disagree about
+  // de-duplication.
+  const bodies = new Map();
   for (const commit of commits ?? []) {
     const message = commit?.commit?.message;
     if (typeof message !== 'string') continue;
     const body = message.split('\n').slice(1).join('\n');
     if (!body.trim()) continue;
-    const hits = [...findAll(body, separated), ...findAll(body, compact)];
-    if (hits.length === 0) continue;
-    commitBodyHits.push(...hits);
-    commitBodyLocations.push(`${commit?.sha ? String(commit.sha).slice(0, 8) : 'a commit'}: ${body.trim().slice(0, 72)}`);
+    if (bodies.has(body)) continue;
+    const sha = commit?.sha ? String(commit.sha).slice(0, 8) : 'a commit';
+    bodies.set(body, {
+      hits: [...findAll(body, separated), ...findAll(body, compact)],
+      location: `${sha}: ${body.trim().slice(0, 72)}`,
+    });
   }
+  const commitBodyHits = [...bodies.values()].flatMap((b) => b.hits);
   if (commitBodyHits.length > 0) {
-    report('A commit message body', commitBodyLocations[0], commitBodyHits, BODY_REMEDY);
+    const first = [...bodies.values()].find((b) => b.hits.length > 0);
+    report('A commit message body', first?.location, commitBodyHits, BODY_REMEDY);
   }
-  for (const commit of commits ?? []) {
-    const message = commit?.commit?.message;
-    if (typeof message !== 'string') continue;
-    const body = message.split('\n').slice(1).join('\n');
-    if (!body.trim()) continue;
-    const location = `${commit?.sha ? String(commit.sha).slice(0, 8) : 'a commit'}: ${body.trim().slice(0, 72)}`;
-    unknownReport('A commit message body', location, body, owned, [], BODY_REMEDY);
+  for (const [body, { hits, location }] of bodies) {
+    unknownReport('A commit message body', location, body, owned, hits, BODY_REMEDY);
     if (findInstanceHosts(body).length > 0) {
       hostReport('A commit message body', location, body, BODY_REMEDY);
     }
