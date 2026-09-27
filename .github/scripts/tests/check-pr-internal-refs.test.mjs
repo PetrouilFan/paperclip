@@ -1155,6 +1155,54 @@ test('the identifier half still reads a commit body, so narrowing the address ha
   assert.match(result.failures.join('\n'), /PET-9001/);
 });
 
+test('the address half stays off the commit body, and masking the body is not what put it there', () => {
+  // Two independent decisions meet on this one loop, and this test is the
+  // boundary between them.
+  //
+  // `60f3a15a3` removed `findInstanceHosts` from the commit body on its own
+  // reasoning, recorded in that commit: the address half flags 31 bodies over
+  // the commits on `master` and all 31 are a commit whose subject matter is the
+  // address. Separately, `e03b8e508` added `maskInlineCodeSpans` and passed
+  // `{ maskInlineCode: true }` to the *identifier* half's call on the same
+  // loop, so a quoted shape in a body is not a reference.
+  //
+  // Those are different halves of one rule, and a later reader must not be able
+  // to conclude that the masking is what stopped the address half. The
+  // assertion below is the address half's; stripping the mask leaves it green,
+  // and re-adding `findInstanceHosts` reds it. Non-vacuity by mutation.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'ddd44444', commit: { message: 'fix(api): survive a restart\n\nReached at http://localhost:3100/api/health\n' } },
+    ],
+  });
+  assert.equal(result.passed, true, 'the address half must not reach the commit body');
+  const joined = result.failures.join('\n');
+  assert.doesNotMatch(joined, /an address that resolves to one machine/);
+  assert.doesNotMatch(joined, /localhost/);
+});
+
+test('masking the commit body does not mask the identifier half, so a declared id in a code span is still a finding', () => {
+  // The exemption is the open-shape tier's *path* rule and nothing else. If the
+  // mask ever reached the configured tier, a commit body could name this
+  // instance's own identifiers freely, which is a real leak and not a
+  // judgement call — so this has to fail loudly rather than drift.
+  //
+  // Paired with the test above: the mask must not switch the address half off,
+  // and it must not switch the configured half off either. The body is masked
+  // for one tier only, and the other two tiers are untouched.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'eee55555', commit: { message: 'fix(api): survive a restart\n\nCarries on from `PET-9001` in the handoff.\n' } },
+    ],
+  });
+  assert.equal(result.passed, false, 'a declared identifier in a code span is still a finding');
+  const joined = result.failures.join('\n');
+  assert.match(joined, /A commit message body carries/);
+  assert.match(joined, /PET-9001/);
+});
+
 test('narrowing the commit body did not take the address coverage off the other three surfaces', () => {
   // The regression this change could plausibly introduce, and the one worth a
   // test: the same address in a title, a description and a commit subject must
