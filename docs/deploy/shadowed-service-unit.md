@@ -468,6 +468,152 @@ mtime is 2026-09-25 00:57 — the timestamp of the in-place `dist` patches in
 same install, reached by different checks. `/proc/<pid>/exe` is `/usr/bin/node`,
 which is the interpreter and says nothing about the target.
 
+## A probe inherits the live notify socket, and a datagram cannot be aimed
+
+Every diagnostic run on this plane is an **agent run**, so it inherits
+`NOTIFY_SOCKET` from the control plane *and* sits inside the control plane unit's
+cgroup. Both facts are one line each, and together they are a capability:
+
+```sh
+$ env | grep -c '^NOTIFY_SOCKET='
+1                                    # /run/user/1000/systemd/notify
+$ cat /proc/self/cgroup
+0::/user.slice/user-1000.slice/user@1000.service/app.slice/paperclipai.service
+$ systemctl --user show paperclipai.service -p NotifyAccess
+NotifyAccess=all
+```
+
+So **any** harness that talks to systemd IPC — a `systemd-notify` call, a
+`LISTEN_FDS` reader, a `READY=1` from a boot probe — is holding a live handle on
+the unit it is running inside. Nothing about being a probe makes that safe, and
+`STATUS=` is the cheapest datagram there is.
+
+The correction to the obvious mental model, measured on this host 2026-09-27, is
+worth more than the warning. It is tempting to think a notify socket belongs to a
+unit and that writing to the control plane's socket is what endangers it. It does
+not work that way:
+
+```sh
+# A throwaway unit's own child, and the control plane's own child:
+$ tr '\0' '\n' < /proc/$(systemctl --user show pc-probe-x.service -p MainPID --value)/environ \
+    | grep NOTIFY_SOCKET
+NOTIFY_SOCKET=/run/user/1000/systemd/notify
+$ tr '\0' '\n' < /proc/$(systemctl --user show paperclipai.service -p MainPID --value)/environ \
+    | grep NOTIFY_SOCKET
+NOTIFY_SOCKET=/run/user/1000/systemd/notify
+```
+
+**Every unit of one manager shares a single notify socket**, and systemd attributes
+a datagram to the unit the *sending process* is in. Sending from unit A and reading
+the `StatusText` of A, of an unrelated unit B, and of the control plane:
+
+| sender's cgroup | A's `StatusText` | B's | `paperclipai.service` |
+|---|---|---|---|
+| `pc-probe-own-A.service` | `i-am-the-sender` | empty | unchanged |
+| inside a run | — | — | **overwritten** |
+
+Two consequences, and they pull in the opposite direction from the obvious one:
+
+1. **You cannot aim a datagram at another unit.** "Set unit X's status" is a
+   category error, not a risky operation. Any probe that believes it is talking to
+   some other unit is talking to itself.
+2. **The only thing that matters is which cgroup the sender is in.** There is no
+   dangerous socket; there is a dangerous *position*. A probe is safe in a
+   throwaway unit and unsafe everywhere else — including in an agent run
+   (`app.slice/paperclipai.service`) and in your own terminal. A terminal's exact
+   position depends on how you logged in: a plain login session puts it in
+   `user@1000.service`, and a desktop session puts it in a per-application scope
+   (`app-org.kde.konsole-2142.scope`). Both are refused, for different reasons, and
+   the guard prints which one applies.
+
+### The supported way to send one
+
+`scripts/paperclip-notify-probe.sh` is the shared guard, and it is the thing to
+call before any harness touches systemd IPC:
+
+```sh
+# What would this send do, and from where?
+scripts/paperclip-notify-probe.sh info
+
+# Refuse to send from a long-lived unit's cgroup. Exit 0 only if allowed.
+scripts/paperclip-notify-probe.sh guard /run/user/$(id -u)/systemd/notify
+
+# The one supported send: the probe itself runs inside a throwaway unit, so the
+# datagram is applied to that unit and to nothing else.
+systemd-run --user --unit="pc-probe-$$" --property=Type=exec \
+  --property=NotifyAccess=all \
+  scripts/paperclip-notify-probe.sh notify \
+    /run/user/$(id -u)/systemd/notify "STATUS=probe-$$"
+```
+
+`--property=Type=exec` rather than `Type=notify`, because a `Type=notify` unit
+stays `activating` until it sends `READY=1`, which the guard refuses — so it would
+fail on `TimeoutStartSec` every time. `Type=exec` with `NotifyAccess=all` is live
+immediately and accepts a `STATUS=` at any moment.
+
+The guard sends only `STATUS=`, `ERRNO=` and `BUSERROR=`, and refuses every other
+field with no override, so wrapping a probe buys a throwaway unit and not a licence
+to change anything about the unit that sent it. It is an **allowlist**, not a list
+of known-bad fields, and the reason is measured: an earlier version named
+`STOPPING=`, `RELOADING=`, `READY=`, `WATCHDOG=`, `WATCHDOG_USEC=` and
+`EXTEND_TIMEOUT_USEC=`, and two state-changing fields were missing from it.
+`MAINPID=` re-points a unit's recorded main process — a throwaway unit's `MainPID`
+went 226683 → 226685 after one probe wrote it — which is exactly the process a stop
+signals under `KillMode=process` (rule 6 below). `NOTIFYACCESS=` re-opens the
+unit's own notify access mid-flight, which is the setting this whole section is
+about. Only refusing the fields nobody thought of holds up over time.
+
+### What the guard's own limits are, so nobody mistakes it for a chokepoint
+
+It is a guard on a script, and a script's guard is worth exactly what its input is
+worth. Two properties are load-bearing, and the first version of this guard got both
+of them wrong in ways that read as security properties in the file they lived in:
+
+- **It must not take its cgroup from a file the caller named.** The sender's cgroup
+  comes from `/proc/self/cgroup`, and the control unit's from
+  `/proc/$(systemctl --user show paperclipai.service -p MainPID --value)/cgroup`.
+  The first version read the sender's cgroup *file* from the environment, so a
+  process inside the live unit could name a file it had written a moment earlier and
+  get `ALLOWED`.
+- **It must not take its ownership proof from a directory.** "Is this unit one
+  systemd created?" was asked as `[ -e /run/user/$(id -u)/systemd/transient/$u ]`.
+  That directory is `drwxr-xr-x` and owned by you, so a single `mkdir` of
+  `paperclipai.service` made the guard print
+  `paperclipai.service (throwaway, safe to send from)` and exit 0. A bare existence
+  test is not a fact about the world. It is now asked of systemd, and confirmed by
+  the unit's own `MainPID` being a running process in the sender's cgroup.
+
+Both were replayed against the shipped guard on this host on 2026-09-27, with the
+forged directory and both environment variables set at once: still refused, still
+naming the unit, and the control plane's `StatusText` byte-identical afterwards.
+That replay is part F of `scripts/paperclip-notify-probe-proof.sh`, so it is a check
+rather than a story.
+
+There is a fourth position worth knowing about: a **session scope** cannot be
+verified at all, because systemd reports no `MainPID` for a scope. The guard refuses
+it as unprovable. Note that a scope *does* have an entry in the transient runtime
+directory, so the existence test above used to call it disposable — it is not, and
+`UnitFileState=transient` does not separate the two cases either, because both a
+throwaway unit and a scope report `transient` with an empty `SourcePath`.
+
+`scripts/paperclip-notify-probe-proof.sh` is the end-to-end proof against a real
+user manager — A and F are the refusals, B the allowed position, D and E the field
+refusals, C the byte-comparison on the control plane at the end. It re-demonstrates
+the attribution table above on whatever host it runs on, so none of this has to be
+taken on trust. `scripts/paperclip-notify-probe.test.mjs` is the contract suite and
+runs in the PR gate; it needs no manager and no root, because the decision is a pure
+function of four facts and `selftest` hands it those four as arguments. The proof
+script is what proves the attribution claim; the contract suite is what proves the
+decision. Neither alone is the other.
+
+**This is a mitigation, not the fix.** The two durable halves are the server-side
+scrub in `sanitizeInheritedPaperclipEnv`
+(`packages/adapter-utils/src/server-utils.ts`), which drops `NOTIFY_SOCKET` and
+the `LISTEN_*` triple from a run child's environment, and the unit-side
+`NotifyAccess=main`, which makes systemd accept a datagram only from the main
+process. The guard covers what neither does: harnesses the control plane did not
+spawn, on a host where the unit is still `NotifyAccess=all`.
+
 ## Rules of thumb
 
 1. **A green `Service definition` is a statement about one file.** It is not a
@@ -478,7 +624,7 @@ which is the interpreter and says nothing about the target.
    list the main file built. Ten drop-ins is a normal, healthy, completely
    ungreppable configuration.
 3. **Resolve the `ExecStart` target before trusting it.** An existing executable
-   file is all the installer checks; a symlink satisfies that and a package install
+   file is all the installer checks. A symlink satisfies that and a package install
    can re-point it with the unit untouched.
 4. **A missing `hot-restart-report.json` is not a clean restart.** It is a restart
    whose run set was never recorded. Correlate the report's `requestedAt` against
@@ -491,3 +637,6 @@ which is the interpreter and says nothing about the target.
 7. **Back the unit up before any re-render, and re-read `systemctl --user show`
    after the reload.** The re-render fixes the file and leaves every drop-in
    standing.
+8. **A notify datagram edits the unit that sent it.** There is no socket to aim at
+   and no per-unit socket to check — check the sender's cgroup, or run the probe in
+   a throwaway unit.
