@@ -1251,9 +1251,13 @@ test('masking the commit body does not mask the identifier half, so a declared i
     ],
   });
   assert.equal(result.passed, false, 'a declared identifier in a code span is still a finding');
-  const joined = result.failures.join('\n');
+  // The finding must not print what it matched. A report that quoted the
+  // literal would be a comment carrying the reference, so the next run finds
+  // it and the pull request stays red. The mask is asserted below as well, so a
+  // finding that matched nothing and printed nothing cannot pass this vacuously.
+  const joined = assertNoEcho(result, ['PET-9001']);
   assert.match(joined, /A commit message body carries/);
-  assert.match(joined, /PET-9001/);
+  assert.match(joined, /███████/, 'the mask is visible in the report, so it is a mask and not a deletion');
 });
 
 test('narrowing the commit body did not take the address coverage off the other three surfaces', () => {
