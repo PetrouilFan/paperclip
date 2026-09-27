@@ -3444,6 +3444,17 @@ export function sanitizeInheritedPaperclipEnv(
     if (key === "PAPERCLIP_LISTEN_PORT") continue;
     delete env[key];
   }
+  // systemd's own IPC handles are an operator capability, not run
+  // configuration. A run child that inherits NOTIFY_SOCKET can send STOPPING=1
+  // to the control plane's unit and stop the server mid-flight, and the
+  // LISTEN_* triple hands it the unit's socket-activated file descriptors
+  // instead. Neither has any use inside a run, so neither is inherited. This
+  // holds regardless of the unit's NotifyAccess= setting; the unit-side
+  // NotifyAccess=main is the other half of the same fix.
+  delete env.NOTIFY_SOCKET;
+  delete env.LISTEN_PID;
+  delete env.LISTEN_FDS;
+  delete env.LISTEN_FDNAMES;
   return env;
 }
 
