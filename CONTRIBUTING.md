@@ -78,6 +78,8 @@ If an internal issue captured useful context, restate that context in plain Engl
 
 Comments are scanned too, and that changes one habit: **edit the comment, do not reply about it.** A reply that says "fixed the `PAPA-123` reference above" is itself a comment carrying a `PAPA-123` reference, so it becomes a new finding on the next run and the pull request stays red. If the comment is not yours — a reviewer's, or a bot's — you cannot edit it, so the finding stays until that person edits theirs.
 
+The gate reads every changed file, including large generated ones. GitHub's API does not return a diff for a very large file, so the gate fetches the published file and scans that in full instead — a generated migration snapshot is read line by line like any other file, and an id inside one is a finding. There is no exemption for generated files and no allowlist entry you need to add: if the gate reports a file it could not read at all, that is a real limit on the file's size, not a rule about what the file is.
+
 ### Branch Naming
 
 Tooling (including Paperclip) often names a working branch after an internal issue and task — e.g. `PAPA-42-why-did-this-break`. That name leaks instance-local context, isn't meaningful to reviewers, and ends up as the public branch on your PR.

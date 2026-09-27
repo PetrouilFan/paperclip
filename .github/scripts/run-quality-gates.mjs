@@ -9,7 +9,7 @@
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
-import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
+import { fetchAllPullRequestFiles, fetchWholeFileContents } from './fetch-pr-files.mjs';
 import { fetchAllPullRequestComments } from './fetch-pr-comments.mjs';
 import { checkTemplate } from './check-pr-template.mjs';
 import { checkLinkedIssue } from './check-pr-linked-issue.mjs';
@@ -23,6 +23,7 @@ import {
   GATE_COMMENT_LOGINS,
   GATE_COMMENT_SIGNATURE as COMMENT_SIGNATURE,
   checkInternalRefs,
+  filesNeedingWholeContent,
 } from './check-pr-internal-refs.mjs';
 
 export { GATE_COMMENT_LOGINS as COMMITPERCLIP_LOGINS };
@@ -197,6 +198,28 @@ async function main() {
     console.error(`comment lookup skipped: ${error.message}`);
   }
 
+  // The second reader, for the one file class GitHub will not produce a patch
+  // for. Kept out of the `Promise.all` above and given its own allowed-to-fail
+  // handling for the same reason the commit and comment fetches are: a
+  // supplementary read must not be able to take down the gates that do block.
+  //
+  // It is also allowed to come back empty without consequence beyond coverage.
+  // The gate is handed the files it managed to read and reports the rest as
+  // unscannable, which is the verdict it gave before this existed — so the
+  // worst outcome of this fetch failing is the behaviour this repository already
+  // ships, and its absence cannot turn a red into a green.
+  const fileContents = await fetchWholeFileContents(
+    ghFetch,
+    GH_REPO,
+    filesNeedingWholeContent(files),
+    pr.head?.sha,
+    GH_TOKEN
+  );
+  const wholeFileCount = Object.keys(fileContents).length;
+  if (wholeFileCount > 0) {
+    console.error(`internal-reference gate: read ${wholeFileCount} file(s) whole because the patch did not arrive`);
+  }
+
   // The deployment's own commenter login, if it has one. The gate needs it for
   // the same reason `findExistingComment` does: on a repository that posts as a
   // login neither default list names, that login's comment is the gate's own
@@ -250,6 +273,7 @@ async function main() {
     commentsUnavailable,
     commentLogins: ownerLogins,
     files,
+    fileContents,
     prefixes: process.env.INTERNAL_REF_PREFIXES,
     productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,
   });
