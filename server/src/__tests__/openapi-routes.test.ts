@@ -1021,3 +1021,26 @@ describe("heartbeat run ID OpenAPI contract", () => {
     expect(checked).toBe(12);
   });
 });
+
+
+describe("blocker edge set OpenAPI contract", () => {
+  // The field was write-only for its whole public life: the spec taught an
+  // author the name to write, and no read documented it back, so an agent that
+  // wrote blockers correctly read `null` and filed a duplicate issue. These
+  // assertions fail if either spelling drops out of the published contract.
+  it("documents the blocker set on both the read and the write of a single issue", () => {
+    const spec: any = buildOpenApiSpec();
+    const path = spec.paths["/api/issues/{id}"];
+
+    expect(path.get.description).toContain("blockedByIssueIds");
+    expect(path.get.description).toContain("blockedBy");
+    // `[]` is the meaningful reading. Documenting only the field name leaves
+    // the null-versus-empty distinction that produced the false positives.
+    expect(path.get.description).toMatch(/\[\]/);
+
+    expect(path.patch.description).toContain("blockedByIssueIds");
+    // Replace, not append. An author who appends silently drops the blockers
+    // they did not resend.
+    expect(path.patch.description).toMatch(/replaces the whole/i);
+  });
+});
