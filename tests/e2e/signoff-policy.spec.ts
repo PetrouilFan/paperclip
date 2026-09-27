@@ -1,4 +1,9 @@
 import { test, expect, request as pwRequest, type APIRequestContext } from "@playwright/test";
+import {
+  ISSUE_BOUND_WAIT_MS,
+  invokeHeartbeatWithRetry,
+  type ObservedRun,
+} from "./heartbeat-run-diagnostics";
 
 /**
  * E2E: Signoff execution policy flow.
@@ -24,24 +29,6 @@ import { test, expect, request as pwRequest, type APIRequestContext } from "@pla
 const PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const COMPANY_NAME = `E2E-Signoff-${Date.now()}`;
-
-/**
- * How long `invokeHeartbeat` waits for the invoked run to become issue-bound.
- *
- * The run has to be admitted, take the legacy controller lease, and snapshot its
- * context before the harness can find it. A window that expires first reports a
- * harness failure for a server-side cause, so the default is sized for a loaded
- * CI runner rather than a developer's laptop. Override with
- * `PAPERCLIP_E2E_RUN_BOUND_TIMEOUT_MS` when a run is known to need longer.
- */
-const RUN_BOUND_TIMEOUT_MS = Number(process.env.PAPERCLIP_E2E_RUN_BOUND_TIMEOUT_MS ?? 15_000);
-
-/**
- * Terminal states a run can be in without ever becoming issue-bound. These are
- * server-side outcomes the harness cannot fix by waiting, so they are recorded
- * for the failure report instead of silently consuming the whole window.
- */
-const TERMINAL_RUN_STATUSES = new Set(["failed", "cancelled", "abandoned", "expired"]);
 
 interface AgentAuth {
   agentId: string;
@@ -76,134 +63,61 @@ async function createAgentRequest(token: string): Promise<APIRequestContext> {
 }
 
 /**
- * What the harness saw while it waited. Carried into the thrown message so a
- * failure names the run that actually died and why, rather than only the
- * harness that could not find a run.
- */
-interface RunBoundObservations {
-  /** Terminal, non-issue-bound runs keyed by run id, most recent last. */
-  terminalRuns: Map<string, string>;
-  /** Whether the issue lock ever pointed at a run for this agent. */
-  sawIssueLock: boolean;
-  /** Whether the agent's recent-runs listing ever returned anything. */
-  sawRecentRuns: boolean;
-}
-
-function describeObservations(
-  agentId: string,
-  issueId: string,
-  attempts: RunBoundObservations[],
-): string {
-  const lines = [
-    `No issue-bound heartbeat run became available for agent ${agentId} on issue ${issueId} within ${RUN_BOUND_TIMEOUT_MS}ms per attempt across ${attempts.length} invoke attempt(s).`,
-  ];
-  const anyTerminalRun = attempts.some((attempt) => attempt.terminalRuns.size > 0);
-  if (anyTerminalRun) {
-    lines.push(
-      "Candidate runs that reached a terminal state without binding to this issue. These are server-side outcomes, not a harness defect:",
-    );
-    // The agent's recent-runs listing spans the whole window, so the same dead
-    // run is re-observed on every attempt. Report each run once and name the
-    // attempts that saw it, or a two-attempt failure lists every run twice.
-    const merged = new Map<string, { description: string; attempts: number[] }>();
-    attempts.forEach((attempt, index) => {
-      for (const [runId, description] of attempt.terminalRuns) {
-        const existing = merged.get(runId);
-        if (existing) {
-          existing.attempts.push(index + 1);
-          // The latest observation wins: a run can gain an error code between polls.
-          if (description !== existing.description) existing.description = description;
-        } else {
-          merged.set(runId, { description, attempts: [index + 1] });
-        }
-      }
-    });
-    for (const [runId, { description, attempts: seenIn }] of merged) {
-      lines.push(`  - run ${runId}: ${description} (seen on attempt ${seenIn.join(", ")})`);
-    }
-    lines.push(
-      "Grep the same run id in the WebServer log for the underlying error. A lost legacy controller lease surfaces here as status=cancelled with no error code.",
-    );
-  } else {
-    lines.push(
-      "No candidate run reached a terminal state, so the run never became visible to the harness at all. That points at the invoke path, not at run setup.",
-    );
-  }
-  const sawIssueLock = attempts.some((attempt) => attempt.sawIssueLock);
-  const sawRecentRuns = attempts.some((attempt) => attempt.sawRecentRuns);
-  lines.push(`Issue lock observed for this agent: ${sawIssueLock ? "yes" : "no"}.`);
-  lines.push(`Agent recent-runs listing returned rows: ${sawRecentRuns ? "yes" : "no"}.`);
-  return lines.join("\n");
-}
-
-/**
  * Invoke a heartbeat run for an agent, returning the run ID.
  *
- * The invoke answers `202` and hands the run off to a background worker, so
- * there are two ways to end without a run id in hand:
- *
- *   1. The run was created but never became issue-bound. That is a server-side
- *      outcome (a lost legacy controller lease, for example), not a harness
- *      defect, and it must not read as one. We re-invoke once and, if that also
- *      fails, report every terminal run we saw with its status and error code.
- *   2. The invoke was skipped because a stage transition already replaced the
- *      previous executor's run with the participant's queued run. That run may
- *      already have released the issue lock, so we recover it by id.
+ * The invoke is accepted even when the run it starts never becomes usable: a
+ * run that loses the legacy controller lease is cancelled during setup, before
+ * it can snapshot the issue it was invoked for. The invoke then answers `202`
+ * with no `run.id` and the run is gone, which the wait below cannot distinguish
+ * from a run that is merely slow. So it retries the invoke once when every run
+ * it saw is terminal, and otherwise reports what it saw.
  */
 async function invokeHeartbeat(
   board: APIRequestContext,
   agentId: string,
   issueId: string,
 ): Promise<string> {
-  const attempts: RunBoundObservations[] = [];
-  const MAX_INVOKE_ATTEMPTS = 2;
+  const observations = new Map<string, ObservedRun>();
 
-  for (let attempt = 1; attempt <= MAX_INVOKE_ATTEMPTS; attempt++) {
-    const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
-      data: {
-        reason: "issue_assigned",
-        payload: { issueId, taskId: issueId, taskKey: issueId },
-      },
-    });
-    expect(res.ok()).toBe(true);
-    const run = await res.json();
-    if (typeof run.id === "string" && run.id.length > 0) return run.id;
-
-    const seen = await awaitIssueBoundRun(board, agentId, issueId, run);
-    if (typeof seen === "string") return seen;
-    attempts.push(seen);
-
-    // Only re-invoke when we positively observed a run that died before
-    // binding. Without that evidence the run may still be in flight, and a
-    // second invoke would race it for the issue lock rather than fix anything.
-    if (seen.terminalRuns.size === 0) break;
-  }
-
-  throw new Error(describeObservations(agentId, issueId, attempts));
+  return invokeHeartbeatWithRetry(
+    board,
+    BASE_URL,
+    agentId,
+    issueId,
+    observations,
+    () => invokeHeartbeatOnce(board, agentId, issueId, observations),
+  );
 }
 
 /**
- * Poll until a run bound to `issueId` for `agentId` is visible, or the window
- * expires. Returns the run id, an empty string when the issue is no longer
- * assigned to this agent (the negative-authorization cases), or the
- * observations gathered on expiry.
+ * One invoke plus its wait, recording every candidate run it observes.
+ *
+ * Returns the run ID to use, or `null` when no issue-bound run appeared. A
+ * negative-authorization case (the agent is deliberately not the assignee) also
+ * returns here, with whatever lock the issue already holds, so the caller keeps
+ * asserting on the server's rejection.
  */
-async function awaitIssueBoundRun(
+async function invokeHeartbeatOnce(
   board: APIRequestContext,
   agentId: string,
   issueId: string,
-  invokeResponse: Record<string, unknown>,
-): Promise<string | RunBoundObservations> {
+  observations: Map<string, ObservedRun>,
+): Promise<string | null> {
+  const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
+    data: {
+      reason: "issue_assigned",
+      payload: { issueId, taskId: issueId, taskKey: issueId },
+    },
+  });
+  expect(res.ok()).toBe(true);
+  const run = await res.json();
+  if (typeof run.id === "string" && run.id.length > 0) return run.id;
+
   // A stage transition can already be replacing the previous executor's run
   // with the participant's queued run. If the legacy invoke is skipped and
   // that run has already released the issue lock, recover it from the agent's
   // recent run receipts.
-  const seen: RunBoundObservations = {
-    terminalRuns: new Map(),
-    sawIssueLock: false,
-    sawRecentRuns: false,
-  };
-  const deadline = Date.now() + RUN_BOUND_TIMEOUT_MS;
+  const deadline = Date.now() + ISSUE_BOUND_WAIT_MS;
   do {
     const issueRunLock = await getIssueRunLockState(board, issueId);
     if (issueRunLock.assigneeAgentId !== agentId) {
@@ -213,17 +127,15 @@ async function awaitIssueBoundRun(
       return issueRunLock.executionRunId ?? issueRunLock.checkoutRunId ?? "";
     }
     const candidates = new Set<string>([
-      typeof invokeResponse.executionRunId === "string" ? invokeResponse.executionRunId : null,
+      run.executionRunId,
       issueRunLock.executionRunId,
       issueRunLock.checkoutRunId,
     ].filter((candidate): candidate is string => Boolean(candidate)));
-    if (issueRunLock.executionRunId || issueRunLock.checkoutRunId) seen.sawIssueLock = true;
     const recentRunsRes = await board.get(
       `${BASE_URL}/api/companies/${issueRunLock.companyId}/heartbeat-runs?agentId=${agentId}&limit=20`,
     );
     if (recentRunsRes.ok()) {
       const recentRuns = await recentRunsRes.json();
-      if (Array.isArray(recentRuns) && recentRuns.length > 0) seen.sawRecentRuns = true;
       for (const recentRun of Array.isArray(recentRuns) ? recentRuns : []) {
         if (typeof recentRun.id === "string") candidates.add(recentRun.id);
       }
@@ -233,33 +145,30 @@ async function awaitIssueBoundRun(
       if (!runRes.ok()) continue;
       const candidateRun = await runRes.json();
       const context = candidateRun.contextSnapshot ?? {};
-      if (
-        candidateRun.agentId === agentId &&
-        (context.issueId === issueId || context.taskId === issueId)
-      ) {
+      const boundIssueId =
+        typeof context.issueId === "string"
+          ? context.issueId
+          : typeof context.taskId === "string"
+            ? context.taskId
+            : null;
+      observations.set(candidateRun.id ?? candidate, {
+        id: candidateRun.id ?? candidate,
+        agentId: typeof candidateRun.agentId === "string" ? candidateRun.agentId : null,
+        status: typeof candidateRun.status === "string" ? candidateRun.status : null,
+        errorCode:
+          typeof candidateRun.errorCode === "string" ? candidateRun.errorCode : null,
+        executionStage:
+          typeof candidateRun.executionStage === "string" ? candidateRun.executionStage : null,
+        boundIssueId,
+      });
+      if (candidateRun.agentId === agentId && boundIssueId === issueId) {
         return candidate;
-      }
-      // Record why this run is not usable so an expiry reports the server-side
-      // cause instead of a bare "not available". Only terminal runs are kept:
-      // a run still in flight is the normal case, not a finding.
-      const status = typeof candidateRun.status === "string" ? candidateRun.status : "unknown";
-      if (TERMINAL_RUN_STATUSES.has(status)) {
-        const errorCode =
-          typeof candidateRun.errorCode === "string" && candidateRun.errorCode.length > 0
-            ? candidateRun.errorCode
-            : "no error code recorded";
-        const boundIssue = context.issueId ?? context.taskId ?? null;
-        const agentMatches = candidateRun.agentId === agentId ? "agent matches" : "DIFFERENT AGENT";
-        seen.terminalRuns.set(
-          candidate,
-          `status=${status} errorCode=${errorCode} issueId=${boundIssue ?? "none"} (${agentMatches})`,
-        );
       }
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
 
-  return seen;
+  return null;
 }
 
 async function getIssueRunLockState(board: APIRequestContext, issueId: string): Promise<IssueRunLockState> {
