@@ -1363,6 +1363,24 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/approvals/{id}/approve",
   "POST /api/approvals/{id}/reject",
   "POST /api/approvals/{id}/request-revision",
+
+  // Board-only by gate, not by URL shape. BOARD_ONLY_PREFIXES lists
+  // "/api/admin/", which matches the top-level admin surface and nothing
+  // nested under a resource path, so neither route below is caught by it --
+  // both start with "/api/issues/". Both refuse an agent actor in the
+  // handler, so the default of "authenticated" published them as
+  // board_or_agent with an AgentBearerAuth security entry, which is the one
+  // inference a stranded agent cannot afford to get wrong.
+  //
+  //   /issues/:id/admin/force-release  issues.ts, explicit actor.type check
+  //   /issues/:id/tree-holds/:holdId/release  issue-tree-control.ts, assertBoard
+  //
+  // The second one is not named "/admin/" but is gated the same way, which is
+  // the reason the contract test in
+  // server/src/__tests__/admin-route-authorization-contract.test.ts sweeps
+  // gates read out of the route source rather than trusting the URL shape.
+  "POST /api/issues/{id}/admin/force-release",
+  "POST /api/issues/{id}/tree-holds/{holdId}/release",
   "GET /api/companies/{companyId}/members",
   "PATCH /api/companies/{companyId}/members/{memberId}",
   "PATCH /api/companies/{companyId}/members/{memberId}/role-and-grants",
