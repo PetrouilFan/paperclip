@@ -642,6 +642,14 @@ The endpoint's list stays a superset of the binding set — it also lists issues
 the run merely wrote to, with no binding source — and an issue the caller cannot
 see is not listed even when a stamp binds it.
 
+The `run_context_required` refusal names the route that can actually be taken.
+Three refusals are distinguishable, and each copy only offers checkout where a
+checkout is possible: a target assigned to another principal, a target a live
+run still holds (checkout is a 409 for anyone but the holder — wait for the
+holder, or raise a child issue), and a finished run, whose stale stamp is the
+very thing being refused, so the only live path is the next heartbeat run. A
+run that has already checked an issue out is never told to check one out.
+
 Agent-authored issue comments persist the responsible user derived from the
 authenticated actor; clients cannot choose that attribution. Each comment also
 records the write-policy reason, and spoof attempts fail with an audited 422.
