@@ -696,6 +696,35 @@ function stoppedFingerprintMetadata(input: {
   };
 }
 
+/**
+ * Project a classifier leaf onto the leaf shape the adapter's wake prompt
+ * renders. `taskWatchdog.terminalLeafSummaries` is the only leaf list a woken
+ * run reads, so the projection has to be emitted inside the `taskWatchdog`
+ * object — a sibling key of the wake context is never read.
+ */
+function taskWatchdogLeafSummaries(
+  leaves: TaskWatchdogStoppedLeaf[],
+  pendingInteractionsByIssueId: TaskWatchdogPendingInteractionsByIssueId,
+) {
+  const shortId = (id: string) => id.length > 8 ? `${id.slice(0, 8)}…` : id;
+  return leaves.map((leaf) => {
+    const interactionKinds = new Map(
+      (pendingInteractionsByIssueId[leaf.issueId] ?? []).map((wait) => [wait.id, wait.kind]),
+    );
+    const waits = [
+      ...leaf.pendingInteractionIds.map((id) => `${interactionKinds.get(id) ?? "interaction"} ${shortId(id)}`),
+      ...leaf.pendingApprovalIds.map((id) => `approval ${shortId(id)}`),
+    ];
+    return {
+      id: leaf.issueId,
+      identifier: leaf.identifier,
+      title: leaf.title,
+      status: leaf.status,
+      summary: waits.length > 0 ? `pending ${waits.join(", ")}` : null,
+    };
+  });
+}
+
 function watchdogWakeContext(input: {
   watchdog: IssueWatchdogRow;
   watchdogIssue: IssueRow;
@@ -712,6 +741,13 @@ function watchdogWakeContext(input: {
       watchedIssueIdentifier: input.sourceIssue.identifier,
       watchedIssueTitle: input.sourceIssue.title,
       stopFingerprint: input.classification.stopFingerprint,
+      // Board-supplied guardrails for this watchdog. A woken run only ever
+      // reads them from here, so they must live inside `taskWatchdog`.
+      customInstructions: input.watchdog.instructions,
+      terminalLeafSummaries: taskWatchdogLeafSummaries(
+        input.classification.stoppedLeaves,
+        input.classification.pendingInteractionsByIssueId,
+      ),
       pendingInteractions: input.classification.pendingInteractionsByIssueId,
       pendingApprovals: Object.fromEntries(Object.entries(input.classification.stopSnapshot.waitsByIssueId)
         .filter(([, waits]) => waits.pendingApprovalIds.length > 0)
@@ -722,6 +758,11 @@ function watchdogWakeContext(input: {
           watchedIssueIdentifier: input.sourceIssue.identifier,
           watchdogIssueId: input.watchdogIssue.id,
           includeNonWatchdogDescendants: true,
+          // The stop classifier reads status *and* blocker state, so a stop can
+          // be caused by a blocker that is not a descendant. One hop of the
+          // blocker edge is in scope, and no further — see
+          // `issueIsInTaskWatchdogSubtree`.
+          includeBlockersOfWatchedSubtree: true,
           excludedOriginKinds: [TASK_WATCHDOG_ORIGIN_KIND],
         },
         operations: [
@@ -747,8 +788,6 @@ function watchdogWakeContext(input: {
     watchedIssueId: input.sourceIssue.id,
     watchedIssueIdentifier: input.sourceIssue.identifier,
     stopFingerprint: input.classification.stopFingerprint,
-    stoppedLeaves: input.classification.stoppedLeaves,
-    customInstructions: input.watchdog.instructions,
     resumeIntent: true,
     followUpRequested: true,
   };

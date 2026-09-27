@@ -1,8 +1,10 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issues, issueWatchdogs } from "@paperclipai/db";
+import { heartbeatRuns, issues, issueRelations, issueWatchdogs } from "@paperclipai/db";
 
 const MAX_WATCHDOG_SCOPE_ANCESTRY_DEPTH = 100;
+/** Cap on how many blocked issues one candidate blocker is matched against. */
+const MAX_WATCHDOG_SCOPE_BLOCKER_FANOUT = 50;
 export const TASK_WATCHDOG_ORIGIN_KIND = "task_watchdog";
 
 type AgentRunActor = {
@@ -139,6 +141,19 @@ export async function issueIsInTaskWatchdogSubtree(
   issueId: string,
   watchedIssueId: string,
 ) {
+  if (await issueIsInWatchedParentSubtree(db, companyId, issueId, watchedIssueId)) return true;
+  return issueBlocksWatchedSubtreeIssue(db, companyId, issueId, watchedIssueId);
+}
+
+/**
+ * The parent-ancestry half of the scope: the watched issue and its descendants.
+ */
+async function issueIsInWatchedParentSubtree(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  watchedIssueId: string,
+) {
   let currentId: string | null = issueId;
   const seen = new Set<string>();
 
@@ -155,6 +170,67 @@ export async function issueIsInTaskWatchdogSubtree(
     if (parent.originKind === TASK_WATCHDOG_ORIGIN_KIND) return false;
     if (currentId === watchedIssueId) return true;
     currentId = parent.parentId ?? null;
+  }
+
+  return false;
+}
+
+/**
+ * The blocker-edge half of the scope.
+ *
+ * A stop is classified from status *and* blocker state, so the issue that
+ * causes a stop is frequently a blocker rather than a descendant. Without this
+ * the watchdog is woken to clear a stop and is refused on the one issue whose
+ * closure would release it, and the unchanged stop re-fires on the next state
+ * change.
+ *
+ * Deliberately exactly one hop: the candidate must itself block the watched
+ * issue or an issue in the watched issue's parent subtree. A blocker of a
+ * blocker belongs to that blocker's own owner — and each extra hop widens what
+ * a run can write, which is the one thing this gate exists to bound.
+ */
+async function issueBlocksWatchedSubtreeIssue(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  watchedIssueId: string,
+) {
+  if (issueId === watchedIssueId) return false;
+
+  // The subject has to be a real issue of the watchdog's own company, and it
+  // must not be a task-watchdog issue — the same two bars the parent walk
+  // applies before it admits anything.
+  const subject: { originKind: string | null } | null = await db
+    .select({ originKind: issues.originKind })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!subject) return false;
+  if (subject.originKind === TASK_WATCHDOG_ORIGIN_KIND) return false;
+
+  const blocked = await db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      parentId: issues.parentId,
+      originKind: issues.originKind,
+    })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issues.id, issueRelations.relatedIssueId))
+    .where(and(
+      eq(issueRelations.companyId, companyId),
+      eq(issueRelations.issueId, issueId),
+      eq(issueRelations.type, "blocks"),
+      eq(issues.companyId, companyId),
+    ))
+    .limit(MAX_WATCHDOG_SCOPE_BLOCKER_FANOUT)
+    .then((rows) => rows);
+
+  for (const candidate of blocked) {
+    if (candidate.originKind === TASK_WATCHDOG_ORIGIN_KIND) continue;
+    if (await issueIsInWatchedParentSubtree(db, companyId, candidate.id, watchedIssueId)) {
+      return true;
+    }
   }
 
   return false;

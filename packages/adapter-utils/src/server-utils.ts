@@ -306,6 +306,7 @@ type PaperclipWakeTaskWatchdogCapabilities = {
     watchedIssueIdentifier: string | null;
     watchdogIssueId: string | null;
     includeNonWatchdogDescendants: boolean;
+    includeBlockersOfWatchedSubtree: boolean;
     excludedOriginKinds: string[];
   } | null;
 };
@@ -1513,6 +1514,12 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(
       targetScopeRaw.includeNonWatchdogDescendants,
       false,
     ),
+    // Defaults to false: an older server that does not send the field has not
+    // granted blocker scope, so the prompt must not claim it.
+    includeBlockersOfWatchedSubtree: asBoolean(
+      targetScopeRaw.includeBlockersOfWatchedSubtree,
+      false,
+    ),
     excludedOriginKinds: normalizeStringList(
       targetScopeRaw.excludedOriginKinds,
       MAX_WATCHDOG_CAPABILITY_ITEMS,
@@ -1520,10 +1527,11 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(
   };
   const hasTargetScope = Boolean(
     targetScope.watchedIssueId ||
-    targetScope.watchedIssueIdentifier ||
-    targetScope.watchdogIssueId ||
-    targetScope.includeNonWatchdogDescendants ||
-    targetScope.excludedOriginKinds.length > 0,
+      targetScope.watchedIssueIdentifier ||
+      targetScope.watchdogIssueId ||
+      targetScope.includeNonWatchdogDescendants ||
+      targetScope.includeBlockersOfWatchedSubtree ||
+      targetScope.excludedOriginKinds.length > 0,
   );
   if (
     operations.length === 0 &&
@@ -2913,6 +2921,11 @@ function renderPaperclipWakePromptBody(
         const scope = watchdog.capabilities.targetScope;
         lines.push(
           `- Target scope: ${scope.watchedIssueIdentifier ?? scope.watchedIssueId ?? "unknown"} plus ${scope.includeNonWatchdogDescendants ? "non-watchdog descendants" : "no descendants"}.`,
+        );
+        lines.push(
+          scope.includeBlockersOfWatchedSubtree
+            ? "- Blocker scope: the direct blockers of the watched issue and of its in-scope descendants are writable, because a stop is usually caused by a blocker rather than by a child. One hop only; a blocker of a blocker is out of scope."
+            : "- Blocker scope: none. A blocker of the watched issue or of a descendant is refused with 403.",
         );
         if (scope.watchdogIssueId) {
           lines.push(`- Reusable watchdog issue: ${scope.watchdogIssueId}.`);
