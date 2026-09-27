@@ -23,6 +23,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { taskWatchdogService } from "../services/task-watchdogs.ts";
+import { resolveTaskWatchdogMutationScope } from "../services/task-watchdog-scope.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -631,7 +632,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(revalidated.classification?.state).toBe("already_reviewed");
   });
 
-  it("still refuses a woken run's mutation once the watched subtree fingerprint changes", async () => {
+  it("still refuses a woken run's first mutation once the watched subtree fingerprint changes", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-ALREADY-REVIEWED-DRIFT", status: "blocked" });
     const agentId = await seedAgent(companyId);
@@ -645,7 +646,9 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, watchdogIssueId));
     await service.reconcileTaskWatchdogs({ companyId });
 
-    // A material field moves in the watched subtree after the run was woken.
+    // A material field moves in the watched subtree after the run was woken. This
+    // run has not written anything yet, so nothing in its own history caused the
+    // drift and the guard is doing its job.
     await db
       .update(issues)
       .set({ status: "in_progress", updatedAt: new Date(Date.now() + 60_000) })
@@ -661,8 +664,142 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     expect(revalidated.allowed).toBe(false);
     expect(revalidated.reason).toContain("stop fingerprint changed");
-    expect(revalidated.reason).toContain("re-read the watched subtree");
+    // The recovery the reason names is the one that actually exists: a fresh run
+    // picks up the current fingerprint. It must not tell the caller to refresh
+    // source state it cannot refresh.
+    expect(revalidated.reason).toContain("let a fresh watchdog run pick up the current fingerprint");
     expect(revalidated.classification?.state).toBe("stopped");
+  });
+
+  it("keeps a woken run admitted after its own write moves the watched subtree fingerprint", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-SELF-REBASE", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const { service } = createService();
+
+    await service.reconcileTaskWatchdogs({ companyId });
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const pinnedFingerprint = watchdog!.lastObservedFingerprint!;
+    const watchdogIssueId = watchdog!.watchdogIssueId!;
+
+    // The wake the scheduler emitted, as the woken run's persisted context.
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "assignment",
+      contextSnapshot: {
+        issueId: watchdogIssueId,
+        taskWatchdog: { watchedIssueId: sourceId, stopFingerprint: pinnedFingerprint },
+      },
+    });
+    const actor = { type: "agent", agentId, companyId, runId };
+
+    const firstScope = await resolveTaskWatchdogMutationScope(db, actor);
+    if (firstScope.kind !== "watchdog") throw new Error(`Expected a watchdog scope, got ${firstScope.kind}`);
+    const firstWrite = await service.revalidateMutationScope(firstScope);
+    expect(firstWrite.allowed).toBe(true);
+
+    // The first write is what files the follow-up the review found. It adds a
+    // material leaf, so the stop fingerprint the guard checks moves — through the
+    // write the run was cleared to make.
+    await seedIssue(companyId, {
+      parentId: sourceId,
+      identifier: "WDOG-SELF-REBASE-FOLLOWUP",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const [afterFollowup] = await db
+      .select()
+      .from(issueWatchdogs)
+      .where(eq(issueWatchdogs.issueId, sourceId));
+    expect(afterFollowup!.lastObservedFingerprint).toBe(pinnedFingerprint);
+
+    // The run's second write. Before the rebase this is the reported lockout: the
+    // run verified the work, filed the follow-up, and could not then report either.
+    const secondScope = await resolveTaskWatchdogMutationScope(db, actor);
+    if (secondScope.kind !== "watchdog") throw new Error(`Expected a watchdog scope, got ${secondScope.kind}`);
+    expect(secondScope.stopFingerprint).toBe(pinnedFingerprint);
+    const secondWrite = await service.revalidateMutationScope(secondScope);
+    expect(secondWrite.allowed).toBe(true);
+    if (!secondWrite.allowed) throw new Error(`Expected the second write to be admitted: ${secondWrite.reason}`);
+    expect(secondScope.mutationAdmittedAt).toEqual(expect.any(String));
+    expect(secondWrite.rebasedFromStopFingerprint).toBe(pinnedFingerprint);
+    if (secondWrite.classification?.state !== "stopped") throw new Error("Expected stopped classification");
+    expect(secondWrite.classification.stopFingerprint).not.toBe(pinnedFingerprint);
+
+    // The baseline the next request reads has followed the subtree, so the run
+    // stays admitted instead of re-deriving the same refusal every time.
+    const rebasedScope = await resolveTaskWatchdogMutationScope(db, actor);
+    if (rebasedScope.kind !== "watchdog") throw new Error(`Expected a watchdog scope, got ${rebasedScope.kind}`);
+    expect(rebasedScope.stopFingerprint).toBe(secondWrite.classification.stopFingerprint);
+    const thirdWrite = await service.revalidateMutationScope(rebasedScope);
+    expect(thirdWrite.allowed).toBe(true);
+    if (thirdWrite.allowed) expect(thirdWrite).not.toHaveProperty("rebasedFromStopFingerprint");
+
+    // A subtree that went live underneath the run is still refused after the
+    // rebase. The rebase is not a licence to stomp a live execution path.
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "assignment",
+      contextSnapshot: { issueId: sourceId },
+    });
+    const afterLive = await service.revalidateMutationScope(rebasedScope);
+    expect(afterLive.allowed).toBe(false);
+    expect(afterLive.reason).toContain("now has a live");
+  });
+
+  it("does not rebase a run that has never been admitted to mutate the watched subtree", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-NO-REBASE", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const { service } = createService();
+
+    await service.reconcileTaskWatchdogs({ companyId });
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const pinnedFingerprint = watchdog!.lastObservedFingerprint!;
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "assignment",
+      contextSnapshot: {
+        taskWatchdog: { watchedIssueId: sourceId, stopFingerprint: pinnedFingerprint },
+      },
+    });
+    const scope = await resolveTaskWatchdogMutationScope(
+      db,
+      { type: "agent", agentId, companyId, runId },
+    );
+    if (scope.kind !== "watchdog") throw new Error(`Expected a watchdog scope, got ${scope.kind}`);
+    expect(scope.mutationAdmittedAt).toBeNull();
+
+    await db
+      .update(issues)
+      .set({ status: "in_progress", updatedAt: new Date(Date.now() + 60_000) })
+      .where(eq(issues.id, sourceId));
+
+    const revalidated = await service.revalidateMutationScope(scope);
+    expect(revalidated.allowed).toBe(false);
+
+    // The refused attempt must not have granted the run the rebase entitlement,
+    // or the next call would admit it and the guard would be a no-op.
+    const [runRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(runRow?.contextSnapshot).toMatchObject({
+      taskWatchdog: { watchedIssueId: sourceId, stopFingerprint: pinnedFingerprint },
+    });
+    expect((runRow?.contextSnapshot as Record<string, unknown>).taskWatchdog).not.toHaveProperty(
+      "mutationAdmittedAt",
+    );
   });
 
   it("surfaces pending interaction kinds and approval ids in the wake and watchdog comment", async () => {

@@ -2546,6 +2546,7 @@ describe("agent issue mutation checkout ownership", () => {
       watchedIssueId?: string;
       watchdogIssueId?: string | null;
       ancestryParentId?: string | null;
+      runContextSnapshot?: Record<string, unknown>;
       watchdogRows?: Record<string, unknown>[];
     } = {}) {
       const watchedIssueId = options.watchedIssueId ?? issueId;
@@ -2553,7 +2554,9 @@ describe("agent issue mutation checkout ownership", () => {
         id: watchdogRunId,
         companyId,
         agentId: peerAgentId,
-        contextSnapshot: { taskWatchdog: { watchedIssueId, stopFingerprint: "task_watchdog_stop:test" } },
+        contextSnapshot: options.runContextSnapshot ?? {
+          taskWatchdog: { watchedIssueId, stopFingerprint: "task_watchdog_stop:test" },
+        },
       }];
       const watchdogRows = options.watchdogRows ?? [{
         id: "dddddddd-dddd-4ddd-8ddd-ddddddddddde",
@@ -2673,8 +2676,44 @@ describe("agent issue mutation checkout ownership", () => {
       );
     });
 
-    it("rejects stale watchdog source mutations when revalidation finds a live path", async () => {
+    // The stale guard re-derives the fingerprint from the live subtree on every
+    // write, so the only way a run can survive moving that fingerprint is if the
+    // guard knows which run is writing and whether that run was ever admitted.
+    // Both facts live on the run's own context, so the route has to hand them
+    // through. Drop either and the rebase is unreachable from a real request.
+    it.each([
+      ["an already-admitted run", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z"],
+      ["a run that has not written yet", undefined, null],
+    ])("passes the run's own rebase state to the stale guard for %s", async (_label, mutationAdmittedAt, expected) => {
       denyBaseBoundary();
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+      const app = await createApp(
+        watchdogActor(),
+        createWatchdogDb({
+          runContextSnapshot: {
+            taskWatchdog: {
+              watchedIssueId: issueId,
+              stopFingerprint: "task_watchdog_stop:test",
+              ...(mutationAdmittedAt ? { mutationAdmittedAt } : {}),
+            },
+          },
+        }),
+      );
+      const res = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Watchdog finding" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockTaskWatchdogService.revalidateMutationScope).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "watchdog",
+          runId: watchdogRunId,
+          stopFingerprint: "task_watchdog_stop:test",
+          mutationAdmittedAt: expected,
+        }),
+      );
+    });
+
+    it("rejects stale watchdog source mutations when revalidation finds a live path", async () => {      denyBaseBoundary();
       mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
       mockTaskWatchdogService.revalidateMutationScope.mockResolvedValueOnce({
         allowed: false,
