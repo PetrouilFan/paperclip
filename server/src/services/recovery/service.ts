@@ -913,6 +913,14 @@ function isRepeatedProductiveContinuationRecovery(
   );
 }
 
+export interface OrphanedRunLeaseRelease {
+  runId: string;
+  companyId: string;
+  agentId: string;
+  status: string;
+  failureReason?: string | null;
+}
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -922,6 +930,10 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /** Release the environment leases of a run this backstop just terminalized
+     * on process-death authority. Absent when the caller has no lease path; the
+     * stranded-lease sweep remains the fallback. */
+    releaseOrphanedRunLeases?: (run: OrphanedRunLeaseRelease) => Promise<void>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -5797,6 +5809,33 @@ export function recoveryService(
     // the stale lock below, so fire it and do not await it.
     void emitAgentTaskRun(db, updated);
     runningProcesses.delete(run.id);
+    // The terminal write above commits the run status; the lease release is a
+    // separate statement. On process-death authority the process and its
+    // sandbox are already gone, so a lease left `active` on this run is a
+    // stranded row, not in-flight cleanup, and `getConversationOwnershipBlocker`
+    // holds the issue on it until something releases it. Release it here, on
+    // the same evidence that terminalized the run, rather than leaving the only
+    // reclaim to a periodic sweep whose failure leaves the hold permanent.
+    // Issue-terminal authority does not prove the process stopped, so its lease
+    // stays: a live provider may still own that sandbox.
+    if (authority === "process_gone") {
+      try {
+        await deps.releaseOrphanedRunLeases?.({
+          runId: updated.id,
+          companyId: updated.companyId,
+          agentId: updated.agentId,
+          status: updated.status,
+          failureReason: updated.error ?? null,
+        });
+      } catch (error) {
+        // The run is already terminal, so a failed release must not abort the
+        // sweep. The stranded-lease sweep is the fallback for this row.
+        logger.error(
+          { err: error, runId: run.id },
+          "failed to release environment leases after terminalizing an orphaned run; the run stays terminal and the stranded-lease sweep retries",
+        );
+      }
+    }
     // The run update above already committed the terminal status. The audit
     // event is best-effort: if the insert fails, the caller must still treat
     // the run as terminalized and clear the lock in the same sweep. So catch
