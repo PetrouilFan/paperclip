@@ -34,17 +34,44 @@
  * Widening `DEFAULT_INTERNAL_REF_PREFIXES` to name more prefixes does not fix
  * it, for the reason the section above already gives: every prefix added is a
  * prefix that has to be guessed, and the ones this repository does not name are
- * unbounded. So the second matcher matches the *shape* instead of a list. What
- * keeps that from being born failing is measured, not argued — see
- * "the measurement" below.
+ * unbounded. The obvious alternative does not fix it either, and it is worth
+ * saying why because the blocklist is easy to mistake for the principled
+ * option: match the bare shape and blocklist the standard tokens it would catch
+ * — `GPT-5`, `UTF-8`, `SHA-256`, `HTTP-404`, `RFC-2119`, `ISO-8601` — and the
+ * filter is a property of the *vocabulary* rather than of the sentence. That is
+ * the prefix list wearing different clothes, and this file's own first section
+ * already condemns it: the list is unbounded, and adding the seventh entry only
+ * moves the boundary.
+ *
+ * So the second matcher matches the shape *where an id is being used as one*.
+ * That is a claim about a position, not about a shape being safe by itself, and
+ * the difference is the whole reason it generalises.
+ *
+ * It is not a claim to have no guessing left in it. The verb tier is a closed
+ * list of nine English tokens, and `supersedes`, `replaces`, `tracks`,
+ * `duplicates`, `blocks` and `addresses` are all reference positions that none
+ * of them match. So this trades an unbounded guessed vocabulary for a bounded
+ * one — three syntactic positions times nine verbs — which is a large reduction
+ * and a real improvement, but it is "much smaller", not "instead of". The
+ * measurement below is what says the reduction is worth having, and the
+ * motivating case is the honest limit: #85's three lines were caught by *two* of
+ * the three positions, and one of those was the `issues/` path rule rather than
+ * the verb list. Had the verb been the only signal, the recall would have rested
+ * on the guesswork. What keeps this from being born failing is measured, not
+ * argued — see "the measurement" below.
  *
  * ### the measurement
  *
- * Replayed over the 60 most recent pull requests on this fork, the bare shape
- * `[A-Z][A-Z0-9]+-\d+` applied to title and body flags 10 of the 60. Eight of
- * those are already caught by the configured prefix. The tokens it reaches
- * *past* the configured list are exactly three, and two of them are the reason
- * this matcher is not just the bare shape:
+ * Pinned to a range, not to a moving window: **`#37`–`#96`, 60 pull requests, as
+ * read at `2026-09-27T01:41Z`**. A range is replayable; "the 60 most recent" is
+ * a description of a moment that has already passed, and a reader who runs it
+ * next week gets a different population with no way to tell a different answer
+ * from a stale claim.
+ *
+ * Over that window the bare shape `[A-Z][A-Z0-9]{1,9}-\d+` applied to title and
+ * body fires on **9 of the 60**. Sixteen of those hits are already covered by
+ * the configured prefix list. Exactly **two** tokens reach past that list, and
+ * both are the reason this matcher is not just the bare shape:
  *
  * - `GPT-5`, in four pull requests (#48, #67, #75, #87), every one of them in a
  *   **Model Used** section naming the model. A matcher that fails the pull
@@ -52,7 +79,30 @@
  *   disabled within a day, and a disabled gate reads as "we checked".
  * - `PROJ-123`, in #67, where it is the *shape* of a config value being
  *   documented rather than a ticket being pointed at.
- * - `TASK-482`, in #85, which is the one that is real.
+ *
+ * ### the true positive is a body state that no longer exists
+ *
+ * The change is motivated by `TASK-482` in #85, and **that finding cannot be
+ * re-derived from the API by anyone, ever again.** #85's body was sanitised at
+ * `2026-09-27T00:06:39Z`, five minutes after the commit that measured it: the
+ * three identifiers became prose. The audit comment on #85 is the surviving
+ * record of the before state, pair by pair, and `PR85_REPRO` in the tests is a
+ * faithful transcription of it.
+ *
+ * So the number to expect when you replay this is **zero**, not one. Over
+ * `#37`–`#96` the open tier reports 0 findings, and `PR85_REPRO` still fails on
+ * its own, which is the mechanism working. Zero is the correct replay result and
+ * is not a regression — it is stated here so that a reader who reaches zero can
+ * tell an inert matcher from an unmeasured one, which the previous wording of
+ * this section left open.
+ *
+ * The population contaminates itself, so re-measuring has to account for it: a
+ * pull request *documenting* this gate quotes the tokens the gate matches. #98's
+ * own body carries `TASK-482`, `PROJ-123`, `UTF-8`, `SHA-256`, `HTTP-404` and —
+ * out of the regex literal `A-Z0-9` in its own write-up — `Z0-9`. Every
+ * gate-documentation pull request therefore adds tokens past the configured
+ * list, which is why that set grows each time the rule is explained. Exclude
+ * those deliberately when re-measuring, or expect the tail to move.
  *
  * The fix is a second condition, not a longer blocklist: the shape only counts
  * where an id is being *referred to*. Three positions qualify, and they are
@@ -60,13 +110,16 @@
  *
  * - an issue-router path — `/issues/TASK-482`, `/api/issues/{TASK-482}/checkout`
  * - a `#` reference — `#TASK-482`
- * - a reference verb — `Fixes TASK-482`, `ticket TASK-482`, `see TASK-482`
+ * - a reference verb — `Fixes TASK-482`, `ticket TASK-482`, `see TASK-482`, and
+ *   the scoped conventional-commit form `fix(shared): TASK-482`, which is this
+ *   repository's dominant commit convention
  *
- * Under that rule the same 60 pull requests produce exactly one finding from
- * this tier: #85, `TASK-482`. `GPT-5` and `PROJ-123` both pass, and no branch
- * name in the population produces one. That is the property worth having — a
- * gate that adds one true positive and zero false positives to sixty real pull
- * requests can be merged without anyone having to decide whether to trust it.
+ * That rule is what turns 9 flagged pull requests into 0 findings on `GPT-5`,
+ * `PROJ-123` and the rest, and the property worth having is that it does so
+ * without the one real case going with them: `PR85_REPRO` fires, the population
+ * does not. A gate that adds one true positive and zero false positives to sixty
+ * real pull requests can be merged without anyone having to decide whether to
+ * trust it.
  *
  * This is the same split the address rule below rests on, one level up: there,
  * prose that names `127.0.0.1` passes and a URL pointing at it fails; here,
@@ -91,13 +144,22 @@
  *   `10.0.0.7` is left alone below: reaching for it fires on correct work.
  * - **Not on the diff.** 736 files on `master` carry `PAP-`/`PAPA-` legitimately.
  *   The configured list, which knows those prefixes, is what covers the diff.
+ * - **Not aware of character classes.** A branch called `fix/A-Z0-9-range`
+ *   matches `Z0-9` out of the middle of the range, on the branch surface, and
+ *   fails. No code change: the shape cannot know it is inside a range, and a
+ *   branch name is the one surface with no reference position to key on. It is
+ *   listed because it is the exact string a pull request *about* this gate
+ *   writes, so it is the first thing the next person tries.
  *
  * The one surface that does not require a reference position is the branch
  * name, because a branch name is not prose containing a reference — it is the
  * name, and there is no verb, no `#` and no path in it for the rules to key on.
- * The bare separated shape is measured there rather than assumed: over the 96
- * distinct branch names that have been a pull request head on this fork it
- * flags none. Its one cost is stated rather than hidden — a branch called
+ * The bare separated shape is measured there rather than assumed: over the 106
+ * distinct branch names that have been a pull request head on this fork, as read
+ * at `2026-09-27T01:41Z`, it flags none. That population grows as branches are
+ * pushed, so the honest form of the claim is the instant it was read at rather
+ * than a number to memorise; the conclusion has held from 84 to 106. Its one
+ * cost is stated rather than hidden — a branch called
  * `fix/UTF-8-normalization` fails, and the remedy is a rename.
  *
  * ## Instance-local addresses: why authored text only
@@ -418,8 +480,15 @@ const OPEN_SHAPE_LOOSE = new RegExp(String.raw`${NOT_IN_WORD}(${OPEN_SHAPE})`, '
  * the first cut of the verb rule read #85 as clean. Held as a plain string
  * because it contains a backtick, which cannot appear unescaped inside the
  * template literal the rules themselves are written in.
+ *
+ * The class opens `(` and closes it again. That is the scoped
+ * conventional-commit prefix, which is this repository's dominant commit
+ * convention, so `fix(shared): TASK-482` is the single most likely subject this
+ * rule is ever asked about: `fix:` fires and `fix(shared):` was silent. An
+ * unbalanced class reads as an oversight rather than a decision, so it is
+ * balanced on purpose and both forms are pinned in the tests.
  */
-const REF_GAP = "[: #`\"'({\\[]*";
+const REF_GAP = "[: #`\"'(){\\[]*";
 
 const OPEN_REF_RULES = [
   // `/issues/TASK-482`, `POST /api/issues/{TASK-482}/checkout`. The `{$?` is a
@@ -430,8 +499,17 @@ const OPEN_REF_RULES = [
   // matched; `#123` is a public GitHub reference and has no prefix to match.
   new RegExp(String.raw`(?<![A-Za-z0-9_])#(${OPEN_SHAPE})`, 'g'),
   // `Fixes TASK-482`, `ticket TASK-482`, `see TASK-482`.
+  //
+  // The optional group is the conventional-commit scope, and it is here because
+  // the gap class alone cannot do the job. `fix(shared): TASK-482` is not a gap
+  // problem: the class matches one character at a time, and the scope *name*
+  // sits between the two parens, so balancing the class without this group
+  // leaves the form silent — and this is the dominant commit convention in the
+  // repository, so it is the most likely input the verb tier ever gets. The
+  // scope body excludes whitespace, so a prose aside in parentheses
+  // (`the fix (see TASK-482)`) is still not a reference position.
   new RegExp(
-    String.raw`\b(?:[Ff]ix(?:e[sd])?|[Cc]los(?:e[sd])?|[Rr]ef(?:s|erenced)?|[Ss]ee|[Tt]ickets?|[Tt]asks?|[Bb]ugs?)\b${REF_GAP}(${OPEN_SHAPE})`,
+    String.raw`\b(?:[Ff]ix(?:e[sd])?|[Cc]los(?:e[sd])?|[Rr]ef(?:s|erenced)?|[Ss]ee|[Tt]ickets?|[Tt]asks?|[Bb]ugs?)\b(?:\([A-Za-z0-9_./-]+\))?${REF_GAP}(${OPEN_SHAPE})`,
     'g',
   ),
 ];
@@ -775,6 +853,7 @@ export function checkInternalRefs({
 
   // --- Surface 4: commit messages, subject and body -----------------------
   // A squash collapses the branch into the PR title, but a merge or a rebase
+  // A squash collapses the branch into the PR title, but a merge or a rebase
   // preserves these messages whole, and a reviewer reading `git log` before
   // merging reads the body today, not just the subject.
   //
@@ -800,26 +879,36 @@ export function checkInternalRefs({
     'Edit the commit message on the commit itself (`git rebase -i`, `reword`, or the "Edit" button on ' +
     'the commit page); a merged message is permanent history.';
 
-  const commitHits = [];
-  const commitLocations = [];
+  // One pass builds the subject list, because the open tier has to be handed
+  // the configured tier's hits *for the same subject*. `fix:` is a reference
+  // verb, so `fix: PET-9003` is visible to both matchers; without the handoff
+  // the author gets two paragraphs, and the second is false — it calls a
+  // namespace this repository has an exemption for one it has none for.
+  // `alreadyFound` is subtracted, so one id is one finding on every surface.
+  const subjectHits = new Map();
+  const subjectOrder = [];
   for (const commit of commits ?? []) {
     const message = commit?.commit?.message;
     if (typeof message !== 'string') continue;
     const firstLine = message.split('\n')[0];
     const hits = [...findAll(firstLine, separated), ...findAll(firstLine, compact)];
+    subjectOrder.push(firstLine);
     if (hits.length === 0) continue;
-    commitHits.push(...hits);
-    commitLocations.push(firstLine.trim().slice(0, 80));
+    subjectHits.set(firstLine, hits);
   }
+  const commitHits = [...subjectHits.values()].flat();
   if (commitHits.length > 0) {
-    report('A commit subject', commitLocations[0], commitHits, SUBJECT_REMEDY);
+    report('A commit subject', subjectOrder.find((l) => subjectHits.has(l))?.trim().slice(0, 80),
+      commitHits, SUBJECT_REMEDY);
   }
-  for (const commit of commits ?? []) {
-    const message = commit?.commit?.message;
-    if (typeof message !== 'string') continue;
-    const firstLine = message.split('\n')[0];
+  for (const firstLine of subjectOrder) {
+    // Re-derived here rather than carried from a per-commit loop: the one-pass
+    // shape above no longer binds a `location`, and the three calls below all
+    // need one. Omit it and the file still parses and the suite still passes —
+    // the address check on this surface just stops firing.
     const location = firstLine.trim().slice(0, 80);
-    unknownReport('A commit subject', location, firstLine, owned, [], SUBJECT_REMEDY);
+    unknownReport('A commit subject', location, firstLine, owned,
+      subjectHits.get(firstLine) ?? [], SUBJECT_REMEDY);
     if (findInstanceHosts(firstLine).length > 0) {
       hostReport('A commit subject', location, firstLine, SUBJECT_REMEDY);
     }
