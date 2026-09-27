@@ -391,9 +391,12 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
   it("does not report a tree-held issue as having no blockers, and withholds readiness", async () => {
     // The measured defect: an issue held by a live child, with no first-class
     // dependency edge, came back as `isDependencyReady: true` and the sentence
-    // "is blocked but has no first-class blocker relations" — while the write
-    // path refused the move. The sentence is a negative, and the aggregate the
-    // server enforces with contradicts it.
+    // "is blocked but has no first-class blocker relations" — while the
+    // blockerAttention walk saw a live hold that projection had no name for.
+    // The sentence is a negative, and the walk contradicts it. That
+    // contradiction is between two read-only answers: no write path consults
+    // the walk, so it is not also a case of the route sending a reader at a
+    // move the server would reject.
     const company = await seedCompany(db, "TreeHold");
     const project = await seedProject(db, company.id, "Tree hold project");
     const root = await seedIssue(db, {

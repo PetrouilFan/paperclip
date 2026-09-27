@@ -252,20 +252,64 @@ export interface IssueBlockerDiagnosticsReadiness {
 }
 
 /**
- * A hold that `blockerAttention` counts and this projection does not model.
+ * A hold the `blockerAttention` walk found and this projection does not model.
  *
  * `blockers` lists first-class dependency edges only. `blockerAttention`
  * aggregates more than that — tree holds and attention/watchdog relations
- * among them — so an issue can be held, refused every status change, and
- * still come back from this route with an empty `blockers` array. That is the
- * case this type exists to make visible.
+ * among them — so an issue can be held by a live child and still come back
+ * from this route with an empty `blockers` array. That is the case this type
+ * exists to make visible.
+ *
+ * This is an attention finding, not a gate. No write path reads it. Both
+ * blocker gates — the `in_progress` status gate and the checkout gate — call
+ * `listIssueDependencyReadinessMap`, whose only edge query is
+ * `eq(issueRelations.type, "blocks")`, and the one tree hold that does gate a
+ * write, the operator pause hold (`getActivePauseHoldGate`), gates checkout
+ * only. A tree-held issue with no dependency edge accepts a transition to
+ * `in_progress`.
  */
 export interface IssueBlockerDiagnosticsUnprojectedHold {
-  /** Holds the server is enforcing that this projection does not model. */
+  /**
+   * Holds the walk found that this projection does not model.
+   *
+   * Read `0` as **not consulted**, not as agreement. The walk only runs for
+   * `status === "blocked"` roots; for any other status
+   * `listIssueBlockerAttentionMap` returns a zeroed attention without walking
+   * at all, so `unresolvedBlockerCount` is `0` by construction and
+   * `max(0, 0 - n)` in the route clamps back to `0` however many unresolved
+   * dependency edges the issue actually has. A non-`blocked` issue with a live
+   * dependency reports `readiness.unresolvedBlockerCount: 1` next to
+   * `unprojectedHold.count: 0`. The two numbers are about different things;
+   * the second one is not a refutation of the first.
+   *
+   * When the walk did run, the count is depth-robust even if the walk itself
+   * gave up: a live descendant implies a live direct child, and the root's own
+   * edges are collected at depth 0, so truncation cannot hide a hold that
+   * makes the root itself blocked.
+   */
   count: number;
-  /** Why the hold exists, from the aggregate that found it. */
+  /**
+   * Why the hold exists, from the walk that found it.
+   *
+   * Not depth-robust, unlike `count`. When the walk truncates
+   * (`BLOCKER_ATTENTION_MAX_DEPTH` / `BLOCKER_ATTENTION_MAX_NODES` in
+   * `listIssueBlockerAttentionMap`) `classifyPath` returns `covered: false` for
+   * every path, so `attentionBlockerCount` is non-zero and this is forced to
+   * `"attention_required"`. Treat that value as an artifact of an incomplete
+   * walk rather than a finding.
+   */
   reason: IssueBlockerAttentionReason;
-  /** One identifier a reader can look up, so the hold is not just a number. */
+  /**
+   * One identifier a reader can look up, so the hold is not just a number.
+   *
+   * `null` means **withheld**, not absent — in this field that is the usual
+   * reading. The route echoes the walk's sample only when it matches a blocker
+   * already cleared for this actor, because the walk's `nodesById` is built by
+   * a traversal with no authorization filter and so may name an identifier this
+   * actor may not see. That check can only withhold, never correct: a
+   * non-`null` value is trustworthy, a `null` is not evidence the walk had
+   * nothing to name.
+   */
   sampleBlockerIdentifier: string | null;
 }
 
@@ -274,15 +318,23 @@ export interface IssueBlockerDiagnosticsResponse {
   diagnosis: string | null;
   /**
    * `null` when the answer would be partial — truncated, partly outside the
-   * actor's authorization, or carrying an unprojected hold. It is never
-   * `isDependencyReady: true` for an issue the write path refuses to move.
+   * actor's authorization, or carrying an unprojected hold. It is a statement
+   * about this route's coverage, not a prediction of what a write will do.
    */
   readiness: IssueBlockerDiagnosticsReadiness | null;
   blockers: IssueBlockerDiagnosticNode[];
   omittedUnauthorizedBlockerCount: number | null;
   /**
    * Holds this route cannot project. `null` when the count is unknowable
-   * (truncated). Zero is a real answer and means the aggregate agrees.
+   * because *this route's* `caps.maxBlockers` truncated the visible set.
+   *
+   * That is the only truncation the route can see. The `blockerAttention` walk
+   * behind this field has its own caps (`BLOCKER_ATTENTION_MAX_DEPTH` /
+   * `BLOCKER_ATTENTION_MAX_NODES`), and that truncation flag never leaves
+   * `listIssueBlockerAttentionMap`, so `truncated: false` with a non-null
+   * `unprojectedHold` is a reachable combination on a tree the walk gave up
+   * on. `count` survives that (see `IssueBlockerDiagnosticsUnprojectedHold`),
+   * `reason` does not.
    */
   unprojectedHold: IssueBlockerDiagnosticsUnprojectedHold | null;
   truncated: boolean;
