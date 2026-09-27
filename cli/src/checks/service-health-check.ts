@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { PaperclipConfig } from "../config/schema.js";
-import { resolvePaperclipInstanceId } from "../config/home.js";
+import { resolvePaperclipHomeDir, resolvePaperclipInstanceId } from "../config/home.js";
 import { readInstallManifest, resolveInstallStorePaths } from "../install-store.js";
 import {
   detectServiceManager,
@@ -10,6 +10,7 @@ import {
   resolveServiceShimPath,
   type ServiceManagerDetection,
 } from "../services/service-manager.js";
+import { readSlowRestartRecord, type SlowRestartRecord } from "../services/slow-restart.js";
 import { buildLocalHealthUrl } from "../utils/health-url.js";
 import type { CheckResult } from "./index.js";
 
@@ -18,7 +19,19 @@ type ServiceCheckDependencies = {
   detect: (instanceId: string) => Promise<ServiceManagerDetection>;
   probe: (config: PaperclipConfig) => Promise<HealthResult>;
   shimPresent: (executablePath: string) => Promise<boolean>;
+  readSlowRestart?: (instanceRoot: string) => Promise<SlowRestartRecord | null>;
+  instanceRoot?: (instanceId: string) => string;
 };
+
+function describeAge(completedAt: string): string {
+  const at = Date.parse(completedAt);
+  if (!Number.isFinite(at)) return "at an unknown time";
+  const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+  if (seconds < 90) return `${seconds}s ago`;
+  if (seconds < 5_400) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 172_800) return `${Math.round(seconds / 3600)}h ago`;
+  return `${Math.round(seconds / 86_400)}d ago`;
+}
 
 async function probeHealth(config: PaperclipConfig): Promise<HealthResult> {
   try {
@@ -214,6 +227,29 @@ async function collectServiceHealthChecks(
       status: "warn",
       message: "Start-on-login is enabled but systemd user lingering is off",
       repairHint: "Re-run `paperclipai service install --enable-linger` if the service must survive logout",
+    });
+  }
+
+  // The channel AC4 needs: a restart that took the service down for longer than
+  // the threshold is reported here, to whoever runs the next `doctor` -- which is
+  // not necessarily the operator who triggered it, and is frequently nobody at
+  // all. It carries the age, because the same record two days old means a
+  // different thing from one written a minute ago, and a record that says
+  // "520s" without saying how often it recurs is a fact nobody acts on twice.
+  const readSlow = deps.readSlowRestart ?? readSlowRestartRecord;
+  const resolveRoot = deps.instanceRoot ?? ((id: string) => path.join(resolvePaperclipHomeDir(), "instances", id));
+  const slow = await readSlow(resolveRoot(resolvePaperclipInstanceId())).catch(() => null);
+  if (slow) {
+    const age = describeAge(slow.completedAt);
+    results.push({
+      name: "Last slow restart",
+      status: slow.severity === "severe" ? "fail" : "warn",
+      message: `${slow.serviceName} was down for ${(slow.elapsedMs / 1000).toFixed(1)}s ${age}, `
+        + `over the ${Math.round(slow.thresholdMs / 1000)}s threshold`
+        + (slow.settled ? "" : ", and never reported itself running again")
+        + `. Every agent run in flight for that window ended process_lost.`,
+      repairHint: "If this recurs, the start is slow rather than the restart being wrong: compare "
+        + "`journalctl --user -u " + slow.serviceName + "` Starting/Started timestamps against TimeoutStartSec.",
     });
   }
 

@@ -60,7 +60,18 @@ function noInstalledService() {
         uninstall: vi.fn(async () => undefined),
         start: vi.fn(async () => undefined),
         stop: vi.fn(async () => undefined),
-        restart: vi.fn(async () => undefined),
+        // restart() reports the measured downtime (PET-681 AC1); a mock has to
+        // supply one, and the honest value for a mock is a fast one.
+        restart: vi.fn(async () => ({
+          serviceName: "paperclipai.service",
+          platform: "systemd" as const,
+          requestedAt: "2026-09-27T00:00:00.000Z",
+          completedAt: "2026-09-27T00:00:00.000Z",
+          elapsedMs: 0,
+          thresholdMs: 30_000,
+          severity: "ok" as const,
+          settled: true,
+        })),
         status: vi.fn(async () => ({
           platform: "systemd" as const,
           serviceName: "paperclipai.service",

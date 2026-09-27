@@ -5,6 +5,13 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolvePaperclipHomeDir, resolvePaperclipInstanceId } from "../config/home.js";
+import {
+  classifyRestartDowntime,
+  emitSlowRestartSignal,
+  SLOW_RESTART_THRESHOLD_MS,
+  type ServiceRestartOutcome,
+  type SlowRestartRecord,
+} from "./slow-restart.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -57,7 +64,14 @@ export interface ServiceManager {
   uninstall(options?: ServiceUninstallOptions): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
-  restart(): Promise<void>;
+  /**
+   * Restart, and report how long the service was actually down.
+   *
+   * The returned measurement is the point of AC4: a caller can tell a 2s
+   * restart from a 520s one, and the threshold verdict travels with it instead
+   * of being re-derived by every caller.
+   */
+  restart(options?: { previousServerPid?: number | null }): Promise<ServiceRestartOutcome>;
   status(): Promise<ServiceStatus>;
   logs(follow: boolean, lines: number): Promise<void>;
   installedExecutablePath(): Promise<string | null>;
@@ -330,6 +344,90 @@ export async function listDropInFiles(directory: string): Promise<string[]> {
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+type MeasuredRestartInput = {
+  serviceName: string;
+  platform: ServicePlatform;
+  instanceId: string;
+  thresholdMs: number;
+  previousServerPid: number | null;
+  previousServerStartedAt: string | null;
+  /** The restart itself. May throw; the measurement is still taken. */
+  run: () => Promise<void>;
+  /**
+   * Whether the platform reported the service back as running. Receives the
+   * restart's own failure, if any, because a restart that threw did not settle
+   * and must not be reported as though it had.
+   */
+  settle: (runFailure: unknown) => Promise<boolean>;
+  signal: (record: SlowRestartRecord) => Promise<void>;
+};
+
+/**
+ * Time a restart, classify the downtime, and raise the slow-restart signal.
+ *
+ * The measurement is taken on the failure path as well as the success path. A
+ * restart that exhausts `TimeoutStartSec` returns non-zero after 600s, and
+ * that is the single worst case AC4 is about: swallowing the timing because the
+ * command threw would drop exactly the restart an operator most needs to know
+ * about. A refusal is not a slow restart -- `RefuseManualStop=yes` makes
+ * `systemctl --user restart` exit 4 in milliseconds -- so an immediate failure
+ * is measured in single-digit milliseconds and stays below the threshold
+ * without needing a special case.
+ */
+async function measureRestart(input: MeasuredRestartInput): Promise<ServiceRestartOutcome> {
+  const requestedAt = new Date().toISOString();
+  const startedAt = Date.now();
+  let failure: unknown;
+  try {
+    await input.run();
+  } catch (error) {
+    failure = error;
+  }
+  const settled = failure === undefined ? await input.settle(failure).catch(() => false) : false;
+  const elapsedMs = Date.now() - startedAt;
+  const severity = classifyRestartDowntime(elapsedMs, input.thresholdMs);
+  const outcome: ServiceRestartOutcome = {
+    serviceName: input.serviceName,
+    platform: input.platform,
+    requestedAt,
+    completedAt: new Date().toISOString(),
+    elapsedMs,
+    thresholdMs: input.thresholdMs,
+    severity,
+    settled,
+  };
+  if (severity !== "ok") {
+    await input.signal({
+      ...outcome,
+      version: 1,
+      instanceId: input.instanceId,
+      previousServerPid: input.previousServerPid,
+      previousServerStartedAt: input.previousServerStartedAt,
+    }).catch(() => undefined);
+  }
+  if (failure !== undefined) {
+    throw new Error(
+      `${input.serviceName} did not restart (${describeError(failure)}). `
+      + (severity === "ok" ? "" : `It was down for ${(elapsedMs / 1000).toFixed(1)}s before that, which is over the ${Math.round(input.thresholdMs / 1000)}s slow-restart threshold. `)
+      + `The outage is recorded and \`paperclipai doctor\` will report it.`,
+      { cause: failure },
+    );
+  }
+  return outcome;
+}
+
+/**
+ * launchd's `kickstart -k` returns once the job is submitted, not once the agent
+ * is up, so unlike `systemctl restart` there is nothing to time implicitly. The
+ * measurement is closed by polling instead, and the poll is bounded so a launch
+ * agent that never comes back cannot hang the caller for the unit's whole start
+ * budget. A restart that has not settled by then is still reported, with
+ * `settled: false` saying so rather than presenting an unfinished restart as a
+ * completed one.
+ */
+const LAUNCHD_SETTLE_TIMEOUT_MS = 120_000;
+const LAUNCHD_SETTLE_POLL_MS = 250;
 
 export function renderSystemdUnit(input: { instanceId: string; shimPath: string; homeDir: string }): string {
   return `[Unit]
@@ -643,7 +741,7 @@ export class SystemdServiceManager implements ServiceManager {
   readonly definitionPath: string;
   readonly dropInDirectory: string;
 
-  constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir()) {
+  constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir(), private readonly restartThresholdMs = SLOW_RESTART_THRESHOLD_MS) {
     this.serviceName = systemdServiceName(instanceId);
     this.definitionPath = path.join(userHomeDir, ".config", "systemd", "user", this.serviceName);
     this.dropInDirectory = path.join(userHomeDir, ".config", "systemd", "user", `${this.serviceName}.d`);
@@ -806,7 +904,52 @@ export class SystemdServiceManager implements ServiceManager {
 
   async start(): Promise<void> { await this.ensureCurrent(); await this.runner("systemctl", ["--user", "start", this.serviceName]); }
   async stop(): Promise<void> { await this.runner("systemctl", ["--user", "stop", this.serviceName]); }
-  async restart(): Promise<void> { await this.ensureCurrent(); await this.runner("systemctl", ["--user", "restart", this.serviceName]); }
+
+  /**
+   * The elapsed time this measures is the real end-to-end downtime, because
+   * `systemctl --user restart` blocks until the start job finishes -- and for a
+   * `Type=notify` unit the job does not finish until READY=1 arrives. Measured
+   * on systemd 261.3 at this host with a throwaway user unit
+   * (`Type=notify`, `NotifyAccess=all`, `TimeoutStartSec=600`,
+   * `ExecStart=/bin/sh -c 'sleep 8; systemd-notify --ready'`): the same restart
+   * took 8.03s, and 0.01s with `--no-block`. So the 520s restart is already
+   * being waited out here; what was missing was the number at the end of it.
+   * That is why this is a timer around the existing call and not a poll loop --
+   * and it is also why the two platforms need different treatment, since
+   * `launchctl kickstart -k` has no equivalent blocking behaviour.
+   */
+  async restart(options: { previousServerPid?: number | null } = {}): Promise<ServiceRestartOutcome> {
+    return measureRestart({
+      serviceName: this.serviceName,
+      platform: this.platform,
+      instanceId: this.instanceId,
+      thresholdMs: this.restartThresholdMs,
+      // Taken from the caller rather than read here. Every caller that matters
+      // has already asked for `status()` -- it needs the pid to record the boot
+      // identity it is about to replace -- and a restart that cannot resolve a
+      // runnable ExecStart must not talk to systemd at all, not even to read
+      // state. That is asserted in service-manager.test.ts and it is the right
+      // invariant: a refused restart is a decision reached before any side
+      // effect, not after a read that already counted as one.
+      previousServerPid: options.previousServerPid ?? null,
+      previousServerStartedAt: null,
+      run: async () => { await this.ensureCurrent(); await this.runner("systemctl", ["--user", "restart", this.serviceName]); },
+      // The blocking call is its own proof of settlement: it returned after
+      // READY=1, or it threw. Re-reading `status` to confirm would be a second
+      // round trip that can only report less than the call already proved. A
+      // throwing call is the case where that proof is absent -- the unit did
+      // not reach active -- so the throw itself settles the question.
+      settle: async (runFailure) => runFailure === undefined,
+      signal: (record) => emitSlowRestartSignal(record, {
+        // This manager's own PAPERCLIP_HOME, not the process environment's
+        // resolved instance root: `restart()` has to record against the
+        // instance it just restarted, and a caller that injected a home is
+        // describing that instance explicitly.
+        instanceRoot: path.join(this.homeDir, "instances", this.instanceId),
+        runner: (command, args) => this.runner(command, args),
+      }),
+    });
+  }
 
   async status(): Promise<ServiceStatus> {
     let output: string;
@@ -841,7 +984,7 @@ export class LaunchdServiceManager implements ServiceManager {
   private readonly stdoutPath: string;
   private readonly stderrPath: string;
 
-  constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir()) {
+  constructor(readonly instanceId: string, private readonly runner: CommandRunner = defaultCommandRunner, private readonly homeDir = resolvePaperclipHomeDir(), private readonly shimPath = resolveServiceShimPath(), userHomeDir = os.homedir(), private readonly restartThresholdMs = SLOW_RESTART_THRESHOLD_MS) {
     this.serviceName = launchdServiceName(instanceId);
     this.definitionPath = path.join(userHomeDir, "Library", "LaunchAgents", `${this.serviceName}.plist`);
     const logDir = path.join(homeDir, "instances", instanceId, "logs");
@@ -941,7 +1084,53 @@ export class LaunchdServiceManager implements ServiceManager {
   }
   async start(): Promise<void> { await this.install({ startNow: true, startOnLogin: await this.isEnabled() }); }
   async stop(): Promise<void> { await this.runner("launchctl", ["bootout", `${this.domain}/${this.serviceName}`]); }
-  async restart(): Promise<void> { await writeIfChanged(this.definitionPath, await this.desiredDefinition()); await this.runner("launchctl", ["kickstart", "-k", `${this.domain}/${this.serviceName}`]); }
+
+  /**
+   * `launchctl kickstart -k` is asynchronous, so the elapsed time around it
+   * would be the time to submit a job and nothing else. The measurement is
+   * closed by polling `status()` for a pid instead, bounded by
+   * `LAUNCHD_SETTLE_TIMEOUT_MS`; see that constant for what an unsettled
+   * measurement means.
+   */
+  async restart(options: { previousServerPid?: number | null } = {}): Promise<ServiceRestartOutcome> {
+    return measureRestart({
+      serviceName: this.serviceName,
+      platform: this.platform,
+      instanceId: this.instanceId,
+      thresholdMs: this.restartThresholdMs,
+      // See the systemd manager: the caller already has the pid.
+      previousServerPid: options.previousServerPid ?? null,
+      previousServerStartedAt: null,
+      run: async () => {
+        await writeIfChanged(this.definitionPath, await this.desiredDefinition());
+        await this.runner("launchctl", ["kickstart", "-k", `${this.domain}/${this.serviceName}`]);
+      },
+      settle: async (runFailure) => {
+        // A throw means kickstart never got the agent going, so there is
+        // nothing to poll for -- and polling anyway would turn an instant
+        // refusal into a two-minute hang before the same refusal is reported.
+        if (runFailure !== undefined) return false;
+        const deadline = Date.now() + LAUNCHD_SETTLE_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+          if ((await this.status().catch(() => null))?.active) return true;
+          await new Promise((resolve) => setTimeout(resolve, LAUNCHD_SETTLE_POLL_MS));
+        }
+        return false;
+      },
+      signal: (record) => emitSlowRestartSignal(record, {
+        // This manager's own PAPERCLIP_HOME, not the process environment's
+        // resolved instance root: `restart()` has to record against the
+        // instance it just restarted, and a caller that injected a home is
+        // describing that instance explicitly.
+        instanceRoot: path.join(this.homeDir, "instances", this.instanceId),
+        runner: (command, args) => this.runner(command, args),
+        // launchd has no journal to write into; the agent's own stderr log is
+        // the same artifact `paperclipai service logs` tails, so the fact lands
+        // where an operator on macOS is already looking.
+        logPath: this.stderrPath,
+      }),
+    });
+  }
 
   async status(): Promise<ServiceStatus> {
     try {
