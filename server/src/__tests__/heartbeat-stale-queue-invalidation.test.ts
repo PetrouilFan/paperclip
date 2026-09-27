@@ -16,6 +16,7 @@ import {
   issueDocuments,
   issueThreadInteractions,
   issues,
+  issueRelations,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
@@ -993,6 +994,57 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
 
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("does not treat blocker-blocked assigned work as actionable timer work", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const issueId = randomUUID();
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: "Assigned work waiting on a blocker",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+      },
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Blocker that is not done",
+        status: "in_progress",
+        priority: "high",
+      },
+    ]);
+    // `issueId` is the blocker, `relatedIssueId` is the dependent.
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    // The issue cannot be worked and cannot be checked out, so a timer wake
+    // would burn a run for nothing.
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const wakeups = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups[0]?.reason).toBe("heartbeat.timer.no_actionable_work");
   });
 
   it("allows legacy generic timer wakes by default when no skip policy is set", async () => {

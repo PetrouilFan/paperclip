@@ -801,6 +801,10 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
   "timed_out",
 ] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
+// How many candidate rows `hasActionableTimerWork` probes for dependency
+// readiness before answering. The question is boolean, so a bounded page is
+// enough to skip the readiness round-trip entirely for an agent with no work.
+const TIMER_ACTIONABLE_READINESS_PROBE_LIMIT = 25;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -17112,7 +17116,11 @@ export function heartbeatService(
   }
 
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
+    // A blocker-blocked `todo`/`in_progress` issue cannot be worked: checkout
+    // 422s on it and the dispatch it would produce is cancelled at claim time.
+    // Selecting a few candidates and dropping the unresolved ones keeps a timer
+    // from reporting phantom work that keeps the agent awake for nothing.
+    const rows = await db
       .select({ id: issues.id })
       .from(issues)
       .where(
@@ -17126,9 +17134,19 @@ export function heartbeatService(
           nonIdleSlackIssueCondition(),
         ),
       )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+      .limit(TIMER_ACTIONABLE_READINESS_PROBE_LIMIT);
+
+    if (rows.length === 0) return false;
+
+    const readinessMap = await issuesSvc.listDependencyReadiness(
+      agent.companyId,
+      rows.map((row) => row.id),
+    );
+    return rows.some((row) => {
+      const readiness = readinessMap.get(row.id);
+      if (!readiness) return true;
+      return readiness.unresolvedBlockerCount === 0;
+    });
   }
 
   /**

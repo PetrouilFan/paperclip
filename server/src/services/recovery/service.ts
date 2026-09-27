@@ -4259,6 +4259,7 @@ export function recoveryService(
       recentProgressExempted: 0,
       operatorCancelExempted: 0,
       onboardingFirstTaskExempted: 0,
+      unresolvedBlockerExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -4965,6 +4966,20 @@ export function recoveryService(
           // as stranded).
           if (await isOnboardingFirstTaskAwaitingUser(issue)) {
             result.onboardingFirstTaskExempted += 1;
+            continue;
+          }
+
+          // A `todo` issue whose blockers are unresolved is not startable: the
+          // queued run can only be cancelled by `claimQueuedRun`, so dispatching it
+          // manufactures a guaranteed-doomed run row and a wake request on every
+          // sweep. `POST /checkout` also 422s on the blocker, so the assignee can
+          // make no progress from the run either. The issue unblocks itself when
+          // its last blocker reaches `done`, which fires `issue_blockers_resolved`.
+          const todoReadiness = (
+            await issuesSvc.listDependencyReadiness(issue.companyId, [issue.id])
+          ).get(issue.id);
+          if (todoReadiness && todoReadiness.unresolvedBlockerCount > 0) {
+            result.unresolvedBlockerExempted += 1;
             continue;
           }
 
