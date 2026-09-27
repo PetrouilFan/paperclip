@@ -4374,7 +4374,14 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
       ),
       stateDirectory,
       lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
-      runnerReconnectGraceMs: 5_000,
+      // This test asserts event ownership, not the reconnect fail-fast policy,
+      // so the production 5s default is not what is under test here. `lost-ack`
+      // drops the active runner and waits for it to re-activate, and a loaded
+      // 1000-test shard stretches that past 5s often enough to make the
+      // transport throw `native_runner_warm_transition_activation_pending`
+      // before any ownership assertion is reached. Give the activation real
+      // headroom; the deadline that matters to this test is the case timeout.
+      runnerReconnectGraceMs: 20_000,
     });
     const readRunner = async () =>
       JSON.parse(
@@ -4476,7 +4483,11 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         expect(rotations).toHaveLength(0);
         if (mode === "lost-ack") core.disconnectActiveRunner();
         releaseCommit();
-        await within("warm attach after old ACK", attachment, 10_000);
+        // Must outlast `runnerReconnectGraceMs` above, because the attach
+        // resolves only after the re-activated runner settles. The two windows
+        // are one budget: tightening either one alone just moves the failure
+        // from the transport's deadline to this gate.
+        await within("warm attach after old ACK", attachment, 30_000);
         expect(rotations).toHaveLength(1);
         const retired = rotations[0]!;
         const heldSourceEventId = heldEvent!.sourceEventId;
@@ -4514,7 +4525,7 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
                 owners(),
               ),
             ).toBe(1),
-          { timeout: 5_000, interval: 25 },
+          { timeout: 15_000, interval: 25 },
         );
         const owner = owners()[0]!;
         expect(owner.event.logicalEffectCount).toBe(1);
@@ -4545,8 +4556,9 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         } else {
           expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(1);
         }
-        await vi.waitFor(async () =>
-          expect((await readRunner()).runId).toBe("run-warm-ack-next"),
+        await vi.waitFor(
+          async () => expect((await readRunner()).runId).toBe("run-warm-ack-next"),
+          { timeout: 10_000, interval: 50 },
         );
         const read = await within(
           "read under new authority",
@@ -4586,12 +4598,15 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
             expect(handle.processGroupId && dead(-handle.processGroupId)).toBe(
               true,
             );
-          });
+          }, { timeout: 10_000, interval: 50 });
         }
         if (providerPid && !dead(-providerPid))
           process.kill(-providerPid, "SIGKILL");
         if (providerPid)
-          await vi.waitFor(() => expect(dead(-providerPid!)).toBe(true));
+          await vi.waitFor(() => expect(dead(-providerPid!)).toBe(true), {
+            timeout: 10_000,
+            interval: 50,
+          });
         cleanupProven = true;
       } catch (error) {
         if (primaryError === undefined) throw error;
@@ -4610,7 +4625,7 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
       }
     }
   },
-  30_000,
+  60_000,
 );
 
 it.each([false, true])(
