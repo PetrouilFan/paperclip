@@ -37,6 +37,75 @@ const io = (fetcher: typeof fetch): RunnerApiIo => ({
   }),
 });
 
+// The zero-result assertion below needs a query that matches nothing, so every
+// token of it must be a word the catalog never writes. searchRunnerApi is an OR
+// ranker, so a single matchable token is enough to make the probe fail. An
+// earlier probe, "nothing-zzzzzzzzzz", was nonsense only in its distinguishing
+// half: it carried the ordinary word "nothing", and the issues-count
+// description ends in "they mean nothing here", so the probe matched that one
+// operation and the assertion read "expected 1 to be 0".
+//
+// That rule used to live in a comment, and a comment does not fail a build. So
+// the tokens are filtered against the catalog's own word set. A token that
+// catalog prose has since swallowed now fails the test by name, instead of
+// surfacing later as a count.
+//
+// The filter does not pick a probe and does not repair one. The candidates stay
+// hardcoded literals. When one rots the test fails and a human writes new
+// nonsense, so the failure is legible, not self-healing.
+const NEGATIVE_CONTROL_CANDIDATES = [
+  "qqzzz",
+  "xvvv",
+  "4417",
+  "zqxjwvb",
+  "vvxq",
+  "zzyzxw",
+  "qjvzxw",
+  "xzqjv",
+];
+const MINIMUM_NEGATIVE_CONTROL_TOKENS = 3;
+
+// runner-api-catalog.ts does not export its tokenizer, so this vocabulary is a
+// second derivation of it. It reads the same six text fields the ranker reads
+// but it skips the ranker's synonym and plural folding, so it can keep a token
+// the ranker still matches. Every surviving token is therefore also checked
+// against the ranker itself, so a vocabulary that went stale cannot quietly let
+// one through.
+const catalogVocabulary = (() => {
+  const vocabulary = new Set<string>();
+  for (const operation of runnerApiCatalog()) {
+    const ranked = `${operation.method} ${operation.path} ${operation.summary} ${operation.description} ${operation.skillReference?.description ?? ""} ${operation.skillReference?.section ?? ""}`;
+    for (const word of ranked.toLowerCase().split(/[^a-z0-9]+/)) {
+      if (word) vocabulary.add(word);
+    }
+  }
+  return vocabulary;
+})();
+
+const negativeControlTokens = (
+  candidates: string[],
+  minimum: number,
+): string[] => {
+  const swallowed = candidates.filter((candidate) =>
+    catalogVocabulary.has(candidate),
+  );
+  expect(
+    swallowed,
+    `these negative-control candidates are catalog text now, so they can no longer prove a zero result; write new nonsense tokens: ${swallowed.join(", ")}`,
+  ).toEqual([]);
+  const kept = candidates.filter((candidate) => !catalogVocabulary.has(candidate));
+  expect(
+    kept.length,
+    `only ${kept.length} of ${candidates.length} negative-control candidates are absent from the catalog, and the probe needs at least ${minimum}`,
+  ).toBeGreaterThanOrEqual(minimum);
+  const stale = kept.filter((token) => searchRunnerApi({ query: token }).total > 0);
+  expect(
+    stale,
+    `these negative-control candidates are absent from the derived vocabulary but still match the ranker, so the vocabulary above has drifted from words(): ${stale.join(", ")}`,
+  ).toEqual([]);
+  return kept;
+};
+
 describe("runner API catalog", () => {
   it("accounts for unique operations with resolved request contracts", () => {
     const catalog = runnerApiCatalog();
@@ -90,14 +159,14 @@ describe("runner API catalog", () => {
       searchRunnerApi({ query: "GET /api/companies/{companyId}/issues" })
         .results[0].dedicatedTools,
     ).toContain("search_tasks");
-    // Every token of the probe must be a token the catalog never uses, because
-    // searchRunnerApi scores every token it can find. An earlier probe,
-    // "nothing-zzzzzzzzzz", was only nonsense in its distinguishing half: it
-    // carried the ordinary word "nothing", and the issues-count description ends
-    // in "they mean nothing here", so the probe matched that one operation and
-    // this assertion failed on any commit that wrote that sentence. A probe
-    // that reads like English is a probe that breaks when the prose changes.
-    expect(searchRunnerApi({ query: "qqzzz-xvvv-4417" }).total).toBe(0);
+    // Every token of the probe must be a word the catalog never uses, and
+    // negativeControlTokens fails by name when that stops being true, so the
+    // failure says which token rotted. See the note above the candidate list.
+    const negativeControl = negativeControlTokens(
+      NEGATIVE_CONTROL_CANDIDATES,
+      MINIMUM_NEGATIVE_CONTROL_TOKENS,
+    ).join("-");
+    expect(searchRunnerApi({ query: negativeControl }).total).toBe(0);
   });
   it("keeps real matches when the query also carries a term the catalog never contains", () => {
     // searchRunnerApi is an OR ranker, on purpose. Natural-language queries
