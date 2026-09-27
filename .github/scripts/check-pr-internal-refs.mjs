@@ -14,13 +14,91 @@
  * The rule bans identifiers from *your own instance's* namespace, and this
  * repository is a fork. The canonical product's own identifier namespace is
  * `PAP-`/`PAPA-`, and the fork inherits it legitimately: on this repository's
- * master, `\b(PAP|PAPA)-[0-9]+` matches 734 files including the whole `ui/`
+ * master, `\b(PAP|PAPA)-[0-9]+` matches 736 files including the whole `ui/`
  * tree, because `PAP-1/child` is a canonical test fixture in
  * `cli/src/__tests__/common.test.ts` and a canonical route in 90+ files
  * (`/PAP/issues/...`). A gate written as "PET, PAP or PAPA" is born failing on
  * the product, gets disabled within a day, and a disabled gate reads as "we
  * checked". So the default list is the instance prefix alone, and a deployment
  * that wants more prefixes names them.
+ *
+ * ## Why there is a second, open matcher, and what it is not allowed to match
+ *
+ * The list above is closed by construction, and the rule text is not. It bans
+ * "any `{PREFIX}-{NUMBER}` identifier that isn't a public GitHub issue number",
+ * which is a shape, not a list — so a prefix nobody configured walks straight
+ * through. It is not hypothetical: PR #85 merged to `master` as `1220016a0`
+ * with `TASK-482` written three times in its *Steps to reproduce*, `review`
+ * green, and a reviewer on github.com unable to open any of them.
+ *
+ * Widening `DEFAULT_INTERNAL_REF_PREFIXES` to name more prefixes does not fix
+ * it, for the reason the section above already gives: every prefix added is a
+ * prefix that has to be guessed, and the ones this repository does not name are
+ * unbounded. So the second matcher matches the *shape* instead of a list. What
+ * keeps that from being born failing is measured, not argued — see
+ * "the measurement" below.
+ *
+ * ### the measurement
+ *
+ * Replayed over the 60 most recent pull requests on this fork, the bare shape
+ * `[A-Z][A-Z0-9]+-\d+` applied to title and body flags 10 of the 60. Eight of
+ * those are already caught by the configured prefix. The tokens it reaches
+ * *past* the configured list are exactly three, and two of them are the reason
+ * this matcher is not just the bare shape:
+ *
+ * - `GPT-5`, in four pull requests (#48, #67, #75, #87), every one of them in a
+ *   **Model Used** section naming the model. A matcher that fails the pull
+ *   request that documents the model which wrote it is a matcher that gets
+ *   disabled within a day, and a disabled gate reads as "we checked".
+ * - `PROJ-123`, in #67, where it is the *shape* of a config value being
+ *   documented rather than a ticket being pointed at.
+ * - `TASK-482`, in #85, which is the one that is real.
+ *
+ * The fix is a second condition, not a longer blocklist: the shape only counts
+ * where an id is being *referred to*. Three positions qualify, and they are
+ * all positions a ticket id is written into rather than mentioned in:
+ *
+ * - an issue-router path — `/issues/TASK-482`, `/api/issues/{TASK-482}/checkout`
+ * - a `#` reference — `#TASK-482`
+ * - a reference verb — `Fixes TASK-482`, `ticket TASK-482`, `see TASK-482`
+ *
+ * Under that rule the same 60 pull requests produce exactly one finding from
+ * this tier: #85, `TASK-482`. `GPT-5` and `PROJ-123` both pass, and no branch
+ * name in the population produces one. That is the property worth having — a
+ * gate that adds one true positive and zero false positives to sixty real pull
+ * requests can be merged without anyone having to decide whether to trust it.
+ *
+ * This is the same split the address rule below rests on, one level up: there,
+ * prose that names `127.0.0.1` passes and a URL pointing at it fails; here,
+ * prose that names `GPT-5` passes and a path pointing at `TASK-482` fails.
+ *
+ * ### the boundaries this matcher does not claim
+ *
+ * Stated as boundaries rather than left to be discovered, because each one is a
+ * real case a reviewer will try:
+ *
+ * - **Not case-insensitive.** `utf-8`, `sha-256`, `http-404` and `gpt-5` are
+ *   ordinary prose, and a case-insensitive open shape matches all four. A
+ *   lowercase ticket prefix is still caught, by the configured list, which is
+ *   case-insensitive precisely because it knows its prefix.
+ * - **Not the compact form, anywhere.** `fix/SHA256-digest` is a perfectly good
+ *   branch name and nothing structural separates it from `fix/task482-thing`,
+ *   so an open compact shape is a blocklist wearing a shape. The configured
+ *   list is what catches `fix/pet392-blocker-edge`, which is the compact case
+ *   that has actually been observed on this fork.
+ * - **Not on a prepositional mention.** "the defect in TASK-482" is not a
+ *   reference position, and `UTF-8` is not either. The same reason a bare
+ *   `10.0.0.7` is left alone below: reaching for it fires on correct work.
+ * - **Not on the diff.** 736 files on `master` carry `PAP-`/`PAPA-` legitimately.
+ *   The configured list, which knows those prefixes, is what covers the diff.
+ *
+ * The one surface that does not require a reference position is the branch
+ * name, because a branch name is not prose containing a reference — it is the
+ * name, and there is no verb, no `#` and no path in it for the rules to key on.
+ * The bare separated shape is measured there rather than assumed: over the 96
+ * distinct branch names that have been a pull request head on this fork it
+ * flags none. Its one cost is stated rather than hidden — a branch called
+ * `fix/UTF-8-normalization` fails, and the remedy is a rename.
  *
  * ## Instance-local addresses: why authored text only
  *
@@ -72,6 +150,24 @@ import { fileURLToPath } from 'node:url';
 
 /** The instance prefix this repository's own board issues carry. */
 export const DEFAULT_INTERNAL_REF_PREFIXES = ['PET'];
+
+/**
+ * Namespaces the open matcher must not claim, because the product owns them.
+ *
+ * This is an exemption, not a prefix list, and the difference is the whole
+ * reason the open matcher is usable: `DEFAULT_INTERNAL_REF_PREFIXES` is
+ * "identifiers I issued", and adding to it makes the gate stricter, whereas
+ * every entry here makes it *looser* and therefore has to be earned. `PAP` and
+ * `PAPA` are earned by the header's measurement — they are the canonical
+ * product's own namespace, the fork inherits it legitimately, and 736 files on
+ * `master` carry it.
+ *
+ * An empty or malformed list is a configuration error rather than a default,
+ * because the failure mode is silent in the dangerous direction: drop the
+ * entries and every honest mention of `/PAP/issues/PAP-1` in a pull request
+ * body starts failing, which is how a gate acquires a reputation for noise.
+ */
+export const DEFAULT_PRODUCT_OWNED_PREFIXES = ['PAP', 'PAPA'];
 
 /** GitHub's hard ceiling on a pull request's changed-file list. */
 export const MAX_PR_FILES = 3000;
@@ -163,6 +259,54 @@ export function resolvePrefixes(raw) {
 }
 
 /**
+ * Resolves and validates the product-owned exemption list. Same contract as
+ * `resolvePrefixes`: a configuration error is returned, never thrown, and the
+ * caller turns it into a failure.
+ */
+export function resolveProductOwnedPrefixes(raw) {
+  const source = raw === undefined || raw === null ? DEFAULT_PRODUCT_OWNED_PREFIXES : raw;
+  const entries = Array.isArray(source) ? source : typeof source === 'string' ? source.split(',') : null;
+  if (entries === null) {
+    return {
+      configError:
+        'PRODUCT_OWNED_REF_PREFIXES must be a comma-separated string or an array of prefixes, ' +
+        `got ${typeof source}. Refusing to run a matcher whose exemptions cannot be read.`,
+    };
+  }
+
+  const list = entries.map((entry) => String(entry).trim()).filter((entry) => entry.length > 0);
+  if (list.length === 0) {
+    return {
+      configError:
+        'PRODUCT_OWNED_REF_PREFIXES is set but resolved to no prefixes. That would make every ' +
+        'mention of the product\'s own `PAP-`/`PAPA-` namespace a failure, including the canonical ' +
+        'route shape. Unset it, or name at least one prefix.',
+    };
+  }
+
+  const bad = list.filter((entry) => !/^[A-Za-z][A-Za-z0-9]{1,9}$/.test(entry));
+  if (bad.length > 0) {
+    return {
+      configError:
+        `PRODUCT_OWNED_REF_PREFIXES holds ${bad.length === 1 ? 'an entry' : 'entries'} that cannot be an ` +
+        `identifier prefix: ${bad.map((e) => `"${e}"`).join(', ')}. Expected 2-10 characters, starting with ` +
+        'a letter, letters and digits only.',
+    };
+  }
+
+  const seen = new Set();
+  const owned = [];
+  for (const entry of list) {
+    const key = entry.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    owned.push(key);
+  }
+
+  return { owned };
+}
+
+/**
  * Builds the matchers for one prefix.
  *
  * Two shapes per prefix, because the identifier is written both ways and a
@@ -196,6 +340,119 @@ function findAll(text, pattern) {
   while ((match = pattern.exec(text)) !== null) {
     found.add(match[0]);
     if (match.index === pattern.lastIndex) pattern.lastIndex += 1;
+  }
+  return [...found];
+}
+
+/**
+ * `findAll`, but keyed on the first capture group rather than the whole match.
+ *
+ * The open-shape rules match more than the identifier — `issues/PAP-224` is a
+ * path segment plus an id, and `#TASK-482` is a sigil plus an id — and the
+ * exemption check has to see the id alone. Returning `match[0]` would compare
+ * `issues/PAP` against a list of prefixes, never match, and report the
+ * product's own namespace as a leak.
+ */
+function findAllCaptured(text, pattern) {
+  const found = new Set();
+  pattern.lastIndex = 0;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    found.add(match[1] ?? match[0]);
+    if (match.index === pattern.lastIndex) pattern.lastIndex += 1;
+  }
+  return [...found];
+}
+
+/**
+ * The open identifier shape, and the three positions a reference goes.
+ *
+ * `OPEN_SHAPE` is deliberately not case-insensitive and carries no `i` flag, so
+ * the verb alternation below spells both cases by hand. Adding `i` here would
+ * silently make `[A-Z]` match `[a-z]` and the matcher would start claiming
+ * `utf-8` and `sha-256` — see the header's boundaries.
+ */
+const OPEN_SHAPE = String.raw`[A-Z][A-Z0-9]{1,9}-\d+\b`;
+
+/**
+ * The bare separated shape, with no reference-position requirement.
+ *
+ * Used on exactly one surface — the branch name. A branch name is not prose
+ * with a reference in it; it *is* the name, so there is no verb, no `#` and no
+ * path for the reference rules to key on, and `fix/TASK-482-unbound-target`
+ * would otherwise pass. Measured over the 96 distinct branch names that have
+ * been a pull request head on this fork, this shape flags none of them, so the
+ * one cost it carries is theoretical: a branch named `fix/UTF-8-normalization`
+ * fails, and the remedy is to rename the branch, which costs nothing before the
+ * branch is pushed and nothing after.
+ *
+ * The compact form stays out on every surface. `fix/SHA256-digest` is a
+ * perfectly good branch name and nothing structural separates it from
+ * `fix/task482-thing`; the configured list already catches the instance's own
+ * lowercase prefix, which is the case that has actually been observed.
+ */
+const OPEN_SHAPE_LOOSE = new RegExp(String.raw`${NOT_IN_WORD}(${OPEN_SHAPE})`, 'g');
+
+
+/**
+ * The gap between a reference verb and the id it refers to.
+ *
+ * Authors quote the id they have just named, so the reference is usually
+ * written `` `TASK-482` `` or `"TASK-482"`, and a matcher that insists on a
+ * single space misses the form that actually appears — that gap is what made
+ * the first cut of the verb rule read #85 as clean. Held as a plain string
+ * because it contains a backtick, which cannot appear unescaped inside the
+ * template literal the rules themselves are written in.
+ */
+const REF_GAP = "[: #`\"'({\\[]*";
+
+const OPEN_REF_RULES = [
+  // `/issues/TASK-482`, `POST /api/issues/{TASK-482}/checkout`. The `{$?` is a
+  // URL template placeholder, which is how #85 wrote the step the finding is
+  // about: a reader copying that curl gets a shell brace, not an issue.
+  new RegExp(String.raw`\b(?:issues|agents|documents)/[{]?(?:\$\{)?(${OPEN_SHAPE})`, 'g'),
+  // `#TASK-482`. A `#` followed by a space is a Markdown heading and is not
+  // matched; `#123` is a public GitHub reference and has no prefix to match.
+  new RegExp(String.raw`(?<![A-Za-z0-9_])#(${OPEN_SHAPE})`, 'g'),
+  // `Fixes TASK-482`, `ticket TASK-482`, `see TASK-482`.
+  new RegExp(
+    String.raw`\b(?:[Ff]ix(?:e[sd])?|[Cc]los(?:e[sd])?|[Rr]ef(?:s|erenced)?|[Ss]ee|[Tt]ickets?|[Tt]asks?|[Bb]ugs?)\b${REF_GAP}(${OPEN_SHAPE})`,
+    'g',
+  ),
+];
+
+/**
+ * Every `{PREFIX}-{NUMBER}` reference in one string whose prefix this
+ * deployment has not accounted for, de-duplicated.
+ *
+ * `owned` is the resolved product-owned list from `resolveProductOwnedPrefixes`;
+ * `alreadyFound` is what the configured-prefix matchers already reported on the
+ * same surface, and it is subtracted here so that one id is one finding even
+ * when both tiers can see it. The second half of that is not cosmetic: the
+ * conventional-commit prefix `fix:` is also a reference verb, so a title
+ * reading `fix: PET-392` is visible to both matchers, and an author who fixed
+ * one identifier and got two paragraphs about it learns to skip the gate.
+ *
+ * `requireReference: false` drops the reference-position condition, and is used
+ * on the branch-name surface only. See `OPEN_SHAPE_LOOSE`.
+ */
+export function findUnknownInternalRefs(
+  text,
+  owned = DEFAULT_PRODUCT_OWNED_PREFIXES,
+  alreadyFound = [],
+  { requireReference = true } = {},
+) {
+  if (typeof text !== 'string' || text.length === 0) return [];
+  const exempt = new Set(owned.map((p) => p.toLowerCase()));
+  const seen = new Set(alreadyFound.map((h) => String(h).toLowerCase()));
+  const found = new Set();
+  for (const rule of requireReference ? OPEN_REF_RULES : [OPEN_SHAPE_LOOSE]) {
+    for (const hit of findAllCaptured(text, rule)) {
+      const prefix = hit.slice(0, hit.lastIndexOf('-'));
+      if (exempt.has(prefix.toLowerCase())) continue;
+      if (seen.has(hit.toLowerCase())) continue;
+      found.add(hit);
+    }
   }
   return [...found];
 }
@@ -340,6 +597,7 @@ export function patchIsComplete(patch) {
  * @param {Array<{commit?: {message?: string}}>} [input.commits]
  * @param {Array<object>} [input.files]  entries of `/pulls/{n}/files`
  * @param {string|string[]|undefined} [input.prefixes]
+ * @param {string|string[]|undefined} [input.productOwnedPrefixes]
  * @returns {{passed: boolean, failures: string[]}}
  */
 export function checkInternalRefs({
@@ -349,9 +607,13 @@ export function checkInternalRefs({
   commits = [],
   files = [],
   prefixes,
+  productOwnedPrefixes,
 } = {}) {
   const { prefixes: resolved, configError } = resolvePrefixes(prefixes);
   if (configError) return { passed: false, failures: [configError] };
+
+  const { owned, configError: ownedError } = resolveProductOwnedPrefixes(productOwnedPrefixes);
+  if (ownedError) return { passed: false, failures: [ownedError] };
 
   const { separated, compact, link } = buildMatchers(resolved);
   const prefixLabel = resolved.map((p) => `${p}-<number>`).join(', ');
@@ -397,12 +659,42 @@ export function checkInternalRefs({
     }
   };
 
+  /**
+   * The open-shape half of the same rule, on the same four authored surfaces.
+   *
+   * Its own report text, because this finding is a different mistake from a
+   * configured-prefix finding and the fix is different. A `PET-` id is a
+   * coordinate from this instance's board. An unconfigured `TASK-482` is the
+   * same mistake made by a tool whose namespace nobody here configured, and the
+   * only way to write the body correctly is to stop pointing at the ticket
+   * altogether — so the failure has to say that, or the author adds a second
+   * prefix to the config and the hole moves rather than closes.
+   */
+  const unknownReport = (surface, location, text, owned, alreadyFound, extra = '', options = {}) => {
+    const hits = findUnknownInternalRefs(text, owned, alreadyFound, options);
+    if (hits.length === 0) return;
+    const listed = [...hits].slice(0, 8).map((h) => `\`${h}\``).join(', ');
+    failures.push(
+      `${surface} refers to ${listed}${hits.length > 8 ? ` (and ${hits.length - 8} more)` : ''} — ` +
+      'an issue identifier in a namespace this repository has no exemption for. ' +
+      'CONTRIBUTING.md ("No Internal Issue References") bans `{PREFIX}-{NUMBER}` that is not a public GitHub ' +
+      'issue number, because a reviewer on github.com cannot open it. Restate what the issue was in plain ' +
+      'English and delete the reference.' +
+      (extra ? ` ${extra}` : '')
+    );
+    if (location) {
+      failures.push(`  ↳ found in ${location}`);
+    }
+  };
+
   // --- Surface 1: PR title -------------------------------------------------
   const titleHits = [...findAll(prTitle, separated), ...findAll(prTitle, compact), ...findAll(prTitle, link)];
   if (titleHits.length > 0) {
     report('The PR title', null, titleHits,
       'A squash merge takes the PR title as the commit subject, so this becomes permanent history and cannot be cleaned up afterwards without a rewrite.');
   }
+  unknownReport('The PR title', null, prTitle, owned, titleHits,
+    'A squash merge takes the PR title as the commit subject, so this becomes permanent history and cannot be cleaned up afterwards without a rewrite.');
   hostReport('The PR title', null, prTitle,
     'A squash merge takes the PR title as the commit subject, so an instance address in a title is permanent history.');
 
@@ -412,6 +704,8 @@ export function checkInternalRefs({
     report('The PR description', null, bodyHits,
       'The description should carry the reasoning, not the coordinates of a ticket nobody outside this instance can open.');
   }
+  unknownReport('The PR description', null, prBody, owned, bodyHits,
+    'A repro step is where these arrive, because the id is the one part of the step a reader cannot reconstruct. Say what the issue was, not what number it had here.');
   hostReport('The PR description', null, prBody,
     'A curl line or a config snippet pasted verbatim is where these arrive: the endpoint is the one thing a reader cannot reconstruct.');
 
@@ -421,6 +715,12 @@ export function checkInternalRefs({
     report(`The branch name \`${prBranch}\``, null, branchHits,
       'CONTRIBUTING.md ("Branch Naming") asks for a name describing the change, and ships the rename snippet for exactly this case.');
   }
+  // No reference-position requirement here, and only here: a branch name has
+  // no verb, no `#` and no path to key on, so the reference rules would never
+  // fire and `fix/TASK-482-unbound-target` would pass.
+  unknownReport(`The branch name \`${prBranch}\``, null, prBranch, owned, branchHits,
+    'CONTRIBUTING.md ("Branch Naming") asks for a name describing the change, and ships the rename snippet for exactly this case.',
+    { requireReference: false });
   hostReport(`The branch name \`${prBranch}\``, null, prBranch,
     'A branch name is published on the PR and outlives the merge.');
   // On this surface the address rule can only ever fire on a bare `.ts.net`
@@ -460,6 +760,8 @@ export function checkInternalRefs({
     const message = commit?.commit?.message;
     if (typeof message !== 'string') continue;
     const firstLine = message.split('\n')[0];
+    unknownReport('A commit subject', firstLine.trim().slice(0, 80), firstLine, owned, [],
+      'Rewrite the subject (`git rebase -i`, `reword`); a merged subject is permanent history.');
     if (findInstanceHosts(firstLine).length > 0) {
       hostReport('A commit subject', firstLine.trim().slice(0, 80), firstLine,
         'Rewrite the subject (`git rebase -i`, `reword`); a merged subject is permanent history.');
@@ -562,6 +864,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     commits: JSON.parse(process.env.PR_COMMITS ?? '[]'),
     files: JSON.parse(process.env.PR_FILES ?? '[]'),
     prefixes: process.env.INTERNAL_REF_PREFIXES,
+    productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,
   });
   console.log(JSON.stringify(result, null, 2));
   process.exit(result.passed ? 0 : 1);
