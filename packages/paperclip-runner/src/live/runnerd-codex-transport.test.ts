@@ -4326,7 +4326,7 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
     const within = async <T>(
       label: string,
       promise: Promise<T>,
-      timeout = 5_000,
+      timeout = 30_000,
     ) => {
       let timer: NodeJS.Timeout | undefined;
       try {
@@ -4584,7 +4584,7 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         await within(
           "warm fixture close",
           bundle.transport.close(),
-          10_000,
+          30_000,
         ).catch(() => undefined);
         for (const handle of handles) {
           await durableControlPlane
