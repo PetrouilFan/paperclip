@@ -770,19 +770,133 @@ const OPEN_REF_RULES = [
  *
  * `requireReference: false` drops the reference-position condition, and is used
  * on the branch-name surface only. See `OPEN_SHAPE_LOOSE`.
+ *
+ * `maskInlineCode: true` is the commit-body surface, and it is the whole of the
+ * fix for the open tier's path rule on bodies: see `maskInlineCodeSpans` for
+ * the rule, the three-commit measurement it came from and the one case it
+ * deliberately leaves failing. Titles, descriptions, comments and branch names
+ * do not set it — none of them is a document whose topic is a URL shape.
  */
+/**
+ * The path-shaped rule, and the reason a commit body is the one surface that
+ * runs it against text with inline code spans removed.
+ *
+ * An inline code span is a *quotation of a token or a shape*, and a commit body
+ * is the one authored surface where quoting one is the entire point of the
+ * commit. Replayed over the 4678 commits on `origin/master`, the bare-path rule
+ * fired on six bodies, and two of the six are that case and cannot be reworded
+ * around:
+ *
+ * - `bc0a076e` *stop linking foreign tracker keys as Paperclip issues* — the
+ *   body is the rule about the token: "That renderer auto-links any
+ *   `IDENT-123`-shaped token to an internal `/issues/IDENT-123` link".
+ * - `d6bee62f` *Cloud tenant issue identifier routes* — the body is the bug
+ *   report: "`/api/issues/PC1897-1` skipped identifier lookup and fell through".
+ *
+ * A third, `af0e05f3` *onboarding wizard navigates to dashboard*, names the
+ * path outside any code span ("(e.g. /JAR/issues/JAR-1)"), and deliberately
+ * still fails: it is a bare path in running prose, which is the form a reader
+ * could paste, and the remedy for it is to genericise the id
+ * (`/JAR/issues/<id>`) rather than to escape a code span. One commit in 4678 is
+ * a different proposition from three in six.
+ *
+ * Fenced blocks are NOT masked, whether the fence is backticks or a tilde. A
+ * fenced block is a runnable artifact and a `/issues/TASK-482` inside one is a
+ * path a reviewer can paste, which is the case the rule exists for; masking
+ * ```` ```\nPOST /api/issues/TASK-482/checkout\n``` ```` would have been a
+ * false negative in the exact shape the rule is written for.
+ *
+ * @param {string} text
+ * @returns {string} the same text, same length and same line breaks, with the
+ *   contents of every inline code span replaced by spaces. Fenced regions are
+ *   returned untouched.
+ */
+export function maskInlineCodeSpans(text) {
+  if (typeof text !== 'string' || !text.includes('`')) return text;
+  const n = text.length;
+  const out = text.split('');
+  // The start of the line containing `i`, so "does this run open a line" is a
+  // question about the characters between the two rather than a regex that has
+  // to know about newlines.
+  const lineStartOf = (i) => {
+    let k = i - 1;
+    while (k >= 0 && text[k] !== '\n') k--;
+    return k + 1;
+  };
+  const isFenceAt = (i, run) => run >= 3 && text.slice(lineStartOf(i), i).trim() === '';
+
+  let i = 0;
+  while (i < n) {
+    const ch = text[i];
+    if (ch !== '`' && ch !== '~') { i++; continue; }
+    let open = 0;
+    while (text[i + open] === ch) open++;
+
+    // A fence: skip the whole region, masked or not. The closing fence is the
+    // next line-opening run of the same character and the same minimum length.
+    if (isFenceAt(i, open)) {
+      let j = i + open;
+      let end = n;
+      while (j < n) {
+        if (text[j] === ch) {
+          let run = 0;
+          while (text[j + run] === ch) run++;
+          if (isFenceAt(j, run)) { end = j + run; break; }
+          j += run;
+          continue;
+        }
+        j++;
+      }
+      i = end;
+      continue;
+    }
+
+    // A tilde that is not a fence is ordinary text and is left for the `i++`
+    // below; only a backtick run can open an inline code span.
+    if (ch !== '`') { i += open; continue; }
+
+    // An inline span. CommonMark lets a longer run close a shorter one, so the
+    // closing run is the next run of at least the same length.
+    let j = i + open;
+    let close = 0;
+    while (j < n) {
+      if (text[j] !== '`') { j++; continue; }
+      let run = 0;
+      while (text[j + run] === '`') run++;
+      if (run >= open) { close = run; break; }
+      j += run;
+    }
+    if (j >= n) { i += open; continue; } // unterminated: not a span
+    for (let k = i + open; k < j; k++) {
+      if (out[k] !== '\n') out[k] = ' ';
+    }
+    i = j + close;
+  }
+  return out.join('');
+}
+
 export function findUnknownInternalRefs(
   text,
   owned = DEFAULT_PRODUCT_OWNED_PREFIXES,
   alreadyFound = [],
-  { requireReference = true } = {},
+  { requireReference = true, maskInlineCode = false } = {},
 ) {
   if (typeof text !== 'string' || text.length === 0) return [];
   const exempt = new Set(owned.map((p) => p.toLowerCase()));
   const seen = new Set(alreadyFound.map((h) => String(h).toLowerCase()));
   const found = new Set();
-  for (const rule of requireReference ? OPEN_REF_RULES : [OPEN_SHAPE_LOOSE]) {
-    for (const hit of findAllCaptured(text, rule)) {
+  const masked = maskInlineCode ? maskInlineCodeSpans(text) : text;
+  // Each rule is paired with the text it reads. Only the path rule (index 0)
+  // reads the masked text; the verb and `#` rules keep the original, so a
+  // `` `Closes TASK-482` `` in a code span is still a finding. The exemption is
+  // about a *path being quoted as a shape*, not about code spans being a general
+  // escape hatch, and keeping the other two rules on the original text is what
+  // stops it from becoming one.
+  const rules = requireReference
+    ? OPEN_REF_RULES.map((rule, i) => [rule, i === 0 && maskInlineCode ? masked : text])
+    : [[OPEN_SHAPE_LOOSE, text]];
+  for (const [rule, source] of rules) {
+    for (const hit of findAllCaptured(source, rule)) {
       const prefix = hit.slice(0, hit.lastIndexOf('-'));
       if (exempt.has(prefix.toLowerCase())) continue;
       if (seen.has(hit.toLowerCase())) continue;
@@ -1211,7 +1325,17 @@ export function checkInternalRefs({
     report('A commit message body', first?.location, commitBodyHits, BODY_REMEDY);
   }
   for (const [body, { hits, location }] of bodies) {
-    unknownReport('A commit message body', location, body, owned, hits, BODY_REMEDY);
+    // The one surface that masks inline code spans before the open tier reads
+    // it. See `maskInlineCodeSpans`. This is the open tier's *path* rule and
+    // nothing else: the configured tier is not masked, so this instance's own
+    // identifiers are still a finding inside a code span, in a path, or in a
+    // link.
+    //
+    // The address half is absent from this surface on purpose, and the header
+    // section "the address half stops before the commit body" is the argument.
+    // #123 removed the `findInstanceHosts` call here and that removal stands;
+    // this change keeps the masking and does not bring the host scan back.
+    unknownReport('A commit message body', location, body, owned, hits, BODY_REMEDY, { maskInlineCode: true });
   }
 
   // --- Surface 5: pull request comments ------------------------------------
