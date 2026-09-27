@@ -1,6 +1,5 @@
 import {
   asString,
-  ensurePathInEnv,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 
@@ -151,7 +150,22 @@ export async function probeOpenCodeEngineVersion(input: {
   let result: Awaited<ReturnType<typeof runChildProcess>>;
   try {
     const probeEnv: Record<string, string> = {};
-    const merged = ensurePathInEnv({ ...process.env, ...input.env });
+    // Deliberately NOT spreading `process.env`. `runChildProcess` already merges
+    // `sanitizeInheritedPaperclipEnv(process.env)` underneath `opts.env`, so the
+    // spread contributed nothing except the one thing that must not reach a
+    // child: the control plane's own `PAPERCLIP_API_KEY`, a company-scoped key
+    // carrying `responsible_user_id` that does not expire with a run. The
+    // inherited scrub deletes it from the base, then this half spread it straight
+    // back in, so `opencode --version` was handed the control plane's credential.
+    // `input.env` still passes through untouched, and PATH and HOME still arrive
+    // through the merged base.
+    //
+    // `ensurePathInEnv` is deliberately not applied here either. It substitutes
+    // `defaultPathForPlatform()` for an absent PATH, and because this half is
+    // spread after the inherited base, that substitution overwrites the server's
+    // real PATH. `runChildProcess` already calls `ensurePathInEnv` on the merged
+    // environment, which is the one place that fallback belongs.
+    const merged = { ...input.env };
     for (const [key, value] of Object.entries(merged)) {
       if (typeof value === "string") probeEnv[key] = value;
     }

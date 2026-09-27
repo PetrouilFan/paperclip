@@ -36,6 +36,51 @@ function collectLog() {
 
 const baseInput = { command: "opencode", cwd: "/tmp", env: {} as Record<string, string> };
 
+// The third of the three `process.env`-derived `env` sites. `probeOpenCodeEngineVersion`
+// used to build `probeEnv` from `{ ...process.env, ...input.env }` and pass it as
+// `opts.env`, and `runChildProcess` spreads `opts.env` over the sanitized
+// inherited base — so the spread restored the control plane's own
+// `PAPERCLIP_API_KEY` to `opencode --version` after the inherited scrub had just
+// removed it. Seeded explicitly because the test host has no key of its own to
+// leak, which would make the assertion vacuous.
+describe("openCode engine version probe child env", () => {
+  const originalApiKey = process.env.PAPERCLIP_API_KEY;
+  const originalWakePayload = process.env.PAPERCLIP_WAKE_PAYLOAD_JSON;
+
+  afterEach(() => {
+    if (originalApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
+    else process.env.PAPERCLIP_API_KEY = originalApiKey;
+    if (originalWakePayload === undefined) delete process.env.PAPERCLIP_WAKE_PAYLOAD_JSON;
+    else process.env.PAPERCLIP_WAKE_PAYLOAD_JSON = originalWakePayload;
+  });
+
+  it("does not put the control plane's API key in the probe child env", async () => {
+    process.env.PAPERCLIP_API_KEY = "server-process-key";
+    process.env.PAPERCLIP_WAKE_PAYLOAD_JSON = '{"companyId":"stale"}';
+    const spy = mockProbe({ stdout: "opencode v2.0.14" });
+
+    await probeOpenCodeEngineVersion({
+      command: "opencode",
+      cwd: "/tmp",
+      env: { PAPERCLIP_TEST_MARKER: "from-caller" },
+    });
+
+    const opts = spy.mock.calls[0]?.[3] as { env: Record<string, string> };
+    expect(opts.env.PAPERCLIP_API_KEY).toBeUndefined();
+    expect(opts.env.PAPERCLIP_WAKE_PAYLOAD_JSON).toBeUndefined();
+    // Non-vacuity: two keys are dropped, not the environment. The caller's own
+    // keys must survive, or the probe cannot resolve the command. An "empty the
+    // adapter half" fix would pass the two assertions above and fail here.
+    expect(opts.env.PAPERCLIP_TEST_MARKER).toBe("from-caller");
+    // PATH must NOT be in the adapter half. This half is spread after the
+    // inherited base, so a PATH here — including one substituted by
+    // `ensurePathInEnv` — overrides the server's real one. The real PATH
+    // arrives from the base, where `runChildProcess` applies
+    // `ensurePathInEnv` to the merged environment.
+    expect(opts.env.PATH).toBeUndefined();
+  });
+});
+
 describe("openCode engine version", () => {
   afterEach(() => {
     delete process.env[OPENCODE_EXPECTED_MAJOR_VERSION_ENV_KEY];
