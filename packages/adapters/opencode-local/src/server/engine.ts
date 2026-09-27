@@ -1,6 +1,5 @@
 import {
   asString,
-  ensurePathInEnv,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 
@@ -160,7 +159,13 @@ export async function probeOpenCodeEngineVersion(input: {
     // back in, so `opencode --version` was handed the control plane's credential.
     // `input.env` still passes through untouched, and PATH and HOME still arrive
     // through the merged base.
-    const merged = ensurePathInEnv({ ...input.env });
+    //
+    // `ensurePathInEnv` is deliberately not applied here either. It substitutes
+    // `defaultPathForPlatform()` for an absent PATH, and because this half is
+    // spread after the inherited base, that substitution overwrites the server's
+    // real PATH. `runChildProcess` already calls `ensurePathInEnv` on the merged
+    // environment, which is the one place that fallback belongs.
+    const merged = { ...input.env };
     for (const [key, value] of Object.entries(merged)) {
       if (typeof value === "string") probeEnv[key] = value;
     }

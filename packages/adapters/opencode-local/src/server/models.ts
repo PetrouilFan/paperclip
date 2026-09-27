@@ -3,7 +3,6 @@ import os from "node:os";
 import type { AdapterModel } from "@paperclipai/adapter-utils";
 import {
   asString,
-  ensurePathInEnv,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isValidOpenCodeModelId } from "../index.js";
@@ -198,13 +197,20 @@ export async function discoverOpenCodeModels(
   // inherited scrub deletes it from the base, then this half spread it straight
   // back in, so `opencode models` was handed the control plane's credential.
   // PATH and HOME still reach the child through the merged base.
-  const runtimeEnv = normalizeEnv(
-    ensurePathInEnv({
-      ...env,
-      ...(resolvedHome ? { HOME: resolvedHome } : {}),
-      OPENCODE_DISABLE_PROJECT_CONFIG: "true",
-    }),
-  );
+  //
+  // `ensurePathInEnv` is deliberately NOT applied here either. It is not a
+  // chokepoint; it is a fallback that substitutes `defaultPathForPlatform()` for
+  // an absent PATH, and because this half is spread *after* the inherited base,
+  // that substitution would overwrite the server's real PATH with a hardcoded
+  // list of eight directories. `runChildProcess` already calls
+  // `ensurePathInEnv` on the merged environment, which is the one place the
+  // fallback belongs. Applying it here made the adapter half win a value it was
+  // only meant to supply when nothing else had one.
+  const runtimeEnv = normalizeEnv({
+    ...env,
+    ...(resolvedHome ? { HOME: resolvedHome } : {}),
+    OPENCODE_DISABLE_PROJECT_CONFIG: "true",
+  });
 
   const maxAttempts = MODELS_DISCOVERY_RETRY_DELAYS_MS.length + 1;
   let lastError: Error | undefined;

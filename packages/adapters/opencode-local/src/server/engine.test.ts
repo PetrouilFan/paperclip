@@ -69,11 +69,15 @@ describe("openCode engine version probe child env", () => {
     expect(opts.env.PAPERCLIP_API_KEY).toBeUndefined();
     expect(opts.env.PAPERCLIP_WAKE_PAYLOAD_JSON).toBeUndefined();
     // Non-vacuity: two keys are dropped, not the environment. The caller's own
-    // keys and PATH must survive, or the probe cannot resolve the command. An
-    // "empty the adapter half" fix would pass the two assertions above and fail
-    // here.
+    // keys must survive, or the probe cannot resolve the command. An "empty the
+    // adapter half" fix would pass the two assertions above and fail here.
     expect(opts.env.PAPERCLIP_TEST_MARKER).toBe("from-caller");
-    expect(opts.env.PATH).toBeTruthy();
+    // PATH must NOT be in the adapter half. This half is spread after the
+    // inherited base, so a PATH here — including one substituted by
+    // `ensurePathInEnv` — overrides the server's real one. The real PATH
+    // arrives from the base, where `runChildProcess` applies
+    // `ensurePathInEnv` to the merged environment.
+    expect(opts.env.PATH).toBeUndefined();
   });
 });
 

@@ -131,16 +131,57 @@ describe("openCode models", () => {
       // Non-vacuity: two keys are dropped, not the environment. The caller's
       // own keys and the discovery-specific ones must survive — a fix that
       // emptied `opts.env` would pass the two assertions above while breaking
-      // discovery. PATH and HOME are added by `ensurePathInEnv`.
+      // discovery.
       expect(opts.env.PAPERCLIP_TEST_MARKER).toBe("from-caller");
       expect(opts.env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe("true");
-      expect(opts.env.PATH).toBeTruthy();
+      // HOME is deliberately re-resolved above and belongs in the adapter half.
       expect(opts.env.HOME).toBeTruthy();
+      // PATH must NOT be in the adapter half. This half is spread after the
+      // inherited base, so a PATH here overrides the server's real one. It
+      // arrives from the base instead, where `runChildProcess` applies
+      // `ensurePathInEnv` to the merged environment.
+      expect(opts.env.PATH).toBeUndefined();
     } finally {
       if (originalApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
       else process.env.PAPERCLIP_API_KEY = originalApiKey;
       if (originalWakePayload === undefined) delete process.env.PAPERCLIP_WAKE_PAYLOAD_JSON;
       else process.env.PAPERCLIP_WAKE_PAYLOAD_JSON = originalWakePayload;
+    }
+  });
+
+  // The no-env path is the live one: `listAdapterModels` in
+  // `server/src/adapters/registry.ts` calls `listModels()` with no arguments, so
+  // `env` is `{}` and the adapter half used to carry a substituted PATH.
+  //
+  // `ensurePathInEnv` fills an absent PATH with `defaultPathForPlatform()`,
+  // eight hardcoded directories. The adapter half is spread *after* the
+  // inherited base, so that substitution overwrote the server's real PATH. A
+  // server whose `opencode` lives anywhere else — `~/.local/bin`, an nvm/asdf/
+  // volta shim directory, a pnpm store, a hand-built image PATH — lost the
+  // ability to resolve the command, and model discovery silently degraded to
+  // the static fallback catalog.
+  it("gives the child the server's real PATH when discovery is called with no env", async () => {
+    const realPath = "/opt/agent-toolchain/bin:/usr/bin:/bin";
+    const originalPath = process.env.PATH;
+    process.env.PATH = realPath;
+    try {
+      const spy = stubModelsCli({
+        refresh: { exitCode: 1, stderr: "unrecognized flag" },
+        plain: () => childResult({ stdout: "openai/gpt-5.2-codex\n" }),
+      });
+
+      await listOpenCodeModels();
+
+      const opts = spy.mock.calls[0]?.[3] as { env: Record<string, string> };
+      // Reproduce the merge `runChildProcess` performs, and assert on what the
+      // child would actually see.
+      const merged = {
+        ...serverUtils.sanitizeInheritedPaperclipEnv(process.env),
+        ...opts.env,
+      };
+      expect(merged.PATH).toBe(realPath);
+    } finally {
+      process.env.PATH = originalPath;
     }
   });
 
