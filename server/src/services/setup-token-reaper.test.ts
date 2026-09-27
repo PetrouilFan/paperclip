@@ -124,6 +124,78 @@ describe("setup-token reaper", () => {
     expect(store.rows.size).toBe(0);
   });
 
+  it("reaps a terminal record that carries no lease id, and never retries it", async () => {
+    // A session that reached `timed_out` before it acquired a lease stores an
+    // empty `provider_lease_id`. `toCleanupRecord` maps that null onto "", so the
+    // sweeper receives a blank id. The production lease store looks the id up in
+    // a uuid-keyed table, so releasing "" raises a database cast error on every
+    // sweep. Because the release gated the row removal, the terminal row stayed
+    // in the reap set and the scheduler re-reported it forever at a fixed count.
+    const store = createMemoryStore();
+    store.seed({ sessionId: "no-lease-1", leaseId: "", state: "timed_out" });
+    const leases = createFakeLeases({
+      releaseImpl: async () => {
+        // Mirrors the live failure: a blank id is a hard cast error in the
+        // production lease store, not a retryable provider fault. If the sweep
+        // reached this call, the record would be pinned forever.
+        throw new Error('invalid input syntax for type uuid: ""');
+      },
+    });
+    const reaper = createSetupTokenReaper({ store, leases, now: () => NOW });
+
+    const first = await reaper.sweep();
+    expect(first.released).toBe(1);
+    expect(first.failed).toBe(0);
+    // Nothing to release, so the release is not attempted at all.
+    expect(leases.releaseByIdCalls).toEqual([]);
+    expect(store.rows.size).toBe(0);
+
+    // The row is gone, so the next sweep has nothing to report. This is the
+    // regression: before the fix the record stayed and the sweep repeated the
+    // same failure on every tick.
+    const second = await reaper.sweep();
+    expect(second.released).toBe(0);
+    expect(second.failed).toBe(0);
+    expect(leases.releaseByIdCalls).toEqual([]);
+  });
+
+  it("treats a whitespace-only lease id as no lease", async () => {
+    // A blank-after-trim id is the same condition: there is no lease to look up.
+    const store = createMemoryStore();
+    store.seed({ sessionId: "no-lease-2", leaseId: "   ", state: "failed" });
+    const leases = createFakeLeases();
+    const reaper = createSetupTokenReaper({ store, leases, now: () => NOW });
+
+    const result = await reaper.sweep();
+
+    expect(result.released).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(leases.releaseByIdCalls).toEqual([]);
+    expect(store.rows.size).toBe(0);
+  });
+
+  it("names the record and the reason when a real release fails", async () => {
+    // The bare catch left the sweep undiagnosable: the log named neither the
+    // record nor the error, so a permanently failing sweep was invisible from
+    // the journal.
+    const store = createMemoryStore();
+    store.seed({ sessionId: "orphan-log", leaseId: "lease-orphan-log", state: "failed" });
+    const leases = createFakeLeases({
+      releaseImpl: async () => {
+        throw new Error("no driver resolves the lease");
+      },
+    });
+    const lines: string[] = [];
+    const reaper = createSetupTokenReaper({ store, leases, now: () => NOW, log: (l) => lines.push(l) });
+
+    await reaper.sweep();
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("session=orphan-log");
+    expect(lines[0]).toContain("lease=lease-orphan-log");
+    expect(lines[0]).toContain("no driver resolves the lease");
+  });
+
   it("reaps every reapable record in one sweep and stays idempotent on the next", async () => {
     const store = createMemoryStore();
     store.seed({ sessionId: "orphan-a", leaseId: "lease-a", state: "failed" });
