@@ -149,6 +149,14 @@ pnpm -r typecheck
 Notes:
 - `packages/db/drizzle.config.ts` reads compiled schema from `dist/schema/*.js`
 - `pnpm db:generate` compiles `packages/db` first
+- `pnpm db:generate` does not delete anything. It used to end in a prune that kept
+  the five newest snapshots and removed the rest, which silently deleted committed
+  snapshot files on any tree tracking more than five. Snapshots are the record of
+  the schema at each migration, so commit every one that is generated.
+- `pnpm --filter @paperclipai/db prune:snapshots` still exists for reclaiming
+  leftovers from an abandoned branch. It refuses to remove a file git tracks and
+  reports the ones it skipped, so run it deliberately. `--keep=N` moves the
+  window, `--dry-run` reports without deleting.
 
 ## 7. Verification Before Hand-off
 
