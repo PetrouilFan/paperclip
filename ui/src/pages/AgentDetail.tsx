@@ -3735,7 +3735,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
         )}
       </div>
 
-      {/* Issues touched by this run */}
+      {/* Issues this run is bound to, plus the ones it only touched */}
       {touchedIssues && touchedIssues.length > 0 && (
         <div className="space-y-2">
           <span className="text-xs font-medium text-muted-foreground">Tasks Touched ({touchedIssues.length})</span>
@@ -3749,6 +3749,14 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 <div className="flex items-center gap-2 min-w-0">
                   <StatusBadge status={issue.status} />
                   <span className="truncate">{issue.title}</span>
+                  {issue.binding && (
+                    <span
+                      className="shrink-0 rounded border border-border text-muted-foreground px-1.5 py-0.5 text-(length:--text-nano) uppercase tracking-wide"
+                      title={`This run is bound to ${issue.identifier ?? "this issue"} via ${issue.binding}. Cross-issue writes from this run are charged against it.`}
+                    >
+                      bound
+                    </span>
+                  )}
                 </div>
                 <span className="font-mono text-muted-foreground shrink-0 ml-2">{issue.identifier ?? issue.issueId.slice(0, 8)}</span>
               </Link>

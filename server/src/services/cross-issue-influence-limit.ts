@@ -1,30 +1,20 @@
-import { and, asc, count, eq, or } from "drizzle-orm";
+import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, heartbeatRuns, issues } from "@paperclipai/db";
-import {
-  isUuidLike,
-  issueWriteDenialResponse,
-  STANDING_WATCH_HOST_ISSUE_STATUS_SET,
-} from "@paperclipai/shared";
+import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import type { CrossIssueRunContextReason } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import {
+  findRunCheckoutBoundIssueIds,
+  readRunContextSourceIssueId,
+  readRunStandingWatchIssueId,
+  resolveStandingWatchHostIssue,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+} from "./run-attribution-source.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
-
-/**
- * A finished run's checkout/execution stamp can linger on the issue row until
- * cleanup runs. Such a binding must not buy a *later* write an exemption, so
- * the run-side fallback only trusts a run that is still live.
- */
-const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
-  "succeeded",
-  "failed",
-  "cancelled",
-  "timed_out",
-  "interrupted",
-]);
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
 const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap_rejected";
@@ -69,33 +59,6 @@ export function crossIssueInfluenceRunContextError(
     targetAssignedToOtherActor: labels.targetAssignedToOtherActor ?? null,
   });
   return forbidden(body.error, { ...body.details, reason });
-}
-
-function readRunSourceIssueId(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
-  const context = contextSnapshot as Record<string, unknown>;
-  for (const candidate of [context.issueId, context.taskId]) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-  }
-  return null;
-}
-
-/**
- * The issue a watch role's timer wake is charged to, stamped by the scheduler
- * from `runtimeConfig.heartbeat.standingWatchIssueId` at enqueue time.
- *
- * Read as its own key rather than as `contextSnapshot.issueId` on purpose: the
- * standing host is a *source of attribution*, not the issue the run is working
- * on. Folding it into `issueId` would make the wake issue-scoped, which drags
- * in the tree-hold deferral, the workspace binding, and the
- * `skipTimerWhenNoActionableWork` short-circuit — none of which a board-wide
- * watch should inherit from one issue.
- */
-function readRunStandingWatchIssueId(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
-  const context = contextSnapshot as Record<string, unknown>;
-  const candidate = context.standingWatchIssueId;
-  return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -165,7 +128,7 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError("run_not_found");
     }
 
-    const contextSourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    const contextSourceIssueId = readRunContextSourceIssueId(run.contextSnapshot);
     if (
       contextSourceIssueId &&
       (contextSourceIssueId === input.targetIssueId ||
@@ -198,25 +161,18 @@ export async function observeCrossIssueInfluence(
       if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
         throw crossIssueInfluenceRunContextError("terminal_status");
       }
-      const boundIssues = await tx
-        .select({ id: issues.id })
-        .from(issues)
-        .where(and(
-          eq(issues.companyId, input.companyId),
-          or(
-            eq(issues.checkoutRunId, input.runId),
-            eq(issues.executionRunId, input.runId),
-          ),
-        ))
-        // Deterministic pick: a run can legitimately hold more than one issue
-        // (the legacy execution-lock fallback stamps a sibling too), and the
-        // audit row must name the same source every time for the same state.
-        .orderBy(asc(issues.id))
-        .limit(2);
-      boundSourceIssueId = boundIssues[0]?.id ?? null;
+      // `limit(2)`: a run can legitimately hold more than one issue (the legacy
+      // execution-lock fallback stamps a sibling too), and the audit row must
+      // name the same source every time for the same state.
+      const boundIssueIds = await findRunCheckoutBoundIssueIds(tx, {
+        companyId: input.companyId,
+        runId: input.runId,
+        limit: 2,
+      });
+      boundSourceIssueId = boundIssueIds[0] ?? null;
       // A run may always write to an issue it actually holds, so the target's
       // own binding is checked before the cap rather than after it.
-      targetIsBound = boundIssues.some((row) => row.id === input.targetIssueId);
+      targetIsBound = boundIssueIds.includes(input.targetIssueId);
 
       // A standing watch is the third and last way a run can have a source.
       // Without a standing-watch config entry a `heartbeat_timer` wake is mute
@@ -229,31 +185,14 @@ export async function observeCrossIssueInfluence(
       // every one of them returned `no_context_source_and_target_unbound` on a
       // bare timer wake while the run produced nothing on the board, which is
       // indistinguishable from a watch that never ran.
-      //
-      // Re-validated here rather than trusted from the snapshot: the config is
-      // operator-editable, the run outlives the config, and this is the last
-      // gate before an unattributed cross-issue write. A host that is not in
-      // this company, not assigned to this agent, or terminal is ignored and
-      // the write falls through to the fail-closed branch exactly as before.
       const standingWatchIssueId = readRunStandingWatchIssueId(run.contextSnapshot);
       if (standingWatchIssueId) {
-        const host = await tx
-          .select({
-            id: issues.id,
-            assigneeAgentId: issues.assigneeAgentId,
-            status: issues.status,
-          })
-          .from(issues)
-          .where(and(
-            eq(issues.id, standingWatchIssueId),
-            eq(issues.companyId, input.companyId),
-          ))
-          .then((rows) => rows[0] ?? null);
-        if (
-          host &&
-          host.assigneeAgentId === input.agentId &&
-          STANDING_WATCH_HOST_ISSUE_STATUS_SET.has(host.status)
-        ) {
+        const host = await resolveStandingWatchHostIssue(tx, {
+          companyId: input.companyId,
+          agentId: input.agentId,
+          standingWatchIssueId,
+        });
+        if (host) {
           standingSourceIssueId = host.id;
           if (host.id === input.targetIssueId) targetIsBound = true;
         }
