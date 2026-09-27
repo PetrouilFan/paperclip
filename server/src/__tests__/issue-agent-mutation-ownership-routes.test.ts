@@ -1660,7 +1660,7 @@ describe("agent issue mutation checkout ownership", () => {
 
   it.each([
     ["done", "todo", 403, "Agent cannot request follow-up for another agent's issue"],
-    ["cancelled", "todo", 409, "Cancelled issues must be restored through the dedicated restore flow"],
+    ["cancelled", "todo", 409, 'Cancelled issues can only be reopened by explicit resume intent: PATCH with { "resume": true, "comment": "<reason>" }. The comment is required.'],
     ["blocked", "done", 403, "Agent cannot request follow-up for another agent's issue"],
   ])(
     "rejects peer agent direct status transitions from %s to %s",
@@ -1676,6 +1676,44 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     },
   );
+
+  // The cancelled-issue 409 used to tell the caller to use "the dedicated
+  // restore flow". There is no issue-level restore route in this router — the
+  // only `/issues/:id/.../restore` endpoint restores a document revision — so
+  // that message pointed at an endpoint that does not exist, for every actor
+  // including the human operator. These tests pin the two properties that make
+  // the replacement message trustworthy: it names the real, executable path,
+  // and the claim it makes about that path is actually true.
+  it("names the executable reopen path on the cancelled-issue 409 instead of a nonexistent restore flow", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "cancelled" }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).not.toMatch(/dedicated restore flow/i);
+    expect(res.body.error).toContain('"resume": true');
+    expect(res.body.error).toContain('"comment"');
+    expect(res.body.details).toMatchObject({
+      issueId,
+      status: "cancelled",
+      remedy: 'PATCH /api/issues/{issueId} with { "resume": true, "comment": "<reason>" }',
+    });
+  });
+
+  it("keeps the cancelled-issue 409 message honest: resume without a comment is still refused", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "cancelled" }));
+
+    // The message tells the caller the comment is required. Prove it, so the
+    // sentence cannot drift away from the handler's actual behavior.
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ resume: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toBe("Follow-up intent requires a comment");
+  });
 
   it("allows same-company agent mutations on unassigned in-progress issues", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: null }));
