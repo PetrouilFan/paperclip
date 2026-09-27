@@ -215,9 +215,9 @@ const COORDINATED_SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM"] as const;
  * The number is load-bearing in the other direction too, which is why
  * `TimeoutStopSec` must not be reduced on its own: the graceful run drain waits
  * for an in-flight agent run, and `adapter_config.timeoutSec` is 3600 on every
- * `opencode_local` agent (raised from 1800 by
- * raised from 1800 to 3600 on all eight of them). A drain that can wait an hour inside a
- * five-minute stop budget is not a drain, it is a guaranteed cgroup-wide
+ * `opencode_local` agent, raised from 1800 to 3600 on all eight of them. A drain
+ * that can wait an hour inside a five-minute stop budget is not a drain, it is a
+ * guaranteed cgroup-wide
  * SIGKILL — and it is guaranteed whether or not any of the bugs fixed here are
  * reachable. That is the arithmetic `resolveHeartbeatDrainBudgetMs` exists to
  * close.

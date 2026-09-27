@@ -173,6 +173,29 @@ export type SystemdNotifierDeps = {
   timeoutMs?: number;
 };
 
+/**
+ * Race `work` against a deadline, and make the deadline stick.
+ *
+ * The timer is deliberately not `unref`'d, for the same reason the three
+ * deadlines in `server/src/shutdown.ts` are not: an unreferenced timer is
+ * skipped entirely whenever the event loop would otherwise be empty, which is
+ * exactly the state a process is in once its last handle is gone. A deadline
+ * that can be skipped is not a deadline.
+ *
+ * That is not a theoretical concern here, and it is the reason this deadline
+ * exists at all. `execFile`'s own `timeout` only bounds the *child*, and only
+ * once `run()` has been reached. The `resolveBinary()` await above it is an
+ * `fs.access` chain over `PATH` — the one wedging mechanism this module's own
+ * docs name — and on a process that has already closed its listener it is the
+ * only thing left. `unref`'d, that promise never settles and the loop empties.
+ * In `shutdown()`'s real shape — an `await` inside a `void`-ed function — node
+ * exits **0** with the notify unresolved: a clean exit code and a unit that
+ * looks like it stopped, while `TimeoutStopSec` is still counting.
+ *
+ * The cost of holding the reference is at most `timeoutMs` of process lifetime
+ * on a path that is already failing. That is not a close trade against an
+ * unbounded wait.
+ */
 const withNotifyTimeout = async <T>(timeoutMs: number, onTimeout: () => T, work: Promise<T>) => {
   let timer: NodeJS.Timeout | null = null;
   try {
@@ -180,7 +203,6 @@ const withNotifyTimeout = async <T>(timeoutMs: number, onTimeout: () => T, work:
       work,
       new Promise<T>((resolve) => {
         timer = setTimeout(() => resolve(onTimeout()), timeoutMs);
-        timer.unref?.();
       }),
     ]);
   } finally {

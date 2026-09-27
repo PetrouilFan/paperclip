@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +33,17 @@ import {
 
 const repoRoot = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "../../..");
 const indexSource = readFileSync(path.join(repoRoot, "server/src/index.ts"), "utf8");
+const fixturesDir = path.join(repoRoot, "server/src/__tests__/fixtures");
+
+/**
+ * The absolute `tsx` ESM loader, resolved from this package rather than from
+ * `cwd`, so the spawned fixture runs the TypeScript source instead of whatever
+ * the last `dist/` build happened to produce.
+ */
+const tsxLoader = path.join(
+  path.dirname(createRequire(import.meta.url).resolve("tsx/package.json")),
+  "dist/loader.mjs",
+);
 
 /** A promise that never settles, which is what a query on a dying database is. */
 function neverSettles<T>(): Promise<T> {
@@ -98,6 +111,35 @@ describe("site 1: the systemd notify is bounded", () => {
     // margin, and it is far below the smallest stop budget worth having.
     expect(SYSTEMD_NOTIFY_TIMEOUT_MS).toBeGreaterThan(100);
     expect(SYSTEMD_NOTIFY_TIMEOUT_MS).toBeLessThan(10_000);
+  });
+
+  it("still resolves when the process has no other work keeping its event loop alive", async () => {
+    // The one case an in-suite test cannot see, so it gets its own process.
+    //
+    // `unref`'d deadline, on a loop with nothing else on it: the timer is
+    // skipped and the notify never resolves. Here that surfaces as exit 13 and
+    // an unsettled-top-level-await warning; in the real `shutdown()` — an await
+    // inside a `void`-ed function — the same timer produces exit 0 and a unit
+    // that looks like it stopped. So the assertion is that the resolution line
+    // was *printed*, never that the process exited cleanly; a clean-exit check
+    // passes on the worst version of this bug. The three deadlines in
+    // `shutdown.ts` are documented as deliberately not unref'd for the same
+    // reason; this keeps the notify's from drifting back.
+    //
+    // It has to be `resolveBinary` and not `run`: `execFile`'s own `timeout`
+    // still bounds the child, so a `run` that never settles is already covered
+    // in-process above. `resolveBinary` is an `fs.access` chain over `PATH`
+    // sitting above `run`, with no second bound, and it is the one the notify's
+    // own docs name as the mechanism this deadline exists for.
+    const child = spawnSync(
+      process.execPath,
+      ["--import", tsxLoader, path.join(fixturesDir, "notify-empty-loop.mjs"), "300"],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+
+    expect(child.status, `fixture stderr: ${child.stderr}`).toBe(0);
+    const printed = JSON.parse((child.stdout ?? "").trim().split("\n").at(-1) ?? "null");
+    expect(printed).toEqual({ notifyResolved: true, result: false, timeoutMs: 300 });
   });
 });
 
