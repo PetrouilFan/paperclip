@@ -340,6 +340,40 @@ Two ways a healthy-looking restart goes wrong here, both observed:
   direct tension; whichever one is in force, the outcome to look for is an absent
   report, not a clean one.
 
+## Check 4 — who is allowed to notify the unit
+
+`Type=notify` puts the unit's notify socket address in the control plane's own
+environment as `NOTIFY_SOCKET`. Anything the server spawns inherits that
+environment, and every local agent run is something the server spawns. So
+`NotifyAccess=` decides whether a run process can talk to systemd about the unit
+that is running it:
+
+```bash
+inst="${inst:-default}"
+systemctl --user show paperclipai.service -p NotifyAccess -p MainPID
+tr '\0' '\n' < "/proc/$(systemctl --user show paperclipai.service -p MainPID --value)/environ" \
+  | grep -c '^NOTIFY_SOCKET='
+```
+
+`NotifyAccess=all` means a run child can send `STOPPING=1` and put the unit into
+`stop-sigterm`, which kills the control plane and every run on it. `main` is the
+value the renderer writes, and it is safe because the only notifier is the
+server itself — `READY=1` and `STOPPING=1` are both sent by the process systemd
+records as `MainPID`.
+
+Two things make this check worth running rather than assuming:
+
+- **An installed unit does not pick up a renderer change by itself.** The renderer
+  only rewrites the definition when it is invoked, and the unit guardian restores
+  a *missing* golden copy — it does not overwrite a stale one that is still
+  present. So a host can be running a definition several renderer revisions old
+  while `main` is in the source tree. `grep '^NotifyAccess='` the installed file
+  itself, not the repository.
+- **`NotifyAccess=` needs a restart, not a reload.** `systemctl --user daemon-reload`
+  re-reads the file for the *next* start; the running unit keeps the value it
+  started with. On a busy instance that restart is the outage, so the change is
+  usually staged as a drop-in and applied deliberately.
+
 ## What "patched" looks like versus "shadowed"
 
 The test is traceability, and it is the same test the sibling document applies to

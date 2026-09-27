@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { and, eq } from "drizzle-orm";
 
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import type { Db } from "@paperclipai/db";
 import { agentSessionGoalActions, agentTaskSessions } from "@paperclipai/db";
 
@@ -396,7 +397,11 @@ export async function executeNativeCodexRunner(input: {
     cwd: input.cwd,
     detached: process.platform !== "win32",
     env: {
-      ...process.env,
+      // The sanitizer, not a bare spread: the runner process and everything it
+      // spawns inherits this environment, and under a Type=notify unit the
+      // server's own environment carries the unit's NOTIFY_SOCKET. A run that
+      // inherits it can stop the control plane's unit with one datagram.
+      ...sanitizeInheritedPaperclipEnv(process.env),
       ...input.environment,
       PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
     },

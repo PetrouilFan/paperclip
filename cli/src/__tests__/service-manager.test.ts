@@ -43,7 +43,14 @@ describe("service definition generation", () => {
   it("generates a stable systemd notify unit without secrets", () => {
     const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
     expect(unit).toContain("Type=notify");
-    expect(unit).toContain("NotifyAccess=all");
+    // main, not all: a run child that inherits NOTIFY_SOCKET must not be able
+    // to send STOPPING=1 and stop the unit. Asserted against the directive line
+    // rather than as a substring, because the unit's own comment above the
+    // setting names the rejected value in prose. Asserted as a negative because
+    // `all` is the value this file used to pin, so a silent revert here would
+    // otherwise pass every other assertion in the suite.
+    expect(unit).toMatch(/^NotifyAccess=main$/m);
+    expect(unit).not.toMatch(/^NotifyAccess=all$/m);
     expect(unit).toContain('ExecStart="/home/alice/.local/bin/paperclipai" run --instance "team-a"');
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("TimeoutStopSec=300");

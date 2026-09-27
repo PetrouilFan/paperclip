@@ -378,7 +378,16 @@ StartLimitBurst=12
 
 [Service]
 Type=notify
-NotifyAccess=all
+# Only the server itself may notify systemd. With NotifyAccess=all every
+# process systemd started for this unit may too, and that population is every
+# local agent run: a run is a child of the server, inherits NOTIFY_SOCKET, and
+# a single STOPPING=1 datagram from it puts the unit into stop-sigterm and
+# kills the control plane plus everything running on it. Measured on a live
+# instance: a run child wrote STATUS= to the unit's notify socket and systemd
+# accepted it. main is safe here because the only notifier is this process —
+# READY=1 and STOPPING=1 are both sent by the server itself, so they are
+# accepted from the main pid and the unit still reaches active/running.
+NotifyAccess=main
 ExecStart="${escapeSystemd(input.shimPath)}" run --instance "${escapeSystemd(input.instanceId)}"
 Environment="PAPERCLIP_SERVICE_MANAGED=1"
 Environment="PAPERCLIP_INSTANCE_ID=${escapeSystemd(input.instanceId)}"
