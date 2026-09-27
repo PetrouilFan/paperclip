@@ -1110,6 +1110,33 @@ Legacy CLI paths that put prompts in command-line arguments (Gemini, Grok, Kimi,
 Pi, and Hermes) still have argument-size limits. ACP turns, SDK requests, and
 CLI paths that use stdin avoid that separate limit for the wake prompt.
 
+## Issue List Description Preview
+
+The issue index routes (`GET /api/companies/{companyId}/issues` and the blocked
+inbox projection) trim the `description` field to a 1200 code-point preview so a
+list response stays bounded. Nothing is lost on write: `GET /api/issues/{id}`
+returns the full text.
+
+A cut preview is reported three ways, and all three agree:
+
+- `descriptionTruncated` — `true` when the stored text is longer than the
+  preview budget, `false` otherwise (including for a `null` description).
+- `descriptionLength` — the stored length in characters, `null` for a `null`
+  description.
+- An in-band marker appended to `description` itself:
+  `[description truncated: showing 1200 of 6587 characters — fetch the issue for
+  the full description]`.
+
+The in-band marker is deliberate. A sibling boolean is easy for a consumer to
+miss when it forwards, renders, logs, or pipes `description` into another
+system, and a silently shortened brief is indistinguishable from a complete
+one. A consumer that only ever sees the text still learns that the brief was
+cut and how much is missing. `truncateInlineSummary` applies the same
+convention to other preview fields in the service layer.
+
+Consumers that need the whole brief must fetch the single issue rather than
+reconstruct it from the list.
+
 ## Paperclip Runner Adapter Conversion
 
 The experimental Paperclip Runner offers native Codex, OpenCode, and **ACPX

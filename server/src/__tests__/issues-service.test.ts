@@ -2759,8 +2759,12 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const [result] = await svc.list(companyId);
 
     expect(result).toBeTruthy();
-    expect(result?.description).toHaveLength(1200);
+    expect(result?.description?.startsWith("x".repeat(1200))).toBe(true);
+    expect(result?.description).toContain(
+      "[description truncated: showing 1200 of 5000 characters",
+    );
     expect(result?.descriptionTruncated).toBe(true);
+    expect(result?.descriptionLength).toBe(5_000);
     expect(result?.executionPolicy).toBeNull();
     expect(result?.executionState).toBeNull();
     expect(result?.executionWorkspaceSettings).toBeNull();
@@ -2790,7 +2794,9 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const [result] = await svc.list(companyId);
 
     expect(result?.description).toHaveLength(1200);
+    expect(result?.description).not.toContain("[description truncated");
     expect(result?.descriptionTruncated).toBe(false);
+    expect(result?.descriptionLength).toBe(1200);
   });
 
   it("marks null list descriptions as not truncated", async () => {
@@ -2817,6 +2823,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     expect(result?.description).toBeNull();
     expect(result?.descriptionTruncated).toBe(false);
+    expect(result?.descriptionLength).toBeNull();
   });
 
   it("does not let description preview truncation split multibyte characters", async () => {
@@ -2842,9 +2849,79 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     const [result] = await svc.list(companyId);
 
-    expect(result?.description).toHaveLength(1200);
-    expect(result?.description?.endsWith("—")).toBe(true);
+    // The preview keeps the first 1200 code points, so the multibyte em dash
+    // survives the cut intact and the rest of the brief is replaced by the
+    // marker rather than silently dropped.
+    const preview = Array.from(description).slice(0, 1200).join("");
+    expect(preview).toBe("x".repeat(1199) + "—");
+    expect(result?.description).toBe(
+      preview +
+        "\n\n[description truncated: showing 1200 of " +
+        description.length +
+        " characters — fetch the issue for the full description]",
+    );
     expect(result?.descriptionTruncated).toBe(true);
+    expect(result?.descriptionLength).toBe(description.length);
+  });
+
+  it("marks every list projection description in band so a text-only consumer cannot miss the cut", async () => {
+    const companyId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const long = [
+      "# Heading",
+      "",
+      "| a | b |",
+      "| --- | --- |",
+      "| 1 | 2 |",
+      "",
+      "row\n".repeat(600) + "tail beyond the cut",
+    ].join("\n");
+    const short = "A brief that fits entirely inside the preview budget.";
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Long brief",
+        description: long,
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "Short brief",
+        description: short,
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const results = await svc.list(companyId);
+    const longRow = results.find((row) => row.title === "Long brief");
+    const shortRow = results.find((row) => row.title === "Short brief");
+
+    // The marker is in band: a consumer that only forwards `description`
+    // still learns the brief was cut and how much is missing.
+    expect(longRow?.description).toContain("[description truncated: showing 1200 of ");
+    expect(longRow?.description).toContain(
+      `characters — fetch the issue for the full description]`,
+    );
+    expect(longRow?.descriptionTruncated).toBe(true);
+    expect(longRow?.descriptionLength).toBe(long.length);
+
+    // The cut never invents a marker on a complete brief.
+    expect(shortRow?.description).toBe(short);
+    expect(shortRow?.description).not.toContain("[description truncated");
+    expect(shortRow?.descriptionTruncated).toBe(false);
+    expect(shortRow?.descriptionLength).toBe(short.length);
   });
 });
 
