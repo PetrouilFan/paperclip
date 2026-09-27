@@ -153,11 +153,41 @@ reconnects.
 
 Source builds carry `patches/postgres@3.4.9.patch` for this behavior. It rejects
 queued and later queries from a disconnected transaction or reserved connection,
-and prevents a released, closed connection from returning to the open pool.
+prevents a released, closed connection from returning to the open pool, and
+guards the deferred write in `nextWrite` so a connection closing between a write
+being buffered and its `setImmediate` flush cannot throw a `TypeError` from a
+timer callback. That last guard matters beyond transactions: the throw is outside
+every promise chain in the program, so it is an uncaught exception and takes the
+process down with `code=exited, status=1/FAILURE`, typically one second into a
+systemd stop. It is not reachable by adding error handling at a call site.
+
 The patch covers both ESM and CommonJS. The regression suite terminates real
 PostgreSQL backends and checks rejection, pool recovery, and transaction isolation.
-Remove the patch when an upstream release passes these tests. Installs of the
-unmodified `postgres` package outside this workspace do not include the patch.
+Remove the patch when an upstream release passes these tests.
+
+### How a vendored patch reaches a consumer
+
+A pnpm patch is applied by pnpm out of *this workspace's* `node_modules`, from
+`package.json#pnpm.patchedDependencies` plus the patch file. It is not carried
+inside another package's tarball, and the registry has no way to know about it.
+So a patched dependency that a published package depends on normally is invisible
+to every consumer: `pnpm install` in this repository gets the patch, and
+`npm install paperclipai` does not.
+
+`bundleDependencies` is the mechanism that ships a patch. It is what
+`acpx` and `embedded-postgres` already use, and `scripts/prepare-bundled-package.mjs`
+implements it: each entry is installed into the staging tree, its configured
+patch is applied with `patch -p1`, and the tarball carries the patched copy.
+
+This is not hypothetical. `postgres@3.4.9` was patched and registered, and CI was
+green, while the deployed board ran upstream `postgres@3.4.9` verbatim because
+`postgres` was a plain dependency of `@paperclipai/db` and of the `paperclipai`
+CLI bundle rather than a bundled one. `postgres` is now in
+`packages/db/package.json`'s `bundleDependencies`, and
+`scripts/acpx-patch-packaging.test.mjs` fails if a patched runtime dependency of
+a published package is not in any `bundleDependencies` or in
+`bundledCliNpmDependencies`. When you add a patch, decide there how it ships, or
+it ships nowhere.
 
 Trusted-header actor synchronization retries transient connection failures,
 including `CONNECT_TIMEOUT`, at most twice. This retry applies only to the

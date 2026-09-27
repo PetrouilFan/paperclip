@@ -123,6 +123,7 @@ import {
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
+import { installNulledSocketWriteContainment } from "./services/postgres-deferred-write-containment.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
 import {
@@ -1173,6 +1174,14 @@ async function startServerWithDatabaseTeardown(
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  // Armed at boot and gated on `heartbeatSchedulerStopped`, so the handler
+  // follows shutdown state instead of latching when it is installed. Outside a
+  // drain it reproduces Node's default fatal behaviour, so registering a
+  // listener here does not soften how any other bug is reported.
+  installNulledSocketWriteContainment({
+    isShuttingDown: () => heartbeatSchedulerStopped,
+    log: logger,
+  });
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;

@@ -149,9 +149,86 @@ test("published packages preserve the patched embedded-postgres runtime", () => 
     rootPackage.pnpm.patchedDependencies["embedded-postgres@18.1.0-beta.16"],
     "patches/embedded-postgres@18.1.0-beta.16.patch",
   );
-  assert.deepEqual(dbPackage.bundleDependencies, ["embedded-postgres"]);
+  assert.deepEqual(dbPackage.bundleDependencies, ["embedded-postgres", "postgres"]);
   assert.equal(bundledCliNpmDependencies.has("embedded-postgres"), true);
   assert.equal(cliEsbuildConfig.external.includes("embedded-postgres"), false);
+});
+
+// The regression this guards. `postgres@3.4.9` carries a vendored
+// patch that hardens `nextWrite` against a write to an already-nulled socket --
+// a `TypeError` thrown from a `setImmediate` callback, which no promise chain
+// covers and which therefore takes the process down. That patch was believed to
+// be in force and was not: the patch is applied by pnpm out of this workspace's
+// own node_modules, and the published `paperclipai` tarball declares `postgres`
+// as a plain npm dependency, so the registry served upstream `3.4.9` verbatim.
+// The deployed instance was running the unpatched driver while this repository,
+// its lockfile hash, and its regression tests all said otherwise.
+//
+// A patch only reaches a consumer if the patched copy travels inside a
+// published tarball. `bundleDependencies` is what does that:
+// `prepare-bundled-package.mjs` installs each entry, applies its configured
+// patch with `patch -p1`, and the tarball carries the result. A patched
+// dependency that is a runtime dependency of a published package but is absent
+// from `bundleDependencies` is invisible to every registry consumer.
+test("a patched runtime dependency of a published package is bundled, so the patch can ship", () => {
+  const shippedInATarball = new Set([
+    ...(dbPackage.bundleDependencies ?? []),
+    ...(serverPackage.bundleDependencies ?? []),
+    ...(adapterUtilsPackage.bundleDependencies ?? []),
+    ...bundledCliNpmDependencies,
+  ]);
+
+  // Every patch whose package is a runtime dependency of a published package has
+  // to be one of the mechanisms above, or its patch is dead weight in
+  // production. Assert the shipped set explicitly so adding a patch forces a
+  // decision instead of silently shipping nothing.
+  for (const [specifier, patchPath] of Object.entries(rootPackage.pnpm.patchedDependencies)) {
+    const name = specifier.slice(0, specifier.lastIndexOf("@"));
+    const isRuntimeDependencyOfDb = name in (dbPackage.dependencies ?? {});
+    const isRuntimeDependencyOfServer = name in (serverPackage.dependencies ?? {});
+    const isRuntimeDependencyOfAdapterUtils = name in (adapterUtilsPackage.dependencies ?? {});
+    if (!isRuntimeDependencyOfDb && !isRuntimeDependencyOfServer && !isRuntimeDependencyOfAdapterUtils) {
+      continue;
+    }
+    assert.equal(
+      existsSync(fileURLToPath(new URL(`../${patchPath}`, import.meta.url))),
+      true,
+      `${specifier} names a patch that does not exist`,
+    );
+    assert.equal(
+      shippedInATarball.has(name),
+      true,
+      `${specifier} is a runtime dependency of a published package but is not in any ` +
+        `bundleDependencies or bundledCliNpmDependencies, so its patch never reaches a ` +
+        `registry consumer. Add "${name}" to the depending package's bundleDependencies, ` +
+        `or accept that the patch only applies to this workspace.`,
+    );
+  }
+});
+
+test("the postgres patch guards the deferred write that reaches a nulled socket", () => {
+  // The guard has to exist in the patch, not only in this reasoning: the
+  // bundled copy is the one production runs, and an unpatched bundle would make
+  // the containment handler the only thing standing between this and a
+  // `code=exited, status=1/FAILURE` stop. Both builds must carry it, because the
+  // deployed server resolves the CommonJS entry while the workspace tests the
+  // ESM one.
+  const postgresPatch = readFileSync(new URL("../patches/postgres@3.4.9.patch", import.meta.url), "utf8");
+  for (const build of ["cjs/src/connection.js", "src/connection.js"]) {
+    assert.match(postgresPatch, new RegExp(`a/${build.replace(/\//g, "/")} `));
+  }
+  const guardOccurrences = postgresPatch.match(/if \(socket === null\) \{/g) ?? [];
+  assert.equal(
+    guardOccurrences.length,
+    2,
+    "expected the socket null guard in both the cjs and the ESM build",
+  );
+  // The guard has to sit ahead of the dereference, and the dereference has to
+  // survive as a context line: a guard added after the write would be dead code.
+  assert.match(
+    postgresPatch,
+    /\+    if \(socket === null\) \{\n(?:\+.*\n)+?\+    \}\n     const x = socket\.write\(chunk, fn\)/,
+  );
 });
 
 test("bundled package staging materializes publishConfig entrypoints", () => {
