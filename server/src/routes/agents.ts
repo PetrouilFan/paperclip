@@ -6781,10 +6781,22 @@ export function agentRoutes(
     })))));
   });
 
+  /**
+   * The two halves of {@link readHeartbeatRunId}, as a predicate, so a route
+   * that must answer an unauthorized caller without ever reporting *why* can
+   * reuse the exact same notion of a well-formed run id. Anything that derives
+   * its own looser check here would drift from the one used to validate input
+   * for board callers.
+   */
+  function isWellFormedHeartbeatRunId(runId: unknown): boolean {
+    if (typeof runId !== "string") return false;
+    // isUuidLike accepts surrounding whitespace, but PostgreSQL UUID inputs do not.
+    return runId === runId.trim() && isUuidLike(runId);
+  }
+
   function readHeartbeatRunId(req: Request): string {
     const runId = req.params.runId as string;
-    // isUuidLike accepts surrounding whitespace, but PostgreSQL UUID inputs do not.
-    if (runId !== runId.trim() || !isUuidLike(runId)) {
+    if (!isWellFormedHeartbeatRunId(runId)) {
       throw badRequest("Invalid heartbeat run ID");
     }
     return runId;
@@ -6817,7 +6829,24 @@ export function agentRoutes(
     "Released by the assignee: the dispatcher never claimed this run, and it was holding the issue execution lock without doing any work";
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
-    const runId = readHeartbeatRunId(req);
+    // Board actors keep the original order: their actor check precedes ID
+    // validation, so a malformed id tells them nothing they could not already
+    // tell. An agent is the case this route newly admits, and an agent must not
+    // be handed a different answer that reveals whether an id is well-formed --
+    // this route is reachable by agents now, so a 400 here would be a validation
+    // oracle over run ids the agent may not touch. A malformed id from an agent
+    // is therefore just another denied case and answers 403, identically to a
+    // well-formed id the agent has no release rights over. That is what
+    // agent-live-run-routes.test.ts pins, and it still holds.
+    const agentActor = req.actor.type === "agent";
+    if (!agentActor) assertBoard(req);
+    const runId = isWellFormedHeartbeatRunId(req.params.runId)
+      ? (req.params.runId as string)
+      : null;
+    if (!runId) {
+      if (agentActor) throw forbidden("Board access required");
+      throw badRequest("Invalid heartbeat run ID");
+    }
     // The resource is loaded before the actor check so a run outside the
     // caller's company is a 404 rather than a 403. That is the same
     // existence-oracle shape as GET /heartbeat-runs/:runId above, and it is

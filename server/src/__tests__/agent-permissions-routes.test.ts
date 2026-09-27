@@ -2078,4 +2078,136 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.error).toBe("Heartbeat run not found");
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
+
+  describe("stranded-run self-service release", () => {
+    const runId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    // Comfortably past NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS, so this is a
+    // run the age-out sweep would clear too — the condition under test, not the
+    // age.
+    const strandedAgo = new Date(Date.now() - 13 * 60 * 60 * 1000);
+    const agentActor = {
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    };
+    const strandedRun = (over: Record<string, unknown> = {}) => ({
+      id: runId,
+      companyId,
+      agentId,
+      status: "queued",
+      startedAt: null,
+      createdAt: strandedAgo,
+      ...over,
+    });
+    const cancel = (app: Awaited<ReturnType<typeof createApp>>) =>
+      requestApp(app, (baseUrl) => request(baseUrl).post(`/api/heartbeat-runs/${runId}/cancel`).send({}));
+
+    it("lets the assignee release their own stranded run, without the operator stand-down marker", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue(strandedRun());
+      mockHeartbeatService.cancelRun.mockResolvedValue(strandedRun({ status: "cancelled" }));
+
+      const res = await cancel(await createApp(agentActor));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      // Same reason and errorCode the age-out sweep records, so the run log
+      // reads the same whichever path freed the lock.
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        expect.stringContaining("dispatcher never claimed this run"),
+        { errorCode: "never_dispatched_timeout" },
+      );
+      // Critically no `resultJson` operator marker: recovery must re-queue the
+      // work rather than stand down, because nothing here was a deliberate Stop.
+      expect(mockHeartbeatService.cancelRun.mock.calls[0]![2]).not.toHaveProperty("resultJson");
+    });
+
+    it("still refuses a running run of the caller's own, so this is a release and not a Stop", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue(
+        strandedRun({ status: "running", startedAt: strandedAgo, processPid: 4242 }),
+      );
+
+      const res = await cancel(await createApp(agentActor));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Board access required");
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("still refuses a queued run the dispatcher has already claimed", async () => {
+      // Same `queued` status, but a runner picked it up. It may be about to act
+      // on the issue, so it keeps its claim.
+      mockHeartbeatService.getRun.mockResolvedValue(
+        strandedRun({ startedAt: strandedAgo }),
+      );
+
+      const res = await cancel(await createApp(agentActor));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("still refuses a stranded run belonging to another agent", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue(
+        strandedRun({ agentId: "99999999-9999-4999-8999-999999999999" }),
+      );
+
+      const res = await cancel(await createApp(agentActor));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Board access required");
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("keeps a board Stop on the operator path, marker and all", async () => {
+      // The negative control. If the self-service path ever widened to running
+      // or to another agent's run, or if the board path lost its stand-down
+      // marker, this is the test that says so.
+      mockHeartbeatService.getRun.mockResolvedValue(
+        strandedRun({ status: "running", startedAt: strandedAgo, processPid: 4242 }),
+      );
+      mockHeartbeatService.cancelRun.mockResolvedValue(
+        strandedRun({ status: "cancelled" }),
+      );
+
+      const res = await cancel(
+        await createApp({
+          type: "board",
+          userId: "board-user",
+          source: "session",
+          isInstanceAdmin: false,
+          companyIds: [companyId],
+        }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled by a board operator",
+        {
+          resultJson: {
+            cancelledByActorType: "user",
+            cancelledByUserId: "board-user",
+          },
+        },
+      );
+    });
+
+    it("answers 403, not 400, for a malformed run id so an agent learns nothing from the shape", async () => {
+      // This route is reachable by agents now, so ID validation must not become
+      // an oracle over ids the agent may not touch. `agent-live-run-routes`
+      // asserts the same for the board-only routes it enumerates; this is the
+      // case where the route stopped being board-only.
+      const app = await createApp(agentActor);
+
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/not-a-uuid/cancel").send({}),
+      );
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+  });
 });
