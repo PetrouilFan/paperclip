@@ -1100,6 +1100,7 @@ export type {
   IssueBlockerDiagnosticNode,
   IssueBlockerDiagnosticsReadiness,
   IssueBlockerDiagnosticsResponse,
+  IssueBlockerDiagnosticsUnprojectedHold,
   IssueWakeDiagnosticActivityRecord,
   IssueWakeDiagnosticEvent,
   IssueWakeDiagnosticWakeFailureClass,
