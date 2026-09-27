@@ -101,9 +101,19 @@ const mockIssueRecoveryActionService = vi.hoisted(() => ({
 }));
 const mockTaskWatchdogService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
-  revalidateMutationScope: vi.fn(async () => ({
+  // `includedIssueIds` is not optional on any variant of the real classifier
+  // result, and the route derives the watchdog's write scope from it. Deriving
+  // it from the scope the service is handed keeps this fixture faithful: a
+  // mock that returned a scope-less classification would be refused for a reason
+  // the real service can never produce.
+  revalidateMutationScope: vi.fn(async (scope: { watchedIssueId?: string }) => ({
     allowed: true,
-    classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test" },
+    classification: {
+      state: "stopped",
+      includedIssueIds: scope?.watchedIssueId ? [scope.watchedIssueId] : [],
+      stoppedLeaves: [],
+      stopFingerprint: "task_watchdog_stop:test",
+    },
   })),
   reconcileForIssueAndAncestors: vi.fn(async () => ({
     checked: 0,
@@ -555,10 +565,17 @@ describe("agent issue mutation checkout ownership", () => {
     mockTaskWatchdogService.getActiveForIssue.mockReset();
     mockTaskWatchdogService.getActiveForIssue.mockResolvedValue(null);
     mockTaskWatchdogService.revalidateMutationScope.mockReset();
-    mockTaskWatchdogService.revalidateMutationScope.mockResolvedValue({
-      allowed: true,
-      classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test" },
-    });
+    mockTaskWatchdogService.revalidateMutationScope.mockImplementation(
+      async (scope: { watchedIssueId?: string }) => ({
+        allowed: true,
+        classification: {
+          state: "stopped",
+          includedIssueIds: scope?.watchedIssueId ? [scope.watchedIssueId] : [],
+          stoppedLeaves: [],
+          stopFingerprint: "task_watchdog_stop:test",
+        },
+      }),
+    );
     mockTaskWatchdogService.reconcileForIssueAndAncestors.mockReset();
     mockTaskWatchdogService.reconcileForIssueAndAncestors.mockResolvedValue({
       checked: 0,
@@ -2759,7 +2776,7 @@ describe("agent issue mutation checkout ownership", () => {
         // cannot drift away from the message the service emits.
         reason:
           "Task-watchdog review is stale because the watched subtree now has a live execution path; another run owns that work, so stop mutating the watched subtree and close the review with that finding.",
-        classification: { state: "live", liveIssueIds: [issueId] },
+        classification: { state: "live", includedIssueIds: [issueId], liveIssueIds: [issueId] },
       });
 
       const app = await createApp(watchdogActor(), createWatchdogDb());
@@ -2777,7 +2794,7 @@ describe("agent issue mutation checkout ownership", () => {
         allowed: false,
         reason:
           "Task-watchdog review is stale because the watched subtree now has a live execution path; another run owns that work, so stop mutating the watched subtree and close the review with that finding.",
-        classification: { state: "live", liveIssueIds: [issueId] },
+        classification: { state: "live", includedIssueIds: [issueId], liveIssueIds: [issueId] },
       });
 
       const app = await createApp(watchdogActor(), createWatchdogDb());

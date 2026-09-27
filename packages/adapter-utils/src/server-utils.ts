@@ -2924,7 +2924,7 @@ function renderPaperclipWakePromptBody(
         );
         lines.push(
           scope.includeBlockersOfWatchedSubtree
-            ? "- Blocker scope: the direct blockers of the watched issue and of its in-scope descendants are writable, because a stop is usually caused by a blocker rather than by a child. One hop only; a blocker of a blocker is out of scope."
+            ? "- Blocker scope: the blockers of the stopped leaves that are themselves blocked are writable, because a stop is usually caused by a blocker rather than by a child. One hop only; a blocker of a blocker, and a blocker of a leaf that is still moving, are out of scope."
             : "- Blocker scope: none. A blocker of the watched issue or of a descendant is refused with 403.",
         );
         if (scope.watchdogIssueId) {

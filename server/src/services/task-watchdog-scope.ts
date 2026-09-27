@@ -1,10 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issues, issueRelations, issueWatchdogs } from "@paperclipai/db";
+import { heartbeatRuns, issues, issueWatchdogs } from "@paperclipai/db";
 
-const MAX_WATCHDOG_SCOPE_ANCESTRY_DEPTH = 100;
-/** Cap on how many blocked issues one candidate blocker is matched against. */
-const MAX_WATCHDOG_SCOPE_BLOCKER_FANOUT = 50;
 export const TASK_WATCHDOG_ORIGIN_KIND = "task_watchdog";
 
 type AgentRunActor = {
@@ -135,112 +132,97 @@ export async function resolveTaskWatchdogMutationScope(
   };
 }
 
+/**
+ * The two id sets a task-watchdog run may write, derived from the stop
+ * classification that `revalidateMutationScope` already computed for this exact
+ * mutation.
+ *
+ * Deriving the scope from the classification rather than from a reverse graph
+ * walk is what makes the grant answer to its own justification. A stop is
+ * classified from status *and* blocker state, so the issue that causes a stop
+ * is frequently a blocker rather than a descendant; the classification already
+ * knows which blocker belongs to which stopped leaf, and nothing else.
+ */
+export type TaskWatchdogWriteScope = {
+  /** The watched issue and its descendants, as the classifier walked them. */
+  subtreeIssueIds: ReadonlySet<string>;
+  /**
+   * Blockers of a stopped leaf that is itself `blocked` — the blocker whose
+   * closure would release a stop.
+   */
+  stopBlockerIssueIds: ReadonlySet<string>;
+};
+
+type TaskWatchdogStopClassification = {
+  state: string;
+  includedIssueIds: string[];
+  stoppedLeaves?: Array<{ status: string; blockerIssueIds: string[] }>;
+};
+
+export function taskWatchdogWriteScopeFromClassification(
+  classification: TaskWatchdogStopClassification | null | undefined,
+): TaskWatchdogWriteScope {
+  const subtreeIssueIds = new Set(classification?.includedIssueIds ?? []);
+  const stopBlockerIssueIds = new Set<string>();
+  for (const leaf of classification?.stoppedLeaves ?? []) {
+    // Bound the grant to the blocker that caused a stop. A blocker attached to
+    // a leaf that is still `in_progress` is not what stopped the subtree, and
+    // closing it buys the run nothing it cannot already do on the leaf itself —
+    // so admitting it would widen the grant past its own justification, and past
+    // the issues the board's `instructions` string was written about.
+    if (leaf.status !== "blocked") continue;
+    for (const blockerIssueId of leaf.blockerIssueIds) stopBlockerIssueIds.add(blockerIssueId);
+  }
+  return { subtreeIssueIds, stopBlockerIssueIds };
+}
+
+/**
+ * Whether `issueId` is inside a task-watchdog run's write scope.
+ *
+ * One query — the subject's own row, for the company boundary and the
+ * task-watchdog-issue exclusion. Both id sets are already in hand, and the
+ * classification that produced them cost the same fixed number of queries the
+ * freshness revalidation spends anyway, so this stays flat no matter how deep
+ * the subtree is or how many blocked edges the subject carries.
+ */
 export async function issueIsInTaskWatchdogSubtree(
   db: Db,
   companyId: string,
   issueId: string,
-  watchedIssueId: string,
+  writeScope: TaskWatchdogWriteScope,
 ) {
-  if (await issueIsInWatchedParentSubtree(db, companyId, issueId, watchedIssueId)) return true;
-  return issueBlocksWatchedSubtreeIssue(db, companyId, issueId, watchedIssueId);
-}
-
-/**
- * The parent-ancestry half of the scope: the watched issue and its descendants.
- */
-async function issueIsInWatchedParentSubtree(
-  db: Db,
-  companyId: string,
-  issueId: string,
-  watchedIssueId: string,
-) {
-  let currentId: string | null = issueId;
-  const seen = new Set<string>();
-
-  for (let depth = 0; currentId && depth < MAX_WATCHDOG_SCOPE_ANCESTRY_DEPTH; depth += 1) {
-    if (seen.has(currentId)) return false;
-    seen.add(currentId);
-
-    const parent: { id: string; companyId: string; parentId: string | null; originKind: string | null } | null = await db
-      .select({ id: issues.id, companyId: issues.companyId, parentId: issues.parentId, originKind: issues.originKind })
-      .from(issues)
-      .where(and(eq(issues.id, currentId), eq(issues.companyId, companyId)))
-      .then((rows) => rows[0] ?? null);
-    if (!parent) return false;
-    if (parent.originKind === TASK_WATCHDOG_ORIGIN_KIND) return false;
-    if (currentId === watchedIssueId) return true;
-    currentId = parent.parentId ?? null;
+  if (writeScope.subtreeIssueIds.has(issueId)) return true;
+  if (writeScope.stopBlockerIssueIds.has(issueId)) {
+    return issueIsWritableTaskWatchdogSubject(db, companyId, issueId);
   }
-
   return false;
 }
 
 /**
- * The blocker-edge half of the scope.
- *
- * A stop is classified from status *and* blocker state, so the issue that
- * causes a stop is frequently a blocker rather than a descendant. Without this
- * the watchdog is woken to clear a stop and is refused on the one issue whose
- * closure would release it, and the unchanged stop re-fires on the next state
- * change.
- *
- * Deliberately exactly one hop: the candidate must itself block the watched
- * issue or an issue in the watched issue's parent subtree. A blocker of a
- * blocker belongs to that blocker's own owner — and each extra hop widens what
- * a run can write, which is the one thing this gate exists to bound.
+ * The bars a granted blocker still has to clear: it has to be a real issue of
+ * the watchdog's own company, and it must not itself be a task-watchdog issue.
  */
-async function issueBlocksWatchedSubtreeIssue(
+async function issueIsWritableTaskWatchdogSubject(
   db: Db,
   companyId: string,
   issueId: string,
-  watchedIssueId: string,
 ) {
-  if (issueId === watchedIssueId) return false;
-
-  // The subject has to be a real issue of the watchdog's own company, and it
-  // must not be a task-watchdog issue — the same two bars the parent walk
-  // applies before it admits anything.
-  const subject: { originKind: string | null } | null = await db
-    .select({ originKind: issues.originKind })
+  const subject: { companyId: string; originKind: string | null } | null = await db
+    .select({ companyId: issues.companyId, originKind: issues.originKind })
     .from(issues)
-    .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+    .where(eq(issues.id, issueId))
     .then((rows) => rows[0] ?? null);
   if (!subject) return false;
+  if (subject.companyId !== companyId) return false;
   if (subject.originKind === TASK_WATCHDOG_ORIGIN_KIND) return false;
-
-  const blocked = await db
-    .select({
-      id: issues.id,
-      companyId: issues.companyId,
-      parentId: issues.parentId,
-      originKind: issues.originKind,
-    })
-    .from(issueRelations)
-    .innerJoin(issues, eq(issues.id, issueRelations.relatedIssueId))
-    .where(and(
-      eq(issueRelations.companyId, companyId),
-      eq(issueRelations.issueId, issueId),
-      eq(issueRelations.type, "blocks"),
-      eq(issues.companyId, companyId),
-    ))
-    .limit(MAX_WATCHDOG_SCOPE_BLOCKER_FANOUT)
-    .then((rows) => rows);
-
-  for (const candidate of blocked) {
-    if (candidate.originKind === TASK_WATCHDOG_ORIGIN_KIND) continue;
-    if (await issueIsInWatchedParentSubtree(db, companyId, candidate.id, watchedIssueId)) {
-      return true;
-    }
-  }
-
-  return false;
+  return true;
 }
 
 export async function taskWatchdogScopeAllowsIssueMutation(
   db: Db,
   scope: TaskWatchdogMutationScope,
   issue: IssueScopeTarget,
-  opts: { allowWatchdogIssue?: boolean } = {},
+  opts: { allowWatchdogIssue?: boolean; writeScope: TaskWatchdogWriteScope },
 ) {
   if (scope.kind !== "watchdog") return scope;
   if (issue.companyId !== scope.companyId) {
@@ -252,7 +234,14 @@ export async function taskWatchdogScopeAllowsIssueMutation(
   if (opts.allowWatchdogIssue !== false && scope.watchdogIssueId && issue.id === scope.watchdogIssueId) {
     return scope;
   }
-  if (await issueIsInTaskWatchdogSubtree(db, scope.companyId, issue.id, scope.watchedIssueId)) {
+  if (
+    await issueIsInTaskWatchdogSubtree(
+      db,
+      scope.companyId,
+      issue.id,
+      opts.writeScope,
+    )
+  ) {
     return scope;
   }
   return {

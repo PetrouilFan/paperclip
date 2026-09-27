@@ -27,6 +27,7 @@ import { taskWatchdogService } from "../services/task-watchdogs.ts";
 import {
   issueIsInTaskWatchdogSubtree,
   taskWatchdogScopeAllowsIssueMutation,
+  taskWatchdogWriteScopeFromClassification,
 } from "../services/task-watchdog-scope.ts";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
@@ -140,7 +141,12 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
     return { service, wakes, instructions };
   }
 
-  async function seedWatchdog(companyId: string, issueId: string, agentId: string, instructions: string) {
+  async function seedWatchdog(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+    instructions: string | null,
+  ) {
     const [row] = await db.insert(issueWatchdogs).values({
       companyId,
       issueId,
@@ -149,6 +155,69 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       status: "active",
     }).returning();
     return row;
+  }
+
+  /**
+   * The write scope a task-watchdog run is actually held to, derived the way
+   * the route derives it: revalidate the stop, then read the id sets out of the
+   * classification that revalidation produced. Nothing here hand-builds a set,
+   * so a test cannot pass by agreeing with itself about what the gate should
+   * admit.
+   */
+  async function writeScopeFor(
+    companyId: string,
+    watchedId: string,
+    agentId: string,
+    instructions: string | null = "Verify stopped work.",
+    dbForService: unknown = db,
+  ) {
+    // Reuse the watchdog the test already seeded where there is one:
+    // `issue_watchdogs` is unique per (company, issue), and this helper is
+    // about reading the scope, not about creating a second watchdog.
+    const existing = await db
+      .select()
+      .from(issueWatchdogs)
+      .where(and(
+        eq(issueWatchdogs.companyId, companyId),
+        eq(issueWatchdogs.issueId, watchedId),
+        eq(issueWatchdogs.status, "active"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    const watchdogRow = existing ?? (await seedWatchdog(companyId, watchedId, agentId, instructions));
+    const service = taskWatchdogService(dbForService as never, {});
+    const revalidated = await service.revalidateMutationScope({
+      kind: "watchdog",
+      // No run id: the baseline write is skipped, and the rebase branch needs
+      // one, so the revalidation reports its refusal instead of adopting a new
+      // fingerprint. The classification is present either way, and that is all
+      // the scope is read from.
+      runId: null,
+      watchdogId: watchdogRow.id,
+      companyId,
+      watchedIssueId: watchedId,
+      stopFingerprint: "task_watchdog_stop:not-the-live-fingerprint",
+      mutationAdmittedAt: null,
+    });
+    return taskWatchdogWriteScopeFromClassification(revalidated.classification);
+  }
+
+  /**
+   * Count every query the authorization path issues, so a test can assert the
+   * count does not move when the graph gets wider or deeper. `.select` and
+   * `.execute` are both counted: the subtree is loaded by a recursive CTE
+   * through `.execute`, and missing that one would make the count look flat for
+   * the wrong reason.
+   */
+  function countingDb(inner: unknown) {
+    const state = { queries: 0 };
+    const proxy = new Proxy(inner as object, {
+      get(target, prop, receiver) {
+        if (prop === "select" || prop === "execute") state.queries += 1;
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    return { db: proxy, state };
   }
 
   describe("board watchdog instructions reach the woken run", () => {
@@ -237,7 +306,14 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       // Not `toContain("blocker")` — the unfixed prompt already says the word
       // somewhere, so that assertion passes either way and proves nothing.
       expect(prompt).toContain("Blocker scope:");
-      expect(prompt).toContain("direct blockers of the watched issue");
+      // The advertised grant has to be the grant. The line is the only place
+      // the run learns what it may write, so a scope that narrowed while this
+      // sentence kept describing the old one would send the run into 403s.
+      expect(prompt).toContain("the blockers of the stopped");
+      expect(prompt).toContain("that are themselves blocked");
+      expect(prompt).not.toContain(
+        "the direct blockers of the watched issue and of its in-scope descendants are writable",
+      );
     });
 
     /**
@@ -256,10 +332,14 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
      * So: for a run that is handed a forbidden-write instruction about a
      * blocker the new scope admits, the prohibition must be in the prompt the
      * run actually reads. If either half regresses, this goes red.
+     *
+     * The watched issue is `blocked` and is itself the stopped leaf, so the
+     * grant under test is the real one — a blocker whose closure releases a
+     * stop — rather than the over-wide grant this change removed.
      */
     it("delivers a forbidden-write instruction about a blocker the new scope admits", async () => {
       const companyId = await seedCompany("Guarded Widen Co");
-      const watchedId = await seedIssue(companyId, { identifier: "GW-1", status: "done" });
+      const watchedId = await seedIssue(companyId, { identifier: "GW-1", status: "blocked" });
       const blockerId = await seedIssue(companyId, { identifier: "GW-2", status: "blocked" });
       await blockIssue(companyId, watchedId, blockerId);
       const agentId = await seedAgent(companyId);
@@ -277,8 +357,9 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
         targetScope: { watchedIssueId: watchedId, includeBlockersOfWatchedSubtree: true },
       });
       // ...and the raw scope predicate agrees, so the gate would not stop it.
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId, prohibition);
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, writeScope),
       ).toBe(true);
       // ...so the prohibition has to arrive, or the grant is unguarded.
       const prompt = renderPaperclipWakePrompt(wakeContext);
@@ -286,33 +367,115 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
     });
   });
 
+
   describe("watchdog mutation scope reaches the blocker that causes the stop", () => {
-    it("admits a blocker of the watched issue that is not a child", async () => {
+    it("admits the blocker of a leaf the stop actually rests on", async () => {
       const companyId = await seedCompany("Scope Co");
       const watchedId = await seedIssue(companyId, { identifier: "SC-1", status: "done" });
-      const blockerId = await seedIssue(companyId, { identifier: "SC-2", status: "blocked" });
-      expect(await seedIssue(companyId, { identifier: "SC-2b" })).not.toBe(blockerId);
-      await blockIssue(companyId, watchedId, blockerId);
-
-      expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, watchedId),
-      ).toBe(true);
-    });
-
-    it("admits a blocker of a descendant of the watched issue", async () => {
-      const companyId = await seedCompany("Scope Co");
-      const watchedId = await seedIssue(companyId, { identifier: "SC-3", status: "done" });
-      const childId = await seedIssue(companyId, {
-        identifier: "SC-4",
+      const stoppedLeafId = await seedIssue(companyId, {
+        identifier: "SC-2",
         status: "blocked",
         parentId: watchedId,
       });
-      const blockerId = await seedIssue(companyId, { identifier: "SC-5", status: "blocked" });
-      await blockIssue(companyId, childId, blockerId);
+      const blockerId = await seedIssue(companyId, { identifier: "SC-3", status: "blocked" });
+      await blockIssue(companyId, stoppedLeafId, blockerId);
+      const agentId = await seedAgent(companyId);
+
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
 
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, writeScope),
       ).toBe(true);
+    });
+
+    it("admits a blocker of the watched issue itself when the stop is the watched issue", async () => {
+      const companyId = await seedCompany("Scope Co");
+      // The watched issue is its own stopped leaf here, so its blockers are the
+      // blockers that caused the stop.
+      const watchedId = await seedIssue(companyId, { identifier: "SC-1b", status: "blocked" });
+      const blockerId = await seedIssue(companyId, { identifier: "SC-2c", status: "blocked" });
+      await blockIssue(companyId, watchedId, blockerId);
+      const agentId = await seedAgent(companyId);
+
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
+
+      expect(
+        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, writeScope),
+      ).toBe(true);
+    });
+
+    /**
+     * The over-wide grant, as a fixture.
+     *
+     * `L1` is healthy and still working; `L2` is the stop. A third party's
+     * blocker hangs off `L1`, in a different branch of the subtree from the one
+     * that stopped, and closing it releases nothing. Before the rework the
+     * predicate walked the reverse graph and admitted it anyway.
+     *
+     * Both instruction configurations are covered because `instructions` is
+     * nullable: the safety argument this change was carrying — "the prohibition
+     * arrives with the grant" — only holds for the watchdogs that have one, so
+     * the grant has to be sound without it.
+     */
+    it("refuses a third party's blocker of a healthy descendant, with or without instructions", async () => {
+      const configurations = [
+        "Never touch the healthy-descendant blocker.",
+        null,
+      ];
+      for (const [iteration, instructions] of configurations.entries()) {
+        const companyId = await seedCompany(`Fixture A Co ${iteration}`);
+        const watchedId = await seedIssue(companyId, { identifier: `FA-${iteration}-1`, status: "done" });
+        const healthyId = await seedIssue(companyId, {
+          identifier: `FA-${iteration}-2`,
+          title: "Healthy, still in progress",
+          status: "in_progress",
+          parentId: watchedId,
+        });
+        // The actual stop, in a different branch of the subtree.
+        await seedIssue(companyId, {
+          identifier: `FA-${iteration}-3`,
+          title: "The actual stop",
+          status: "blocked",
+          parentId: watchedId,
+        });
+        const thirdPartyId = await seedIssue(companyId, {
+          identifier: `FA-${iteration}-4`,
+          title: "Belongs to another team",
+          status: "blocked",
+        });
+        // Blocks only the healthy descendant, not the stop.
+        await blockIssue(companyId, healthyId, thirdPartyId);
+        const agentId = await seedAgent(companyId);
+
+        const writeScope = await writeScopeFor(companyId, watchedId, agentId, instructions);
+
+        // Non-vacuity: the classification really ran, the healthy leaf is inside
+        // the scope, and the third party is in no stop's blocker set. Without
+        // these, an empty classification would make the refusal below pass for
+        // the wrong reason.
+        expect(writeScope.subtreeIssueIds.has(healthyId)).toBe(true);
+        expect(writeScope.stopBlockerIssueIds.has(thirdPartyId)).toBe(false);
+
+        expect(
+          await issueIsInTaskWatchdogSubtree(db, companyId, thirdPartyId, writeScope),
+        ).toBe(false);
+      }
+    });
+
+    it("refuses a blocker of a watched issue that is already done", async () => {
+      const companyId = await seedCompany("Scope Co");
+      const watchedId = await seedIssue(companyId, { identifier: "SC-4", status: "done" });
+      const blockerId = await seedIssue(companyId, { identifier: "SC-5", status: "blocked" });
+      // A `done` watched issue is terminal, so it is never a stopped leaf and
+      // this edge is not what stopped anything.
+      await blockIssue(companyId, watchedId, blockerId);
+      const agentId = await seedAgent(companyId);
+
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
+
+      expect(
+        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, writeScope),
+      ).toBe(false);
     });
 
     it("still admits the watched issue and its parent-ancestry subtree", async () => {
@@ -328,12 +491,15 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
         status: "blocked",
         parentId: childId,
       });
+      const agentId = await seedAgent(companyId);
+
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
 
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, watchedId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, watchedId, writeScope),
       ).toBe(true);
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, grandchildId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, grandchildId, writeScope),
       ).toBe(true);
     });
 
@@ -344,13 +510,16 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       const blockerId = await seedIssue(companyId, { identifier: "SC-11", status: "blocked" });
       // The candidate blocks a real issue, just not one in the watched subtree.
       await blockIssue(companyId, outsideBlockedId, blockerId);
+      const agentId = await seedAgent(companyId);
+
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
 
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, writeScope),
       ).toBe(false);
     });
 
-    it("admits a candidate that blocks an in-scope issue even when it also blocks an out-of-scope one", async () => {
+    it("admits a candidate that blocks a stopped leaf even when it also blocks an out-of-scope one", async () => {
       const companyId = await seedCompany("Scope Co");
       const watchedId = await seedIssue(companyId, { identifier: "SC-9b", status: "done" });
       const childId = await seedIssue(companyId, {
@@ -362,51 +531,90 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       const blockerId = await seedIssue(companyId, { identifier: "SC-11b", status: "blocked" });
       await blockIssue(companyId, childId, blockerId);
       await blockIssue(companyId, outsideBlockedId, blockerId);
+      const agentId = await seedAgent(companyId);
+
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
 
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, writeScope),
       ).toBe(true);
     });
 
     it("refuses a blocker of a blocker: the scope is exactly one hop", async () => {
       const companyId = await seedCompany("Scope Co");
       const watchedId = await seedIssue(companyId, { identifier: "SC-13", status: "done" });
+      const stoppedLeafId = await seedIssue(companyId, {
+        identifier: "SC-15b",
+        status: "blocked",
+        parentId: watchedId,
+      });
       const blockerId = await seedIssue(companyId, { identifier: "SC-14", status: "blocked" });
       const outerBlockerId = await seedIssue(companyId, { identifier: "SC-15", status: "blocked" });
-      await blockIssue(companyId, watchedId, blockerId);
+      await blockIssue(companyId, stoppedLeafId, blockerId);
       await blockIssue(companyId, blockerId, outerBlockerId);
+      const agentId = await seedAgent(companyId);
 
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
+
+      // The inner blocker is the one that released the stop, so it is admitted...
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, outerBlockerId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, blockerId, writeScope),
+      ).toBe(true);
+      // ...and the outer one belongs to that blocker's own owner.
+      expect(
+        await issueIsInTaskWatchdogSubtree(db, companyId, outerBlockerId, writeScope),
       ).toBe(false);
     });
 
-    it("refuses a blocker that is itself a task-watchdog issue", async () => {
+    it("refuses a granted blocker that is itself a task-watchdog issue", async () => {
       const companyId = await seedCompany("Scope Co");
       const watchedId = await seedIssue(companyId, { identifier: "SC-16", status: "done" });
+      const stoppedLeafId = await seedIssue(companyId, {
+        identifier: "SC-17b",
+        status: "blocked",
+        parentId: watchedId,
+      });
+      // A nested watchdog's review issue is a blocker of the stop, so it reaches
+      // the subject check rather than being filtered out of the set — which is
+      // the point: the bar that refuses it has to be the one under test.
       const watchdogIssueId = await seedIssue(companyId, {
         identifier: "SC-17",
         status: "blocked",
         originKind: "task_watchdog",
         originId: watchedId,
       });
-      await blockIssue(companyId, watchedId, watchdogIssueId);
+      await blockIssue(companyId, stoppedLeafId, watchdogIssueId);
+      const agentId = await seedAgent(companyId);
 
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
+
+      expect(writeScope.stopBlockerIssueIds.has(watchdogIssueId)).toBe(true);
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, watchdogIssueId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, watchdogIssueId, writeScope),
       ).toBe(false);
     });
 
-    it("refuses a blocker edge that crosses a company boundary", async () => {
+    it("refuses a granted blocker that belongs to another company", async () => {
       const companyId = await seedCompany("Scope Co A");
       const otherCompanyId = await seedCompany("Scope Co B");
       const watchedId = await seedIssue(companyId, { identifier: "SC-18", status: "done" });
+      const stoppedLeafId = await seedIssue(companyId, {
+        identifier: "SC-18b",
+        status: "blocked",
+        parentId: watchedId,
+      });
       const foreignBlockerId = await seedIssue(otherCompanyId, { identifier: "SC-19" });
       // A row that names the watched company but points at another company's issue.
-      await blockIssue(companyId, watchedId, foreignBlockerId);
+      await blockIssue(companyId, stoppedLeafId, foreignBlockerId);
+      const agentId = await seedAgent(companyId);
 
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
+
+      // The relation row is company-scoped, so the id reaches the set; the
+      // subject's own company is what has to refuse it.
+      expect(writeScope.stopBlockerIssueIds.has(foreignBlockerId)).toBe(true);
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, foreignBlockerId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, foreignBlockerId, writeScope),
       ).toBe(false);
     });
 
@@ -421,9 +629,12 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       });
       const siblingBlockerId = await seedIssue(companyId, { identifier: "SC-23", status: "blocked" });
       await blockIssue(companyId, siblingChildId, siblingBlockerId);
+      const agentId = await seedAgent(companyId);
+
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
 
       expect(
-        await issueIsInTaskWatchdogSubtree(db, companyId, siblingBlockerId, watchedId),
+        await issueIsInTaskWatchdogSubtree(db, companyId, siblingBlockerId, writeScope),
       ).toBe(false);
     });
 
@@ -438,6 +649,8 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       const blockerId = await seedIssue(companyId, { identifier: "SC-26", status: "blocked" });
       await blockIssue(companyId, childId, blockerId);
       const outsideId = await seedIssue(companyId, { identifier: "SC-27" });
+      const agentId = await seedAgent(companyId);
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
       const scope = {
         kind: "watchdog" as const,
         runId: randomUUID(),
@@ -450,16 +663,20 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       };
 
       expect(
-        await taskWatchdogScopeAllowsIssueMutation(db, scope, {
-          id: blockerId,
-          companyId,
-        }),
+        await taskWatchdogScopeAllowsIssueMutation(
+          db,
+          scope,
+          { id: blockerId, companyId },
+          { writeScope },
+        ),
       ).toMatchObject({ kind: "watchdog" });
       expect(
-        await taskWatchdogScopeAllowsIssueMutation(db, scope, {
-          id: outsideId,
-          companyId,
-        }),
+        await taskWatchdogScopeAllowsIssueMutation(
+          db,
+          scope,
+          { id: outsideId, companyId },
+          { writeScope },
+        ),
       ).toMatchObject({ kind: "invalid" });
     });
 
@@ -469,6 +686,8 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       const watchedId = await seedIssue(companyId, { identifier: "SC-28", status: "done" });
       const foreignId = await seedIssue(otherCompanyId, { identifier: "SC-29" });
       await blockIssue(companyId, watchedId, foreignId);
+      const agentId = await seedAgent(companyId);
+      const writeScope = await writeScopeFor(companyId, watchedId, agentId);
       const scope = {
         kind: "watchdog" as const,
         runId: randomUUID(),
@@ -481,11 +700,98 @@ describeEmbeddedPostgres("task watchdog wake contract", () => {
       };
 
       expect(
-        await taskWatchdogScopeAllowsIssueMutation(db, scope, {
-          id: foreignId,
-          companyId: otherCompanyId,
-        }),
+        await taskWatchdogScopeAllowsIssueMutation(
+          db,
+          scope,
+          { id: foreignId, companyId: otherCompanyId },
+          { writeScope },
+        ),
       ).toMatchObject({ kind: "invalid" });
     });
+  });
+
+  /**
+   * The cost of the authorization decision, as a test.
+   *
+   * The scope check is on the mutation-approval path, so it runs on every write
+   * a watchdog run makes. Deriving the grant from the classification the
+   * freshness revalidation already computed is what keeps it flat: the subtree
+   * arrives as one recursive-CTE result and both id sets arrive with it, so
+   * neither the depth of the subtree nor the number of blocked edges the
+   * candidate carries can turn into more round-trips.
+   */
+  describe("watchdog write scope costs the same whatever the graph looks like", () => {
+    async function measureAuthorization(depth: number, decoyEdges: number) {
+      const companyId = await seedCompany(`Cost ${depth}-${decoyEdges}`);
+      // `issues.identifier` is unique instance-wide, not per company, so every
+      // fixture in this describe needs its own prefix.
+      const tag = `${depth}x${decoyEdges}`;
+      const watchedId = await seedIssue(companyId, { identifier: `CO-${tag}-1`, status: "done" });
+
+      // A chain of `depth` descendants under the watched issue, so ancestry has
+      // somewhere to be deep.
+      let parentId = watchedId;
+      let stoppedLeafId = watchedId;
+      for (let index = 0; index < depth; index += 1) {
+        stoppedLeafId = await seedIssue(companyId, {
+          identifier: `CO-${tag}-chain-${index}`,
+          status: index === depth - 1 ? "blocked" : "in_progress",
+          parentId,
+        });
+        parentId = stoppedLeafId;
+      }
+
+      const blockerId = await seedIssue(companyId, { identifier: `CO-${tag}-2`, status: "blocked" });
+      await blockIssue(companyId, stoppedLeafId, blockerId);
+
+      // Decoy edges: the candidate blocks issues that are outside the subtree.
+      // A reverse-graph walk matches each of these and re-walks ancestry for it.
+      for (let index = 0; index < decoyEdges; index += 1) {
+        const decoyId = await seedIssue(companyId, {
+          identifier: `CO-${tag}-decoy-${index}`,
+          parentId: index % 2 === 0 ? watchedId : null,
+        });
+        await blockIssue(companyId, decoyId, blockerId);
+      }
+
+      const agentId = await seedAgent(companyId);
+      const counted = countingDb(db);
+      const writeScope = await writeScopeFor(
+        companyId,
+        watchedId,
+        agentId,
+        "Verify stopped work.",
+        counted.db,
+      );
+      const admitted = await issueIsInTaskWatchdogSubtree(
+        counted.db as never,
+        companyId,
+        blockerId,
+        writeScope,
+      );
+      return { queries: counted.state.queries, admitted };
+    }
+
+    it("does not spend more queries as decoy edges and ancestry depth grow", async () => {
+      const small = await measureAuthorization(2, 0);
+      const wide = await measureAuthorization(2, 49);
+      const deep = await measureAuthorization(40, 0);
+      const worst = await measureAuthorization(40, 49);
+
+      // Each fixture has to be the same decision, or the counts are not
+      // comparable: only the shape of the graph is allowed to differ.
+      for (const measured of [small, wide, deep, worst]) {
+        expect(measured.admitted).toBe(true);
+      }
+
+      expect(wide.queries).toBe(small.queries);
+      expect(deep.queries).toBe(small.queries);
+      expect(worst.queries).toBe(small.queries);
+      // And a ceiling, so a future change cannot buy a flat count by moving the
+      // work somewhere this assertion no longer sees — and a floor, so a flat
+      // count of zero cannot pass for a measurement.
+      expect(small.queries).toBeGreaterThan(0);
+      expect(small.queries).toBeLessThanOrEqual(16);
+    }, 30_000);
   });
 });

@@ -45,6 +45,10 @@ function registerRouteMocks() {
     TASK_WATCHDOG_ORIGIN_KIND: "task_watchdog",
     resolveTaskWatchdogMutationScope: vi.fn(async () => ({ kind: "none" })),
     taskWatchdogScopeAllowsIssueMutation: vi.fn(async () => ({ kind: "none" })),
+    taskWatchdogWriteScopeFromClassification: vi.fn(() => ({
+      subtreeIssueIds: new Set<string>(),
+      stopBlockerIssueIds: new Set<string>(),
+    })),
   }));
 
   vi.doMock("../services/index.js", () => ({

@@ -759,9 +759,10 @@ function watchdogWakeContext(input: {
           watchdogIssueId: input.watchdogIssue.id,
           includeNonWatchdogDescendants: true,
           // The stop classifier reads status *and* blocker state, so a stop can
-          // be caused by a blocker that is not a descendant. One hop of the
-          // blocker edge is in scope, and no further — see
-          // `issueIsInTaskWatchdogSubtree`.
+          // be caused by a blocker that is not a descendant. The blockers of the
+          // stopped leaves are in scope, and nothing else on the blocker edge is
+          // — see `taskWatchdogWriteScopeFromClassification`, which is the same
+          // derivation the gate applies.
           includeBlockersOfWatchedSubtree: true,
           excludedOriginKinds: [TASK_WATCHDOG_ORIGIN_KIND],
         },
