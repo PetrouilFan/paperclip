@@ -123,7 +123,35 @@ export function buildRunnerApiCatalog(document: Json = buildOpenApiDocument()): 
 
 let cached: RunnerApiOperation[] | undefined;
 let cachedDigest: string | undefined;
+let cachedVocabulary: ReadonlySet<string> | undefined;
 export function runnerApiCatalog(): RunnerApiOperation[] { return cached ??= buildRunnerApiCatalog(); }
+// The two halves of the text a query token can be scored against. The ranker
+// weights them differently but matches either, so `runnerApiSearchVocabulary`
+// reads the same two expressions rather than a third list of fields that can
+// drift away from the one the scorer actually uses.
+function titleText(entry: RunnerApiOperation): string { return `${entry.method} ${entry.path} ${entry.summary}`; }
+function descriptionText(entry: RunnerApiOperation): string { return `${entry.description} ${entry.skillReference?.description ?? ""} ${entry.skillReference?.section ?? ""}`; }
+/**
+ * Every token the ranker can score on, synonyms and plural folding included.
+ *
+ * `searchRunnerApi` is a bag of words with no relevance floor: a query token
+ * that appears in an operation's method, path, summary or prose scores, and
+ * any non-zero score keeps the operation. "This query matches nothing" is
+ * therefore a property of the catalog text rather than of the query, and the
+ * catalog text is documentation that is meant to grow. A caller that needs a
+ * genuinely unmatchable query derives it from this set instead of trusting a
+ * literal to stay gibberish. Memoized for the process lifetime, like the
+ * catalog it reads, and returned read-only because the memo is shared.
+ */
+export function runnerApiSearchVocabulary(): ReadonlySet<string> {
+  if (cachedVocabulary) return cachedVocabulary;
+  const vocabulary = new Set<string>();
+  for (const entry of runnerApiCatalog()) {
+    for (const word of words(titleText(entry))) vocabulary.add(word);
+    for (const word of words(descriptionText(entry))) vocabulary.add(word);
+  }
+  return cachedVocabulary = vocabulary;
+}
 export function runnerApiOperation(id: string): RunnerApiOperation {
   const operation = runnerApiCatalog().find((entry) => entry.operationId === id);
   if (!operation) throw notFound("Unknown API operation; use search_api to discover its exact operationId");
@@ -149,8 +177,8 @@ export function searchRunnerApi(value: unknown) {
   const exact = catalog.find((entry) => entry.operationId.toLowerCase() === query.trim().toLowerCase());
   const terms = [...new Set(words(query))];
   const matches = exact ? [exact] : catalog.map((entry) => {
-    const title = new Set(words(`${entry.method} ${entry.path} ${entry.summary}`));
-    const description = new Set(words(`${entry.description} ${entry.skillReference?.description ?? ""} ${entry.skillReference?.section ?? ""}`));
+    const title = new Set(words(titleText(entry)));
+    const description = new Set(words(descriptionText(entry)));
     return { entry, score: terms.reduce((sum, word) => sum + (title.has(word) ? 5 : description.has(word) ? 1 : 0), 0) };
   }).filter(({ score }) => score > 0).sort((a, b) => b.score - a.score || a.entry.operationId.localeCompare(b.entry.operationId)).map(({ entry }) => entry);
   const results = matches.slice(offset, offset + limit);

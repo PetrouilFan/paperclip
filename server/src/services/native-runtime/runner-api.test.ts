@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   runnerApiCatalog,
   runnerApiOperation,
+  runnerApiSearchVocabulary,
   searchRunnerApi,
 } from "./runner-api-catalog.js";
 import {
@@ -21,6 +22,10 @@ const context = {
 };
 const projects = "GET /api/companies/{companyId}/projects";
 const createProject = "POST /api/companies/{companyId}/projects";
+// Every token must be one the catalog never uses. See the negative control in
+// "ranks natural language, explains dedicated alternatives, and supports exact
+// lookup" for why that is checked rather than assumed.
+const negativeControlTokens = ["zzqqxvvkwb", "9876543210zb"];
 const io = (fetcher: typeof fetch): RunnerApiIo => ({
   apiUrl: "http://127.0.0.1:3100",
   token: "private-agent-token",
@@ -90,14 +95,29 @@ describe("runner API catalog", () => {
       searchRunnerApi({ query: "GET /api/companies/{companyId}/issues" })
         .results[0].dedicatedTools,
     ).toContain("search_tasks");
-    // Every token of the probe must be a token the catalog never uses, because
-    // searchRunnerApi scores every token it can find. An earlier probe,
-    // "nothing-zzzzzzzzzz", was only nonsense in its distinguishing half: it
-    // carried the ordinary word "nothing", and the issues-count description ends
-    // in "they mean nothing here", so the probe matched that one operation and
-    // this assertion failed on any commit that wrote that sentence. A probe
-    // that reads like English is a probe that breaks when the prose changes.
-    expect(searchRunnerApi({ query: "qqzzz-xvvv-4417" }).total).toBe(0);
+    // The negative control has to be unmatchable, not merely unlikely. searchRunnerApi
+    // scores every token it can find, so one shared description word is enough to
+    // return an operation: an earlier probe, "nothing-zzzzzzzzzz", was only nonsense
+    // in its distinguishing half. It carried the ordinary word "nothing", and the
+    // issues-count description ends in "they mean nothing here", so the probe matched
+    // that one operation and this assertion failed on any commit that wrote that
+    // sentence. Two merges later the failure read as a regression in the issue-list
+    // contract rather than as a fixture that had gone stale.
+    //
+    // Checking the tokens against the scorer's own vocabulary turns that convention
+    // into an invariant. A comment can be read and ignored; if the next documented
+    // sentence swallows one of these tokens, the check below fails here naming it,
+    // instead of leaving the count assertion to report a mysterious total of 1.
+    const vocabulary = runnerApiSearchVocabulary();
+    for (const token of negativeControlTokens) {
+      expect(
+        vocabulary.has(token),
+        `negative-control token ${token} became catalog text; pick a new one`,
+      ).toBe(false);
+    }
+    expect(
+      searchRunnerApi({ query: negativeControlTokens.join("-") }).total,
+    ).toBe(0);
   });
   it("keeps real matches when the query also carries a term the catalog never contains", () => {
     // searchRunnerApi is an OR ranker, on purpose. Natural-language queries
