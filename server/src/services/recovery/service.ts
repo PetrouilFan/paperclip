@@ -28,6 +28,7 @@ import {
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   requiresExecutionReconciliation,
+  issueMonitorSuspensionReason,
   type IssueCommentMetadata,
   type IssueCommentPresentation,
 } from "@paperclipai/shared";
@@ -97,7 +98,6 @@ import {
 } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
-  issueMonitorSuspensionReason,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";

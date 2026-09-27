@@ -196,6 +196,102 @@ describe("deriveMonitorState", () => {
   });
 });
 
+/**
+ * The board re-derived "can this watch fire?" from `issue.status` alone and never
+ * read the `suspended` / `suspendedReason` the server sends. That predicate was a
+ * strict subset of the server's — it ignored the assignee — so an issue held for
+ * want of an agent rendered a red "overdue by 2h" countdown naming a check the
+ * server had already declared it would not make.
+ */
+describe("deriveMonitorState suspension", () => {
+  const now = new Date("2026-09-27T08:40:48.000Z");
+  const overdueBy = "2026-09-27T06:40:48.000Z";
+
+  /** The payload `GET /api/issues/{id}` sends for a held issue. */
+  function projectedMonitor(suspendedReason: "host_status" | "host_assignee" | null) {
+    return {
+      executionState: {
+        monitor: {
+          status: suspendedReason ? ("suspended" as const) : ("scheduled" as const),
+          nextCheckAt: overdueBy,
+          attemptCount: 9,
+          serviceName: "model-liveness-probe",
+          ...(suspendedReason ? { suspendedReason } : {}),
+        },
+      },
+    };
+  }
+
+  it.each(["in_progress", "in_review"] as const)(
+    "reads the server's verdict on a %s issue instead of counting an overdue watch",
+    (status) => {
+      const derived = deriveMonitorState(
+        { status, ...projectedMonitor("host_assignee") },
+        now,
+      );
+      expect(derived.state).toBe("suspended");
+      expect(derived.suspendedReason).toBe("host_assignee");
+    },
+  );
+
+  it("trusts a projected `suspended` even when the row looks runnable", () => {
+    // The payload is the authority. A client that second-guesses it is back to
+    // two predicates, which is the drift this replaced.
+    const derived = deriveMonitorState(
+      { status: "in_progress", assigneeAgentId: "agent-1", ...projectedMonitor("host_status") },
+      now,
+    );
+    expect(derived.state).toBe("suspended");
+  });
+
+  it("keeps the cadence on a suspended watch, so the banner can still show when it was due", () => {
+    const derived = deriveMonitorState({ status: "blocked", ...projectedMonitor("host_status") }, now);
+    expect(derived).toMatchObject({
+      state: "suspended",
+      nextCheckAt: overdueBy,
+      attemptCount: 9,
+      serviceName: "model-liveness-probe",
+    });
+  });
+
+  it("derives the same verdict on an unprojected read, with the full predicate", () => {
+    // List rows and relation summaries carry the stored `scheduled`, not the
+    // projection. The board still has to be right there, which is why the
+    // fallback is the shared predicate rather than a status-only subset.
+    const stored = { executionState: { monitor: { status: "scheduled" as const, nextCheckAt: overdueBy, attemptCount: 9 } } };
+    expect(deriveMonitorState({ status: "blocked", assigneeAgentId: "agent-1", ...stored }, now))
+      .toMatchObject({ state: "suspended", suspendedReason: "host_status" });
+    expect(deriveMonitorState({ status: "todo", assigneeAgentId: null, assigneeUserId: "u1", ...stored }, now))
+      .toMatchObject({ state: "suspended", suspendedReason: "host_assignee" });
+    // …and a genuinely runnable issue is left alone.
+    expect(deriveMonitorState({ status: "in_progress", assigneeAgentId: "agent-1", ...stored }, now).state)
+      .toBe("overdue");
+  });
+
+  it("keeps a terminal issue's stale monitor out of the picture", () => {
+    expect(deriveMonitorState({ status: "done", ...projectedMonitor(null) }, now).state).toBe("none");
+  });
+
+  it("does not invent a suspension for a read that projects nothing and says nothing", () => {
+    // An absent status is not evidence that the watch is held. Suspending here
+    // would replace a working countdown with a false alarm.
+    const derived = deriveMonitorState(
+      { executionState: { monitor: { status: "scheduled", nextCheckAt: "2026-09-27T09:40:48.000Z", attemptCount: 1 } } },
+      now,
+    );
+    expect(derived.state).toBe("scheduled");
+  });
+
+  it("reports a suspended watch with no reason rather than naming a cause it was not told", () => {
+    const derived = deriveMonitorState(
+      { status: "in_progress", executionState: { monitor: { status: "suspended", nextCheckAt: overdueBy, attemptCount: 9 } } },
+      now,
+    );
+    expect(derived.state).toBe("suspended");
+    expect(derived.suspendedReason).toBeUndefined();
+  });
+});
+
 describe("useMonitorCountdown", () => {
   beforeEach(() => {
     vi.useFakeTimers();

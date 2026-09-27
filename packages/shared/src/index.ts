@@ -737,6 +737,13 @@ export {
 } from "./constants.js";
 
 export {
+  ISSUE_EXECUTION_MONITOR_LIVE_STATUSES,
+  ISSUE_EXECUTION_MONITOR_INACTIVE_STATUSES,
+  issueAllowsMonitor,
+  issueMonitorSuspensionReason,
+} from "./issue-monitor-suspension.js";
+
+export {
   generateSummarySlotSchema,
   summarySlotKeySchema,
   summarySlotQuerySchema,

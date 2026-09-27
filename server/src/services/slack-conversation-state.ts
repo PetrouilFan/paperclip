@@ -1,5 +1,16 @@
 import { chatConversations, issues, type Db } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
+import { ISSUE_EXECUTION_MONITOR_LIVE_STATUSES } from "@paperclipai/shared";
+
+/**
+ * `sql.raw` is load-bearing: a list interpolated into a `sql` template becomes
+ * bound parameters, and `not in ($1, $2)` is not what this predicate means to
+ * inline into a correlated sub-select. The values come from a module constant
+ * next to the enum, not from a request, so inlining them is safe.
+ */
+const liveMonitorStatusesSql = `(${ISSUE_EXECUTION_MONITOR_LIVE_STATUSES.map(
+  (status) => `'${status}'`,
+).join(", ")})`;
 
 /** Read-only projection; Slack threads do not acquire Agent Chat identities. */
 export function externalConversationStateSql() {
@@ -8,7 +19,7 @@ export function externalConversationStateSql() {
       and "issues"."execution_run_id" is null
       and "issues"."monitor_next_check_at" is null
       and coalesce("issues"."execution_state"->>'status', '') not in ('pending', 'changes_requested')
-      and coalesce("issues"."execution_state"->'monitor'->>'status', '') not in ('scheduled', 'triggered')
+      and coalesce("issues"."execution_state"->'monitor'->>'status', '') not in ${sql.raw(liveMonitorStatusesSql)}
       and not exists (select 1 from issue_thread_interactions i
         where i.company_id = c.company_id and i.issue_id = c.issue_id and i.status = 'pending')
       and not exists (select 1 from issue_approvals ia join approvals a on a.id = ia.approval_id and a.company_id = ia.company_id

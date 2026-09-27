@@ -6,6 +6,7 @@ import {
   issueWatchdogs,
   type Db,
 } from "@paperclipai/db";
+import { ISSUE_EXECUTION_MONITOR_LIVE_STATUSES } from "@paperclipai/shared";
 
 /**
  * The identity of an execution-recovery decision is `(runId, issueId)` — never
@@ -226,7 +227,8 @@ export const LIVE_WATCH_EXEMPT_KEY = "liveWatchExempt";
  *
  *  - `executionState.monitor.status = 'cleared'` counts as no monitor. A ticket
  *    whose watch was actually torn down is stranded in the ordinary sense and
- *    still wants the block.
+ *    still wants the block. The live set is
+ *    {@link ISSUE_EXECUTION_MONITOR_LIVE_STATUSES}, not a copy of it.
  *  - Only `in_progress` / `in_review` qualify, which is exactly the set
  *    `triggerIssueMonitor` and `tickDueIssueMonitors` will dispatch from. From
  *    `todo` or an already-`blocked` issue a monitor cannot run anyway, so the
@@ -258,9 +260,8 @@ export async function hasLiveMonitoredWatch(
         or(
           isNotNull(issues.monitorNextCheckAt),
           inArray(sql`${issues.executionState}->'monitor'->>'status'`, [
-            "scheduled",
-            "triggered",
-          ]),
+            ...ISSUE_EXECUTION_MONITOR_LIVE_STATUSES,
+          ] as [string, ...string[]]),
         ),
         inArray(issues.status, ["in_progress", "in_review"]),
       ),

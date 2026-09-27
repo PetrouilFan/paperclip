@@ -44,6 +44,7 @@ import { orderItemsBySelectedAndRecent } from "../../lib/recent-selections";
 import { formatAssigneeUserLabel, formatUserLabel } from "../../lib/assignees";
 import { buildExecutionPolicy, stageParticipantValues } from "../../lib/issue-execution-policy";
 import {
+  deriveMonitorState,
   formatMonitorAbsolute,
   formatMonitorAbsoluteFull,
   formatMonitorEta,
@@ -1300,18 +1301,29 @@ export function IssueProperties({
   const monitorServiceName = issue.executionPolicy?.monitor?.serviceName ?? monitorState?.serviceName ?? null;
   const monitorNotes = issue.executionPolicy?.monitor?.notes ?? monitorState?.notes ?? null;
   const monitorNow = useMonitorCountdown(monitorNextCheckAt);
+  // The row used to re-derive its own ETA from the timestamp alone, so a held
+  // issue's watch read as a healthy countdown here while the banner above it
+  // said the check would not fire. One derivation, one answer.
+  const monitorDerived = deriveMonitorState(issue, monitorNow);
+  const monitorIsSuspended = monitorDerived.state === "suspended";
   const monitorRelative = monitorNextCheckAt ? formatMonitorEta(monitorNextCheckAt, monitorNow) : null;
   const monitorIsDueNow = monitorRelative === "due now";
   const monitorIsOverdue = Boolean(monitorRelative?.startsWith("overdue by "));
   const monitorPrimary = monitorNextCheckAt
-    ? formatMonitorEtaLabel(monitorNextCheckAt, monitorNow)
+    ? monitorIsSuspended
+      ? "Paused"
+      : formatMonitorEtaLabel(monitorNextCheckAt, monitorNow)
     : monitorState?.status === "cleared"
       ? "Cleared"
       : "None";
   const monitorSecondary = monitorNextCheckAt
-    ? monitorIsDueNow
-      ? "checking momentarily…"
-      : `${formatMonitorAbsolute(monitorNextCheckAt, {}, monitorNow)}${monitorIsOverdue ? " · fires on next tick" : monitorAttemptCount > 0 ? ` · Attempt ${monitorAttemptCount}` : ""}`
+    ? monitorIsSuspended
+      ? monitorDerived.suspendedReason === "host_assignee"
+        ? "no agent is assigned to run it"
+        : "the issue is not runnable"
+      : monitorIsDueNow
+        ? "checking momentarily…"
+        : `${formatMonitorAbsolute(monitorNextCheckAt, {}, monitorNow)}${monitorIsOverdue ? " · fires on next tick" : monitorAttemptCount > 0 ? ` · Attempt ${monitorAttemptCount}` : ""}`
     : monitorState?.status === "cleared"
       ? [
           monitorLastTriggeredAt ? `last checked ${timeAgo(monitorLastTriggeredAt)}` : null,
@@ -1352,7 +1364,7 @@ export function IssueProperties({
             <div>
               <div className="text-xs text-muted-foreground">Next check</div>
               <div className="text-sm">{formatMonitorAbsoluteFull(monitorNextCheckAt)}</div>
-              <div className="text-xs text-muted-foreground">{monitorRelative}</div>
+              <div className="text-xs text-muted-foreground">{monitorIsSuspended ? "paused — the server will not dispatch this check" : monitorRelative}</div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Watching</div>
