@@ -143,6 +143,8 @@ node -e 'import("./scripts/check-running-build-drift.mjs").then(async m => {
 
 A gap between the two is the deploy decision, and it is a per-channel question, not a per-version one. Measure it; do not infer it from a version number.
 
+The same question pointed at the *guardian* — the 60s timer that restores the unit file and its drop-ins from golden copies — is `scripts/check-guardian-install-drift.mjs`, and it answers the analogous question: is the installed copy the committed one, byte for byte. On 2026-09-27 the installed copy was a 4-line `exit 0` under a timer that was `active` at a correct cadence, and 1418 clean runs in the journal. See Check 4 in [shadowed-service-unit.md](./shadowed-service-unit.md).
+
 ## Rules of thumb
 
 1. **A version string is a claim, not a check.** Before debugging instance behaviour, diff the installed `dist` against the published tarball for that version, look for `.pre-*` / `.bak-*` scars, and run `scripts/check-running-build-drift.mjs` for the fix-by-fix answer. Ten seconds, and it tells you whether you are reasoning about real code.
