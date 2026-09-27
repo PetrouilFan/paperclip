@@ -10,6 +10,7 @@ import {
   EXIT_UNEVALUATED,
   RUNNING_BUILD_SENTINELS,
   evaluateSentinels,
+  findPatchScars,
   formatReport,
   resolveRunningServerDist,
   runCheck,
@@ -187,14 +188,9 @@ test("the source-attribution sentinel is not satisfied by the superseded fallbac
   const path = "server/src/services/cross-issue-influence-limit.ts";
   // Every shipped sentinel is evaluated, so the stub has to serve each source
   // path. Only the fallback file's contents decide the two states asserted
-  // below; the checkout sentinel is served a body carrying its marker so it
-  // does not muddy the result.
-  const git = (args) => {
-    const spec = args[1];
-    if (spec === `HEAD:${path}`) return source;
-    if (spec === "HEAD:server/src/services/issues.ts") return "function assertCheckoutRunIsActive() {}\n";
-    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
-  };
+  // below; the other sentinels are served bodies carrying their markers so they
+  // do not muddy the result.
+  const git = gitServingAllShippedSentinels({ [path]: source });
   const root = distRootWith({
     "cross-issue-influence-limit.js": supersededVariant,
     "issues.js": "function assertCheckoutRunIsActive() {}\n",
@@ -279,37 +275,83 @@ test("exit codes stay distinct: deployed is 0, drift is 1, and never the reverse
   assert.notEqual(EXIT_UNEVALUATED, EXIT_OK);
 });
 
-test("the run shape of the live build still reports exactly the two real findings", () => {
-  // Guards against the exit-code refactor changing what the check measures. The
-  // source carries every marker (as HEAD does), while the artifact is the
-  // hand-patched build: the checkout guard is gone and the fallback is the
-  // superseded narrow variant. That must read as two drifts, not one and not a
-  // manifest mismatch.
-  const crossSource = [
-    "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
-    "let boundSourceIssueId = null;",
-    "  throw crossIssueInfluenceRunContextError('terminal_status');",
-    "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
-    "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
-  ].join("\n");
-  const crossSupersededVariant = [
-    "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
-    "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
-    "const sourceIssueId = contextSourceIssueId;",
-  ].join("\n");
-  const p = "server/src/services/cross-issue-influence-limit.ts";
-  const git = (args) => {
+/** A `git show HEAD:<path>` stub serving every shipped sentinel's source path. */
+function gitServingAllShippedSentinels(overrides = {}) {
+  const defaults = {
+    "server/src/services/cross-issue-influence-limit.ts": [
+      "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+      "let boundSourceIssueId = null;",
+      "let targetIsBound = false;",
+      "  throw crossIssueInfluenceRunContextError('terminal_status');",
+      "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+      "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
+    ].join("\n"),
+    "server/src/services/issues.ts": "function assertCheckoutRunIsActive() {}\n",
+    "server/src/middleware/error-handler.ts": "res.status(400).json({ error: 'Invalid JSON body' });\n",
+    "server/src/embedded-postgres-supervisor.ts":
+      "const markShutdownIntent = () => {};\noptions.onRecoveryExhausted?.(lastError);\n",
+  };
+  const bodies = { ...defaults, ...overrides };
+  return (args) => {
     const spec = args[1];
-    if (spec === `HEAD:${p}`) return crossSource;
-    if (spec === "HEAD:server/src/services/issues.ts") {
-      return "function assertCheckoutRunIsActive() {}\n";
+    if (spec?.startsWith("HEAD:")) {
+      const body = bodies[spec.slice("HEAD:".length)];
+      if (body === undefined) throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+      return body;
     }
     throw new Error(`unexpected git invocation: ${args.join(" ")}`);
   };
-  const root = distRootWith({
-    "cross-issue-influence-limit.js": crossSupersededVariant,
-    "issues.js": "// build predates the checkout guard\n",
-  });
+}
+
+/** A dist root whose `services/` holds the two fallback sentinels' files. */
+function distRootWithFallbackSentinels() {
+  const root = mkdtempSync(path.join(os.tmpdir(), "drift-dist-"));
+  mkdirSync(path.join(root, "services"), { recursive: true });
+  writeFileSync(path.join(root, "services", "issues.js"), "function assertCheckoutRunIsActive() {}\n");
+  writeFileSync(
+    path.join(root, "services", "cross-issue-influence-limit.js"),
+    [
+      "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+      "  throw crossIssueInfluenceRunContextError('terminal_status');",
+      "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+      "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
+    ].join("\n"),
+  );
+  return root;
+}
+
+/** A dist root holding `middleware/error-handler.js` alongside services/. */
+function distRootWithMiddleware(contents) {
+  const root = distRootWithFallbackSentinels();
+  mkdirSync(path.join(root, "middleware"), { recursive: true });
+  writeFileSync(path.join(root, "middleware", "error-handler.js"), contents);
+  return root;
+}
+
+test("the run shape of the live build still reports exactly the findings it has", () => {
+  // Guards against the exit-code refactor changing what the check measures. The
+  // source carries every marker (as HEAD does), while the artifact is the
+  // hand-patched build: the checkout guard is gone, the fallback is the
+  // superseded narrow variant, the malformed-JSON mapping is absent, and the
+  // database shutdown latch is present because it was patched in directly.
+  const git = gitServingAllShippedSentinels();
+  const root = mkdtempSync(path.join(os.tmpdir(), "drift-dist-"));
+  mkdirSync(path.join(root, "services"), { recursive: true });
+  mkdirSync(path.join(root, "middleware"), { recursive: true });
+  writeFileSync(path.join(root, "services", "issues.js"), "// build predates the checkout guard\n");
+  writeFileSync(
+    path.join(root, "services", "cross-issue-influence-limit.js"),
+    [
+      "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+      "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+      "const sourceIssueId = contextSourceIssueId;",
+    ].join("\n"),
+  );
+  writeFileSync(path.join(root, "middleware", "error-handler.js"), "res.status(500).json({});\n");
+  writeFileSync(
+    path.join(root, "embedded-postgres-supervisor.js"),
+    "let shutdownIntent = false;\nconst markShutdownIntent = () => { shutdownIntent = true };\noptions.onRecoveryExhausted?.(lastError);\n",
+  );
   let out = "";
   const code = runCheck({
     distRoot: root,
@@ -325,6 +367,116 @@ test("the run shape of the live build still reports exactly the two real finding
   // the discrimination the check exists to make.
   assert.match(out, /ok   run-bound-fallback-scoped/);
   assert.match(out, /ok   cross-issue-403-names-the-gate/);
+  // The shutdown latch is green only because the install was hand-patched, and
+  // the report has to say so rather than let a green line read as "a reinstall
+  // is safe".
+  assert.match(out, /ok   embedded-postgres-shutdown-intent/);
+  assert.match(out, /DRIFT malformed-json-is-a-400/);
   assert.doesNotMatch(out, /BUG  /);
-  assert.match(out, /2 fix\(es\) are committed/);
+  assert.match(out, /3 fix\(es\) are committed/);
+});
+
+test("a fix held only by a hand-patch is reported as a reinstall hazard, not as a green line", () => {
+  // The whole point of the scars section. Every sentinel is deployed, so the
+  // drift line reads "every guarded fix is present" — and without the scars the
+  // reader concludes a reinstall is safe, which silently reverts the hand-patch.
+  const root = distRootWithFallbackSentinels();
+  mkdirSync(path.join(root, "middleware"), { recursive: true });
+  writeFileSync(
+    path.join(root, "middleware", "error-handler.js"),
+    "res.status(400).json({ error: 'Invalid JSON body' });\n",
+  );
+  writeFileSync(
+    path.join(root, "embedded-postgres-supervisor.js"),
+    "const markShutdownIntent = () => {};\noptions.onRecoveryExhausted?.(lastError);\n",
+  );
+  writeFileSync(
+    path.join(root, "services", "cross-issue-influence-limit.js.bak-20260925T002012Z"),
+    "released original\n",
+  );
+  let out = "";
+  const code = runCheck({
+    distRoot: root,
+    git: gitServingAllShippedSentinels(),
+    write: (text) => {
+      out += text;
+    },
+  });
+  // Scars are reported but never borrow the drift code: the question this
+  // check answers is "is the fix deployed", and that answer is yes.
+  assert.equal(code, EXIT_OK);
+  assert.match(out, /every guarded fix is present/);
+  assert.match(out, /retained-original file\(s\)/);
+  assert.match(out, /cross-issue-influence-limit\.js\.bak-20260925T002012Z/);
+  assert.match(out, /edited in place/);
+});
+
+test("a clean dist reports no scars and does not print the hazard section", () => {
+  const root = distRootWithFallbackSentinels();
+  const results = evaluateSentinels(RUNNING_BUILD_SENTINELS, {
+    distRoot: root,
+    git: gitServingAllShippedSentinels(),
+  });
+  assert.deepEqual(findPatchScars(root, RUNNING_BUILD_SENTINELS), []);
+  const out = formatReport({ distRoot: root, ...summarize(results), results, scars: [] });
+  assert.doesNotMatch(out, /retained-original/);
+  assert.doesNotMatch(out, /shadowed-server-install/);
+});
+
+test("a scar in a sentinel's own directory is found, and an unreadable one is not fatal", () => {
+  // Scoped to the dist root and each sentinel's directory: a backup sitting
+  // next to the file a sentinel reads is the one that matters, and walking
+  // 5000 files of a full dist to find ten backups is not worth the cost.
+  const root = distRootWith({ "issues.js": "x\n" });
+  writeFileSync(path.join(root, "services", "issues.js.bak-20260925T171750Z"), "orig\n");
+  const found = findPatchScars(root, RUNNING_BUILD_SENTINELS);
+  assert.deepEqual(
+    found.map((s) => s.name),
+    ["issues.js.bak-20260925T171750Z"],
+  );
+
+  // A missing or unreadable directory is already reported as drift for the
+  // sentinel that wanted it; it is not evidence of a hand-patch, so the scan
+  // skips it rather than failing the check.
+  const exploding = () => {
+    throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+  };
+  assert.deepEqual(findPatchScars(root, RUNNING_BUILD_SENTINELS, exploding), []);
+});
+
+test("the malformed-JSON sentinel separates a published release from a build with the fix", () => {
+  // The asymmetry this sentinel exists for, and the reason a channel matrix had
+  // to be measured by hand four separate times: the fix is on master and on no
+  // published release, so "which channel do I install" cannot answer "is the
+  // trap still live".
+  const without = distRootWithMiddleware("res.status(500).json({ error: 'Internal server error' });\n");
+  const with_ = distRootWithMiddleware("res.status(400).json({ error: 'Invalid JSON body' });\n");
+  const git = gitServingAllShippedSentinels();
+  const sentinelById = (results, id) => {
+    const found = results.filter((r) => r.id === id);
+    assert.equal(found.length, 1, `expected exactly one ${id} sentinel`);
+    return found[0];
+  };
+  const released = sentinelById(
+    evaluateSentinels(RUNNING_BUILD_SENTINELS, { distRoot: without, git }),
+    "malformed-json-is-a-400",
+  );
+  const fixed = sentinelById(
+    evaluateSentinels(RUNNING_BUILD_SENTINELS, { distRoot: with_, git }),
+    "malformed-json-is-a-400",
+  );
+  assert.equal(released.state, "drifted");
+  assert.deepEqual(released.missingFromDeployed, ["Invalid JSON body"]);
+  assert.equal(fixed.state, "deployed");
+  // A build that renamed the guard is a manifest bug, never a deploy finding.
+  const renamed = sentinelById(
+    evaluateSentinels(RUNNING_BUILD_SENTINELS, {
+      distRoot: with_,
+      git: gitServingAllShippedSentinels({
+        "server/src/middleware/error-handler.ts": "res.status(400).json({});\n",
+      }),
+    }),
+    "malformed-json-is-a-400",
+  );
+  assert.equal(renamed.state, "manifest_mismatch");
 });

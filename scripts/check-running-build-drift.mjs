@@ -23,6 +23,16 @@
  * Check 1 is what keeps this honest. Without it the manifest is a hand-typed
  * list that drifts from the code and reports a permanently green board.
  *
+ * A third question is reported alongside the two, and it is the one a deploy
+ * decision actually turns on: "present" and "durably present" are different
+ * answers. A fix applied by editing the installed `dist` in place reads as
+ * deployed here and is deleted by the next `npm install`, so the report also
+ * counts the `.bak-*` / `.pre-*` scars such an edit leaves and says which
+ * sentinels are being held by a hand-patch rather than by a release. Without
+ * that, the natural reading of a green line is "a reinstall is safe", which is
+ * the one conclusion that turns a healthy plane into a regression. See
+ * `docs/deploy/shadowed-server-install.md`.
+ *
  * Exit codes: 0 no drift, 1 drift found, 2 the check could not be evaluated
  * (no running build found, a manifest/source mismatch, or an unreadable source
  * tree — the last two are bugs in this file, not deploy states). Every
@@ -31,7 +41,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -115,6 +125,38 @@ export const RUNNING_BUILD_SENTINELS = [
     markers: ["boundSourceIssueId", "terminal_status"],
     summary: "the run-bound fallback attributes a write to the bound issue and names a terminal run",
   },
+  {
+    // This one reads as drift on every published release, and the reason
+    // matters: a malformed request body has to be distinguishable from a
+    // server fault, because the run contract tells an agent to stop retrying a
+    // control-plane write after two failures of the same write. A `500
+    // {"error":"Internal server error"}` names no field, no offset and no
+    // parser message, so it reads as a server fault and spends the retries on
+    // a client-side typo. The fix turns that into a `400` carrying
+    // `Invalid JSON body`, which is the same string the server's own tests
+    // assert on.
+    id: "malformed-json-is-a-400",
+    sinceCommit: "3ff3b34e1",
+    sourcePath: "server/src/middleware/error-handler.ts",
+    distPath: "middleware/error-handler.js",
+    markers: ["Invalid JSON body"],
+    summary: "a malformed request body is a 400, not an unnamed 500",
+  },
+  {
+    // The embedded-database stop path. A unit using `KillMode=control-group`
+    // takes the requested stop of its own database with it, and if the
+    // supervisor reads that as an unexpected exit it relaunches what was just
+    // deliberately stopped. This existed on the `default` plane only as a
+    // hand-patch, which made it invisible to this check *and* deletable by any
+    // reinstall: the reported release could not restore it, because no
+    // published channel ever carried it.
+    id: "embedded-postgres-shutdown-intent",
+    sinceCommit: "6a92f523a",
+    sourcePath: "server/src/embedded-postgres-supervisor.ts",
+    distPath: "embedded-postgres-supervisor.js",
+    markers: ["markShutdownIntent", "onRecoveryExhausted"],
+    summary: "a requested database stop is not read as an unexpected exit",
+  },
 ];
 
 /** First candidate root that actually holds a server dist. */
@@ -123,6 +165,52 @@ export function resolveRunningServerDist(candidates, exists = existsSync) {
     if (exists(join(candidate, "services", "issues.js"))) return candidate;
   }
   return null;
+}
+
+/** Filename suffixes a hand-edit of the installed dist leaves behind. */
+export const PATCH_SCAR_SUFFIXES = [".bak-", ".bak.", ".pre-", ".orig"];
+
+/**
+ * Files under the dist root that look like the retained original of a
+ * hand-edited file.
+ *
+ * A packaged install is the ground truth agents stop reasoning about, so
+ * editing it in place is invisible everywhere except here: the version string
+ * still says the release, and the fix reads as deployed. The retained original
+ * is the tell, because a hand-edit almost always keeps the file it replaced
+ * next to the file it replaced it with. Reporting the scars is what turns
+ * "deployed" into "deployed, and one `npm install` from gone" — and the second
+ * half is the half that decides whether a reinstall is safe.
+ *
+ * Scoped to the directories a sentinel actually reads plus the dist root
+ * itself. Walking all 5000 files of a full dist to find ten backups is not
+ * worth the cost, and a sentinel reading a clean file is not made safer by a
+ * scar somewhere else in the tree.
+ */
+export function findPatchScars(
+  distRoot,
+  sentinels = RUNNING_BUILD_SENTINELS,
+  readdir = readdirSync,
+) {
+  const dirs = new Set([distRoot, ...sentinels.map((s) => join(distRoot, s.distPath, ".."))]);
+  const scars = [];
+  for (const dir of dirs) {
+    let entries;
+    try {
+      entries = readdir(dir, { withFileTypes: true });
+    } catch {
+      // A sentinel whose directory cannot be listed is already reported as
+      // drift, and an unreadable directory is not evidence of a hand-patch.
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (PATCH_SCAR_SUFFIXES.some((suffix) => entry.name.includes(suffix))) {
+        scars.push({ dir, name: entry.name });
+      }
+    }
+  }
+  return scars.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function readSourceAtHead(sourcePath, git) {
@@ -204,6 +292,19 @@ export function formatReport(report) {
   } else {
     lines.push("", "every guarded fix is present in the running build.");
   }
+  if (report.scars && report.scars.length > 0) {
+    lines.push(
+      "",
+      `${report.scars.length} retained-original file(s) in the dist root — this install was`,
+      "edited in place, so the fixes above are held by a hand-patch and not by a release:",
+      ...report.scars.map((scar) => `  ${scar.name}`),
+      "",
+      "An npm install of any channel deletes these and restores the released files, which",
+      "silently reverts every fix the scars were carrying. Port them to source and merge",
+      "that instead, or install a build that already contains them. See",
+      "docs/deploy/shadowed-server-install.md.",
+    );
+  }
   return lines.join("\n");
 }
 
@@ -227,6 +328,7 @@ export function runCheck({
   distRoot,
   git,
   exists = existsSync,
+  readdir = readdirSync,
   sentinels = RUNNING_BUILD_SENTINELS,
   write = (text) => process.stdout.write(text),
 } = {}) {
@@ -255,7 +357,16 @@ export function runCheck({
     return EXIT_UNEVALUATED;
   }
 
-  const report = { distRoot, ...summarize(results), results };
+  // Reported, never fatal. A hand-edited install is a fact about the plane, and
+  // the exit code already carries the question this check was asked to answer
+  // — borrowing the drift code for it would report a reinstall hazard as a
+  // deploy finding and train readers to ignore the code.
+  const report = {
+    distRoot,
+    ...summarize(results),
+    results,
+    scars: findPatchScars(distRoot, sentinels, readdir),
+  };
   write(asJson ? `${JSON.stringify(report, null, 2)}\n` : `${formatReport(report)}\n`);
   if (report.manifestMismatch.length > 0) return EXIT_UNEVALUATED;
   return report.drifted.length > 0 ? EXIT_DRIFT : EXIT_OK;
