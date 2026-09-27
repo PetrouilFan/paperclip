@@ -153,9 +153,42 @@ test('collectBlockingFailures tolerates a gate that returned nothing', () => {
 
 test('the internal-refs gate is wired into the blocking failure list', () => {
   const source = readFileSync(fileURLToPath(new URL('../run-quality-gates.mjs', import.meta.url)), 'utf8');
-  assert.match(source, /import \{ checkInternalRefs \} from '\.\/check-pr-internal-refs\.mjs'/);
+  assert.match(source, /checkInternalRefs,/);
   assert.match(source, /const internalRefsResult = checkInternalRefs\(\{/);
   assert.match(source, /internalRefsResult,/);
+});
+
+test('the comment surface is wired in, and its fetch is allowed to fail', () => {
+  // Three things have to be true together, and each is a way the surface can be
+  // present in the file and dead in practice: the fetcher is called, the gate is
+  // handed the list, and the failure flag is handed over too. A gate wired
+  // without the flag reads an empty list as a clean scan — which is the exact
+  // claim the comment fetch failing would otherwise manufacture.
+  const source = readFileSync(fileURLToPath(new URL('../run-quality-gates.mjs', import.meta.url)), 'utf8');
+  assert.match(source, /import \{ fetchAllPullRequestComments \} from '\.\/fetch-pr-comments\.mjs'/);
+  assert.match(source, /comments = await fetchAllPullRequestComments\(/);
+  assert.match(source, /commentsUnavailable = true/);
+  assert.match(source, /^\s*comments,$/m);
+  assert.match(source, /^\s*commentsUnavailable,$/m);
+  // And the exempt-login answer is resolved before the gates run, not after.
+  assert.ok(
+    source.indexOf('const ownerLogins') < source.indexOf('const internalRefsResult'),
+    'ownerLogins is resolved before the gate that needs it',
+  );
+});
+
+test('the gate signature and login lists have exactly one definition', () => {
+  // They moved into the gate module because the gate has to recognise its own
+  // report, and importing the orchestrator to get them would be circular. Two
+  // definitions would let the orchestrator overwrite one comment while the gate
+  // read it, which is the loop the exemption exists to stop.
+  const orchestrator = readFileSync(fileURLToPath(new URL('../run-quality-gates.mjs', import.meta.url)), 'utf8');
+  const gate = readFileSync(fileURLToPath(new URL('../check-pr-internal-refs.mjs', import.meta.url)), 'utf8');
+  assert.doesNotMatch(orchestrator, /= '— commitperclip'/);
+  assert.doesNotMatch(orchestrator, /const COMMITPERCLIP_LOGINS =/);
+  assert.match(gate, /export const GATE_COMMENT_SIGNATURE = '— commitperclip'/);
+  // The old name is still exported, because the orchestrator's test imports it.
+  assert.match(orchestrator, /export \{ GATE_COMMENT_LOGINS as COMMITPERCLIP_LOGINS \}/);
 });
 
 test('an internal-refs failure reaches the list that decides the exit code', () => {

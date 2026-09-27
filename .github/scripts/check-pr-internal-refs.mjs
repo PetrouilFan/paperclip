@@ -211,9 +211,9 @@
  *
  * CONTRIBUTING.md's section also bans `localhost`, private-IP and tailnet URLs,
  * and that rule *is* checked here — but only in the text an author writes: the
- * PR title, the description, the branch name, the commit subjects and the
- * commit message bodies. It is deliberately not applied to the diff, and the
- * difference is the whole design.
+ * PR title, the description, the branch name, the commit subjects, the commit
+ * message bodies and the pull request comments. It is deliberately not applied
+ * to the diff, and the difference is the whole design.
  *
  * The evidence for the restriction is the measurement this file's identifier
  * half already records: `\b(localhost|127\.0\.0\.1)` matches 664 files on
@@ -232,12 +232,112 @@
  * below flags exactly two — #22 (`http://127.0.0.1:8099/v1` in the body) and
  * #25 (`http://localhost:3101/api/companies/...` in the body) — and no
  * correctly-authored body. Both are the class this rule exists for: an
- * instance coordinate, copy-pasted, permanent.
+ * instance coordinate, copy-pasted, permanent. The same matcher on the comment
+ * surface over the 100 most recently updated pull requests adds two more, on
+ * #105: `http://localhost` twice, both in the same comment.
  *
  * `agent://` is likewise a canonical product feature (structured agent
  * mentions, `packages/shared/src/project-mentions.ts`), so only `agent://`
  * followed by a configured instance prefix is treated as a link to an internal
  * issue — a bare `agent://` is not.
+ *
+ * ## Pull request comments: the seventh surface, and the largest one
+ *
+ * `CONTRIBUTING.md` names the surfaces the rule covers — "your PR title,
+ * description, commits, and comments" — and every surface but one was scanned.
+ * Comments were not, and the measurement of what that cost is the reason this
+ * section exists. Replayed over the 100 most recently updated pull requests on
+ * this fork, against this gate's own matchers, on all 367 comments they carry
+ * (issue comments, inline review comments and review bodies):
+ *
+ * | | |
+ * |---|---:|
+ * | comments read | 367 |
+ * | comments carrying a finding | **131** |
+ * | …written by the pull request's own author | 125 |
+ * | …written by somebody else | 6 (all `github-actions[bot]`) |
+ * | findings this gate reports, run as shipped | 139 |
+ * | open pull requests that would fail | **8 of 12** |
+ *
+ * This is not a tail risk found by reading the code; it is the single largest
+ * concentration of unreported leaks anywhere on this repository, and the reason
+ * it went unreported is the reason this section is written down: the surface
+ * nobody looked at is the surface that leaks.
+ *
+ * Three of the 131 are the two address findings and one instance-address
+ * finding on #105, on a comment the gate's own maintainer wrote the same
+ * afternoon the gate shipped. The author had pasted the before/after diff
+ * verbatim into a reply explaining the fix, which put the very identifiers the
+ * gate had been made to reject onto the pull request that adds the gate, and
+ * the gate reported `passed: true` throughout. The harness was correct and the
+ * coverage was absent, which is the failure mode this surface is here to end.
+ *
+ * ### why a comment is the same kind of surface as a title
+ *
+ * The original scoping was defensible on its own terms — the rule was about
+ * "text that becomes permanent history" (a squash subject) or "text that lands
+ * in the tree" (a code comment), and a PR comment is neither. It is also
+ * wrong, and the measurement above is what makes it wrong rather than merely
+ * unfashionable: a comment on github.com is permanent, public, indexed by
+ * search engines, and readable by exactly the audience the rule exists to
+ * protect — a reviewer who cannot open the identifier. The `git log` argument
+ * that justified excluding commit bodies does not transfer, because nobody
+ * reaches a merged pull request's comment thread by reading the commit.
+ *
+ * So the surface is scanned, and the same three matchers apply with the same
+ * reference-position requirement. A comment is prose, so `GPT-5` and
+ * `PROJ-123` still pass, exactly as they do in a body.
+ *
+ * ### why the exemption costs nothing today and is still load-bearing
+ *
+ * Measured on that same population, **zero** of the 367 comments match
+ * `isGateComment` — every gate comment on those 100 pull requests is a
+ * "all checks passing" report, and a passing report quotes nothing. The
+ * exemption is therefore unexercised by the population and indispensable the
+ * moment the gate fails, which is the moment it starts quoting the literals it
+ * found. A control feeds a real failing report back through the scan: as the
+ * gate's own comment it passes, and the same body one login over — an agent's
+ * review comment, which is what the 6 third-party findings above are — it fails.
+ * That pair is the whole argument for the exclusion existing in one specific
+ * form rather than another.
+ *
+ * ### the one comment the gate does not read: its own
+ *
+ * The gate's report quotes the literals it found — `` `PET-9005` `` — because
+ * the author has to be able to search for them. A gate that scanned its own
+ * report would therefore fail on its own output on the next run, and the
+ * failure would be indistinguishable from a real leak. That is not a reason to
+ * render the report in shapes instead; the literal is what makes the report
+ * actionable.
+ *
+ * So one comment is excluded, by the predicate `isGateComment` below, and that
+ * predicate is **the same one `run-quality-gates.mjs` already uses** to find
+ * the comment it is about to overwrite. Both halves are required: a bot login
+ * (nobody can post as `commitperclip[bot]`) and the `— commitperclip`
+ * signature line. This introduces no new trust, because the orchestrator has
+ * already decided that a comment matching this predicate is its own before
+ * this gate runs; the only thing that changes is that the gate stops reading
+ * it. The boundary is stated rather than left to be discovered: a token that
+ * can post as a bot login *and* choose to write the signature can hide a leak
+ * in a comment, and the way to close that is to not give agents a posting
+ * token, not to widen this predicate. Note the login half is not sufficient on
+ * its own — agents' own review comments reach this repository as
+ * `github-actions[bot]` — and the signature half is not sufficient on its own,
+ * because a human can type the signature in a comment. Measured over the 367
+ * comments above, the two halves together are what separates the gate's report
+ * from real content.
+ *
+ * ### the trap this surface creates, named in the report
+ *
+ * A finding in a comment the author cannot edit blocks the author on a third
+ * party. That is measured, not hypothetical: 6 of the 131 findings are in
+ * comments written by somebody else, and all six are agent review comments.
+ * Blocking is still the right verdict — the leak is real and it is permanent,
+ * and a non-blocking surface is a surface that gets no fixes — but the report
+ * has to say who has to edit it, or the author is sent to a dead end. It also
+ * has to say that *replying about the leak re-creates it*, which is the
+ * reflex every author has after reading a finding: the next comment says "fixed
+ * the PET-9005 in my last comment" and is itself a finding, forever.
  *
  * ## Failing closed
  *
@@ -253,6 +353,11 @@
  *   never read. The fetch is optional so a transient 5xx cannot take down the
  *   gates that do block, which is right; reading its failure as "no
  *   references found" would be the gate answering about text it never saw.
+ * - the comment list could not be fetched, for the same reason and with the
+ *   same consequence. This is the surface with the most findings on it, so it
+ *   is the one where a silent empty list would cost the most.
+ * - the comment list reached `MAX_PR_COMMENTS`, so the fetch stopped with
+ *   comments unread and the surface is not fully covered.
  *
  * A gate that answers "passed" because it could not look is worse than no gate,
  * because it is evidence.
@@ -282,6 +387,59 @@ export const DEFAULT_PRODUCT_OWNED_PREFIXES = ['PAP', 'PAPA'];
 
 /** GitHub's hard ceiling on a pull request's changed-file list. */
 export const MAX_PR_FILES = 3000;
+
+/**
+ * The point at which the comment list stops being fully read.
+ *
+ * Not a documented GitHub ceiling — there is none for comments — and the bound
+ * is here for the same reason `MAX_PR_FILES` is: the scan has to be bounded, and
+ * a fetch that stops early must say so rather than report a clean surface over
+ * the part it did read. The number is the same as the file cap so the two
+ * surfaces carry the same bound, and it is four orders of magnitude above
+ * anything real: the busiest pull request in the 100-pull-request population
+ * above carries 13 comments across all three comment endpoints.
+ */
+export const MAX_PR_COMMENTS = 3000;
+
+/**
+ * The signature the gate stamps on its own report, and the logins it posts as.
+ *
+ * These live here rather than in `run-quality-gates.mjs` because the gate needs
+ * them to recognise its own report, and importing the orchestrator to get them
+ * would be circular. `run-quality-gates.mjs` imports them back from here, so
+ * there is still exactly one definition of each.
+ */
+export const GATE_COMMENT_SIGNATURE = '— commitperclip';
+
+/**
+ * Logins that may own the gate comment. The app identity is the norm; the extra
+ * entry covers a repository where the commitperclip app is not installed and
+ * the gates therefore run under the workflow's own `GITHUB_TOKEN` instead.
+ */
+export const GATE_COMMENT_LOGINS = ['commitperclip[bot]', 'commitperclip'];
+
+/**
+ * Whether a comment is the gate's own report, and so is not scanned.
+ *
+ * Both halves are required. The login half is what a human cannot forge; the
+ * signature half is what separates the gate's report from an agent's own review
+ * comment, since agents' comments reach this repository under the same bot
+ * login. See the header's "the one comment the gate does not read" for the
+ * measurement behind the split and for the boundary it does not close.
+ *
+ * `extraLogins` is the deployment's `GH_COMMENTER_LOGIN`, which is how the
+ * orchestrator accounts for a repository that posts as a login neither list
+ * names. The exemption follows the identity rather than being duplicated, so a
+ * comment the orchestrator would overwrite is a comment the gate does not read.
+ */
+export function isGateComment(comment, extraLogins = []) {
+  const login = comment?.user?.login;
+  if (typeof login !== 'string') return false;
+  const owners = new Set([...GATE_COMMENT_LOGINS, ...extraLogins.filter((l) => typeof l === 'string' && l)]);
+  if (!owners.has(login)) return false;
+  const body = comment?.body;
+  return typeof body === 'string' && body.includes(GATE_COMMENT_SIGNATURE);
+}
 
 /**
  * Paths this gate never scans.
@@ -748,6 +906,9 @@ export function checkInternalRefs({
   prBranch = '',
   commits = [],
   commitsUnavailable = false,
+  comments = [],
+  commentsUnavailable = false,
+  commentLogins = [],
   files = [],
   prefixes,
   productOwnedPrefixes,
@@ -1000,7 +1161,70 @@ export function checkInternalRefs({
     }
   }
 
-  // --- Surface 5: the diff, and the paths it touches -----------------------
+  // --- Surface 5: pull request comments ------------------------------------
+  //
+  // The surface `CONTRIBUTING.md` names and the gate did not read, and the one
+  // that carries the most findings on this repository by a wide margin: 131 of
+  // 367 comments across the 100 most recently updated pull requests. The header
+  // section "Pull request comments: the seventh surface" has the table and the
+  // reasoning; what is here is the scan.
+  //
+  // One surface, three report shapes, because the caller has flattened the
+  // three comment endpoints (issue comments, inline review comments, review
+  // bodies) into one list and a finding has to name which kind it came from.
+  // Each comment is reported on its own rather than pooled: the remedy is
+  // "edit that comment", and a pooled finding with one location tells the
+  // author to go and find which of four comments the gate meant.
+  if (commentsUnavailable) {
+    failures.push(
+      'The comment list could not be read, so the comment surface was not scanned and this result is not a clean scan. ' +
+      'The comment fetch is allowed to fail so that a transient 5xx cannot take down the gates that do block; the cost ' +
+      'is that this gate then has nothing to read. Re-run the gate once the API is reachable. This is the surface ' +
+      'with the most findings on it on this repository, so it is the one where a silent empty list would cost the ' +
+      'most. Do not read `passed: true` here as "no internal references found".'
+    );
+  }
+  if (comments.length >= MAX_PR_COMMENTS) {
+    failures.push(
+      `The comment list reached this gate's ${MAX_PR_COMMENTS}-comment cap, so the comment surface could not be ` +
+      'fully scanned. This gate reports failure rather than a clean result it did not earn. Close or resolve the ' +
+      'outdated comments, or raise MAX_PR_COMMENTS deliberately.'
+    );
+  }
+
+  const COMMENT_REMEDY =
+    'Edit the comment on github.com (every comment is editable, and the edit is what removes the reference). ' +
+    '**Do not reply about the leak** — a reply that quotes the identifier is itself a comment carrying it, so it ' +
+    'becomes a new finding on the next run. If the comment is not yours, you cannot edit it: ask the person who ' +
+    'wrote it, and the finding stays until they do.';
+
+  for (const comment of comments ?? []) {
+    const body = comment?.body;
+    if (typeof body !== 'string' || !body.trim()) continue;
+    // The one exclusion, and it is an identity rather than a path: see the
+    // header's "the one comment the gate does not read". `SELF_EXEMPT_PATHS`
+    // does not grow, because a comment has no path.
+    if (isGateComment(comment, commentLogins)) continue;
+
+    const kind = typeof comment.kind === 'string' && comment.kind ? comment.kind : 'comment';
+    const author = typeof comment.user?.login === 'string' && comment.user.login ? comment.user.login : 'an unknown author';
+    const where = typeof comment.html_url === 'string' && comment.html_url ? comment.html_url : null;
+    // The location carries the author and the link, because the two cases the
+    // author has to act on are different and the finding has to tell them
+    // apart: a comment of theirs they can edit in a click, and a comment of
+    // somebody else's they cannot.
+    const article = /^[aeiou]/i.test(kind) ? 'an' : 'a';
+    const location = `${article} ${kind} by ${author}${where ? ` (${where})` : ''}: "${body.trim().slice(0, 72).replace(/\s+/g, ' ')}"`;
+
+    const hits = [...findAll(body, separated), ...findAll(body, compact), ...findAll(body, link)];
+    if (hits.length > 0) {
+      report('A pull request comment', location, hits, COMMENT_REMEDY);
+    }
+    unknownReport('A pull request comment', location, body, owned, hits, COMMENT_REMEDY);
+    hostReport('A pull request comment', location, body, COMMENT_REMEDY);
+  }
+
+  // --- Surface 6: the diff, and the paths it touches -----------------------
   //
   // The instance-address rule stops here, on purpose. 664 files on master use
   // `localhost` in the e2e and dev surface, and a test that asserts a service
@@ -1095,6 +1319,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     prBranch: process.env.PR_BRANCH ?? '',
     commits: JSON.parse(process.env.PR_COMMITS ?? '[]'),
     commitsUnavailable: process.env.PR_COMMITS_UNAVAILABLE === '1',
+    comments: JSON.parse(process.env.PR_COMMENTS ?? '[]'),
+    commentsUnavailable: process.env.PR_COMMENTS_UNAVAILABLE === '1',
     files: JSON.parse(process.env.PR_FILES ?? '[]'),
     prefixes: process.env.INTERNAL_REF_PREFIXES,
     productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,

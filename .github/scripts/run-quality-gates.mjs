@@ -10,6 +10,7 @@
 import { fileURLToPath } from 'node:url';
 import { ghFetch } from './get-bot-token.mjs';
 import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
+import { fetchAllPullRequestComments } from './fetch-pr-comments.mjs';
 import { checkTemplate } from './check-pr-template.mjs';
 import { checkLinkedIssue } from './check-pr-linked-issue.mjs';
 import { checkDedupSearch } from './check-pr-dedup-search.mjs';
@@ -18,14 +19,13 @@ import { checkLockfile } from './check-pr-lockfile.mjs';
 import { checkDependencies } from './check-pr-dependencies.mjs';
 import { checkReleaseBootstrap } from './check-pr-release-bootstrap.mjs';
 import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors.mjs';
-import { checkInternalRefs } from './check-pr-internal-refs.mjs';
+import {
+  GATE_COMMENT_LOGINS,
+  GATE_COMMENT_SIGNATURE as COMMENT_SIGNATURE,
+  checkInternalRefs,
+} from './check-pr-internal-refs.mjs';
 
-const COMMENT_SIGNATURE = '— commitperclip';
-
-// Logins that may own a gate comment. The app identity is the norm; the extra
-// entry covers a repository where the commitperclip app is not installed and
-// the gates therefore run under the workflow's own GITHUB_TOKEN instead.
-export const COMMITPERCLIP_LOGINS = ['commitperclip[bot]', 'commitperclip'];
+export { GATE_COMMENT_LOGINS as COMMITPERCLIP_LOGINS };
 
 /**
  * The provenance line stamped under the gate detail.
@@ -93,7 +93,7 @@ export function buildComment(author, failures, informational, provenance = null)
   return withProvenance(`${body}\n\n${COMMENT_SIGNATURE}`, provenance);
 }
 
-export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, commenterLogins = COMMITPERCLIP_LOGINS) {
+export async function findExistingComment(fetchFromGitHub, token, repo, prNumber, commenterLogins = GATE_COMMENT_LOGINS) {
   const owners = new Set(commenterLogins);
 
   for (let page = 1; ; page += 1) {
@@ -183,6 +183,29 @@ async function main() {
     console.error(`co-author lookup skipped: ${error.message}`);
   }
 
+  // Same shape, and for the same reason, on the surface that carries the most
+  // findings: the comment list is allowed to fail, and its failure is a gate
+  // failure rather than a clean scan. 131 of the 367 comments on the 100 most
+  // recently updated pull requests on this fork carry a finding, so this is the
+  // fetch whose silent empty list would cost the most.
+  let comments = [];
+  let commentsUnavailable = false;
+  try {
+    comments = await fetchAllPullRequestComments(ghFetch, GH_REPO, prNumber, GH_TOKEN);
+  } catch (error) {
+    commentsUnavailable = true;
+    console.error(`comment lookup skipped: ${error.message}`);
+  }
+
+  // The deployment's own commenter login, if it has one. The gate needs it for
+  // the same reason `findExistingComment` does: on a repository that posts as a
+  // login neither default list names, that login's comment is the gate's own
+  // and must not be read as content.
+  const commenter = process.env.GH_COMMENTER_LOGIN?.trim();
+  const ownerLogins = commenter
+    ? [...new Set([...GATE_COMMENT_LOGINS, commenter])]
+    : GATE_COMMENT_LOGINS;
+
   const prBody = pr.body ?? '';
   const author = PR_AUTHOR ?? pr.user.login;
   const branch = PR_BRANCH ?? pr.head.ref;
@@ -211,17 +234,21 @@ async function main() {
       checkReleaseBootstrap(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
     ]);
   // Kept out of the Promise.all above for the same reason as the co-author
-  // lookup: `commits` is populated by a fetch that is allowed to fail, and a
-  // gate that needs it must see the empty list rather than never run at all.
-  // On an empty list this gate still scans the title, the body, the branch and
-  // the whole diff — the commit-message leg is the only thing it loses, which
-  // is why `commitsUnavailable` makes it say so rather than pass quietly.
+  // lookup: `commits` and `comments` are populated by fetches that are allowed
+  // to fail, and a gate that needs them must see the empty lists rather than
+  // never run at all. On empty lists this gate still scans the title, the body,
+  // the branch and the whole diff — the commit-message and comment legs are the
+  // only things it loses, which is why `commitsUnavailable` and
+  // `commentsUnavailable` make it say so rather than pass quietly.
   const internalRefsResult = checkInternalRefs({
     prTitle,
     prBody,
     prBranch: branch,
     commits,
     commitsUnavailable,
+    comments,
+    commentsUnavailable,
+    commentLogins: ownerLogins,
     files,
     prefixes: process.env.INTERNAL_REF_PREFIXES,
     productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,
@@ -250,11 +277,10 @@ async function main() {
     ranAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
   }));
 
-  // Post comment if there are failures/informational, or update existing comment
-  const commenter = process.env.GH_COMMENTER_LOGIN?.trim();
-  const ownerLogins = commenter
-    ? [...new Set([...COMMITPERCLIP_LOGINS, commenter])]
-    : COMMITPERCLIP_LOGINS;
+  // Post comment if there are failures/informational, or update existing comment.
+  // `ownerLogins` is resolved above, before the gates run, because the
+  // internal-reference gate needs the same answer this line does: a comment
+  // matching that predicate is the gate's own, and the gate does not read it.
   const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber, ownerLogins);
   if (allFailures.length > 0 || informational.length > 0 || existing) {
     await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);

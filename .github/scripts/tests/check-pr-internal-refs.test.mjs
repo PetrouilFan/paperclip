@@ -6,11 +6,13 @@ import {
   ALLOWLIST,
   DEFAULT_INTERNAL_REF_PREFIXES,
   DEFAULT_PRODUCT_OWNED_PREFIXES,
+  MAX_PR_COMMENTS,
   MAX_PR_FILES,
   SELF_EXEMPT_PATHS,
   checkInternalRefs,
   findInstanceHosts,
   findUnknownInternalRefs,
+  isGateComment,
   patchIsComplete,
   resolvePrefixes,
   resolveProductOwnedPrefixes,
@@ -57,6 +59,7 @@ const DECLARED_FIXTURE_IDS = new Set([
   'PET9004',
   'PET-9005',
   'PET9005',
+  'PET-9006',
 ]);
 
 /**
@@ -1041,6 +1044,324 @@ test('a commit message that is only a subject is not scanned twice', () => {
     commits: [{ sha: 'ddd44444', commit: { message: 'fix(api): survive a restart' } }],
   });
   assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+// --- The comment surface ----------------------------------------------------
+//
+// A comment is the seventh surface `CONTRIBUTING.md` names and the one the gate
+// did not read. The header's section "Pull request comments: the seventh
+// surface" carries the measurement — 131 findings across 367 comments on the
+// 100 most recently updated pull requests, 125 of them written by the pull
+// request's own author — and the controls below are the shape the existing five
+// surfaces already use: the leak fails, the same string somewhere it belongs
+// still passes, and each way the surface can go unread fails rather than passes.
+
+const CLEAN_COMMENT = {
+  kind: 'issue comment',
+  user: { login: 'an-author' },
+  html_url: 'https://github.com/o/r/pull/1#issuecomment-1',
+  body: 'Confirmed on a clean checkout: the rebase drops the second hunk.',
+};
+
+test('a clean comment passes', () => {
+  const result = checkInternalRefs({ ...CLEAN, comments: [CLEAN_COMMENT] });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('an id in a pull request comment fails the gate', () => {
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ ...CLEAN_COMMENT, body: 'Carried on from PET-9006 — see the plan in /PET/issues/PET-9006.' }],
+  });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  const joined = result.failures.join('\n');
+  assert.match(joined, /A pull request comment carries/);
+  assert.match(joined, /PET-9006/);
+});
+
+test('an address in a comment is a leak, and a comment is not a diff line', () => {
+  // The same pair the commit-body surface has: the string fails in authored
+  // text, and the control below proves the diff surface is untouched.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ ...CLEAN_COMMENT, body: 'Reproduced at http://localhost:3100/api/health' }],
+  });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  assert.match(result.failures.join('\n'), /A pull request comment carries `http:\/\/localhost`/);
+});
+
+test('a comment that names the loopback interface is not a leak; one that links to it is', () => {
+  // The control for the test above, and it is the same split the body surface
+  // makes: prose that merely names `127.0.0.1` is somebody explaining the e2e
+  // harness, and a URL pointing at it is a coordinate a reviewer on github.com
+  // cannot route to. The same string in a diff line stays left alone entirely,
+  // which the control after this one holds.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ ...CLEAN_COMMENT, body: 'The e2e harness reaches this fixture over 127.0.0.1 by design.' }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('the same string in a diff line is still left alone', () => {
+  // If this ever starts failing, the comment surface has started reading like a
+  // diff and the gate is born failing on 664 files of correct code.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [
+      {
+        filename: 'server/src/e2e/rebind.test.ts',
+        changes: 2,
+        patch: '@@ -1 +1 @@\n-await http.get("http://127.0.0.1:8099/v1")\n+await http.get(baseUrl)\n',
+      },
+    ],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('an unconfigured namespace in a comment is reported by the open matcher', () => {
+  // The second tier has to reach the comment surface too, or a `TASK-482`
+  // pasted into a reply walks straight through the one surface nobody reads.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ ...CLEAN_COMMENT, body: 'Same shape as the one in /issues/TASK-482.' }],
+  });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  assert.match(result.failures.join('\n'), /A pull request comment refers to `TASK-482`/);
+});
+
+test('prose that names a shape is still not a reference, in a comment either', () => {
+  // The reference-position requirement is what keeps the open matcher from
+  // claiming every model name in a long review thread. Dropping it on this
+  // surface would be the difference between a gate and noise.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ ...CLEAN_COMMENT, body: 'Re-ran the Model Used section; GPT-5 and PROJ-123 are both expected here.' }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('the finding names the comment, its author and its link', () => {
+  // The remedy is "edit that comment", so the finding has to identify which one
+  // and — for the measured 6-in-131 case where the author cannot edit it — who
+  // wrote it. A pooled finding with one location does neither.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [
+      { ...CLEAN_COMMENT, body: 'Nothing here.' },
+      { ...CLEAN_COMMENT, kind: 'review body', user: { login: 'a-reviewer' }, body: 'Blocked on PET-9006.' },
+    ],
+  });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  const joined = result.failures.join('\n');
+  assert.match(joined, /a review body by a-reviewer/);
+  assert.match(joined, /https:\/\/github\.com\/o\/r\/pull\/1#issuecomment-1/);
+  // And the report has to warn about the reflex that re-creates the finding.
+  assert.match(joined, /Do not reply about the leak/);
+  assert.match(joined, /you cannot edit it/);
+});
+
+test('one leaking comment is one finding, not one per surface', () => {
+  // All three matchers see the same string, and the author gets one thing to
+  // fix rather than three paragraphs about one comment.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ ...CLEAN_COMMENT, body: 'Blocked on PET-9006 and on http://localhost:3100.' }],
+  });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  const joined = result.failures.join('\n');
+  assert.equal((joined.match(/A pull request comment carries/g) ?? []).length, 2);
+  // The unconfigured-namespace report must not re-report the configured id.
+  assert.doesNotMatch(joined, /refers to `PET-9006`/);
+});
+
+test("the gate's own report is not read as content", () => {
+  // The loop this surface would otherwise have. The gate's report quotes the
+  // literals it found, so a gate that read its own report would fail on its own
+  // output on the next run — with a finding the author cannot act on, because
+  // the author did not write it.
+  const ownReport = [
+    'Hey @author! Before this PR can be reviewed, a few things need attention:',
+    '',
+    '**Missing or incomplete:**',
+    '- [ ] A pull request comment carries `PET-9006` — internal issue identifier.',
+    '',
+    'Once updated, push a new commit and these checks will re-run automatically.',
+    '',
+    'Gates ran 2026-09-27T00:00:00Z from gate revision `abc123456`.',
+    '',
+    '— commitperclip',
+  ].join('\n');
+
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ kind: 'issue comment', user: { login: 'commitperclip[bot]' }, body: ownReport }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+
+  // The same body, one login over. The agents whose comments produced 6 of the
+  // 131 findings post under a bot login, so the pair — same bytes, different
+  // author — is the whole argument for the exemption existing in this form.
+  const asAgent = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ kind: 'issue comment', user: { login: 'github-actions[bot]' }, body: ownReport }],
+  });
+  assert.equal(asAgent.passed, false, 'the same report text is content when it is not the gate\'s own');
+  assert.match(asAgent.failures.join('\n'), /A pull request comment carries/);
+});
+
+test('the exemption needs the signature as well as the login', () => {
+  // The pair that makes the exemption load-bearing rather than convenient. A
+  // bot login alone would exempt an agent's own review comment — and on this
+  // repository those arrive under a bot login, which is exactly the case the
+  // signature half exists for. The signature alone is something a human can
+  // type, so it cannot be the whole test either.
+  const leaking = 'Blocked on PET-9006.';
+
+  const both = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ kind: 'issue comment', user: { login: 'commitperclip[bot]' }, body: `${leaking}\n\n— commitperclip` }],
+  });
+  assert.equal(both.passed, true, `bot login plus signature is the gate's own report: ${JSON.stringify(both.failures)}`);
+
+  const loginOnly = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ kind: 'issue comment', user: { login: 'commitperclip[bot]' }, body: leaking }],
+  });
+  assert.equal(loginOnly.passed, false, 'a bot login alone does not exempt a comment');
+
+  const signatureOnly = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ kind: 'issue comment', user: { login: 'a-human' }, body: `${leaking}\n\n— commitperclip` }],
+  });
+  assert.equal(signatureOnly.passed, false, 'the signature alone does not exempt a comment');
+});
+
+test('an agent comment under the workflow login is not mistaken for the gate report', () => {
+  // The measured case, and the reason the signature half is not redundant: on
+  // this repository the agents' own review comments reach the API as
+  // `github-actions[bot]`, six of them carrying findings in the population the
+  // header measures. Without the signature half, exempting by login would have
+  // silently discarded the six findings that were not the gate's own.
+  const leaking = 'Held on PET-9006 until the rebase lands.';
+
+  const asAgent = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ kind: 'issue comment', user: { login: 'github-actions[bot]' }, body: leaking }],
+  });
+  assert.equal(asAgent.passed, false, 'an agent comment is content');
+
+  const agentQuotingTheSignature = checkInternalRefs({
+    ...CLEAN,
+    commentLogins: ['github-actions[bot]'],
+    comments: [{ kind: 'issue comment', user: { login: 'github-actions[bot]' }, body: leaking }],
+  });
+  assert.equal(agentQuotingTheSignature.passed, false, 'and it is content without the signature, even once the login is named');
+});
+
+test("the gate's own report is exempt under the deployment's commenter login", () => {
+  // A repository that posts as a login neither default list names still gets the
+  // exemption, because the predicate follows the identity the orchestrator
+  // already uses rather than duplicating it.
+  const own = 'Blocked on PET-9006.\n\n— commitperclip';
+  const asDefault = checkInternalRefs({ ...CLEAN, comments: [{ user: { login: 'custom-app[bot]' }, body: own }] });
+  assert.equal(asDefault.passed, false, 'not exempt until the deployment names the login');
+
+  const asDeployment = checkInternalRefs({
+    ...CLEAN,
+    commentLogins: ['custom-app[bot]'],
+    comments: [{ user: { login: 'custom-app[bot]' }, body: own }],
+  });
+  assert.equal(asDeployment.passed, true, JSON.stringify(asDeployment.failures, null, 2));
+});
+
+test('an unreadable comment list fails closed instead of reporting a clean scan', () => {
+  // The comment fetch is allowed to fail so a transient 5xx cannot take down the
+  // gates that block. That makes an empty list ambiguous, and this is the
+  // surface where the permissive reading would cost the most.
+  const result = checkInternalRefs({ ...CLEAN, comments: [], commentsUnavailable: true });
+  assert.equal(result.passed, false);
+  const joined = result.failures.join('\n');
+  assert.match(joined, /comment list could not be read/);
+  assert.match(joined, /not a clean scan/);
+  assert.match(joined, /Do not read `passed: true`/);
+});
+
+test('an empty comment list from a healthy fetch is not a failure', () => {
+  // The counterpart, so the fail-closed leg cannot be satisfied by passing
+  // `commentsUnavailable: true` on every call and disabling the surface. Two of
+  // the 100 pull requests in the measured population genuinely have no comments.
+  const result = checkInternalRefs({ ...CLEAN, comments: [] });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('an unavailable comment list still scans the surfaces it can read', () => {
+  // Failing closed must not become failing blind.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    prTitle: 'fix(issues): a blocker edge (PET-9006)',
+    comments: [],
+    commentsUnavailable: true,
+  });
+  assert.equal(result.passed, false);
+  const joined = result.failures.join('\n');
+  assert.match(joined, /The PR title carries `PET-9006`/);
+  assert.match(joined, /comment list could not be read/);
+});
+
+test('a comment list past the cap fails closed rather than scanning a prefix', () => {
+  // The same principle as the 3000-file cap, on the surface that now has the
+  // most findings on it: a truncated read is not a clean read.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: Array.from({ length: MAX_PR_COMMENTS }, (_, i) => ({ ...CLEAN_COMMENT, body: `note ${i}` })),
+  });
+  assert.equal(result.passed, false);
+  const joined = result.failures.join('\n');
+  assert.match(joined, new RegExp(`${MAX_PR_COMMENTS}-comment cap`));
+  assert.match(joined, /not fully scanned|rather than a clean result/);
+});
+
+test('an empty comment body is not a comment', () => {
+  // `/pulls/{n}/reviews` returns a row per review event and an approval carries
+  // no text; the fetcher filters those, and the gate does not have to.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ ...CLEAN_COMMENT, body: '   ' }, { ...CLEAN_COMMENT, body: null }, { ...CLEAN_COMMENT }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('isGateComment is a predicate on identity, and it is total', () => {
+  // Exported, so it is part of the module's surface and gets a direct control
+  // rather than only being exercised through the scan. The last four cases are
+  // the ones a malformed payload produces, and every one of them has to read as
+  // "not the gate's own" — the permissive answer there is an exemption nobody
+  // granted.
+  assert.equal(isGateComment({ user: { login: 'commitperclip[bot]' }, body: 'x\n— commitperclip' }), true);
+  assert.equal(isGateComment({ user: { login: 'commitperclip' }, body: 'x\n— commitperclip' }), true);
+  assert.equal(isGateComment({ user: { login: 'commitperclip[bot]' }, body: 'x' }), false, 'no signature');
+  assert.equal(isGateComment({ user: { login: 'someone' }, body: 'x\n— commitperclip' }), false, 'wrong login');
+  assert.equal(isGateComment({ user: { login: 'someone' }, body: 'x', }, ['someone']), false, 'no signature even when named');
+  assert.equal(isGateComment(null), false);
+  assert.equal(isGateComment(undefined), false);
+  assert.equal(isGateComment({}), false);
+  assert.equal(isGateComment({ user: {}, body: 'x\n— commitperclip' }), false);
+  assert.equal(isGateComment({ user: { login: 'commitperclip[bot]' } }), false, 'no body');
+  assert.equal(isGateComment({ user: { login: 'commitperclip[bot]' }, body: 42 }), false, 'body is not a string');
+  assert.equal(isGateComment({ user: { login: '' }, body: 'x\n— commitperclip' }), false, 'blank login');
+  // A non-string in the deployment list must not make every comment exempt.
+  assert.equal(isGateComment({ user: { login: 'someone' }, body: 'x\n— commitperclip' }, [null, undefined, '']), false, 'a junk deployment list exempts nothing');
+});
+
+test('the comment surface did not cost the diff surface its exemption', () => {
+  // `SELF_EXEMPT_PATHS` has to stay closed through this change. A comment has
+  // no path, so the exclusion is an identity, and the two files the gate and
+  // its test live in must still be the only paths the diff scan skips.
+  assert.deepEqual(SELF_EXEMPT_PATHS, [
+    '.github/scripts/check-pr-internal-refs.mjs',
+    '.github/scripts/tests/check-pr-internal-refs.test.mjs',
+  ]);
 });
 
 test('an unreadable commit list fails closed instead of reporting a clean scan', () => {
