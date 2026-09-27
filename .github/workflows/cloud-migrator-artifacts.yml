@@ -7,8 +7,11 @@ on:
   workflow_dispatch:
 
 permissions: {}
+# Ref-keyed for the same reason as cloud-readiness.yml: a SHA-keyed group with
+# cancel-in-progress: false never supersedes anything, so every push to master
+# leaves another uncancellable run behind competing for the same runner pool.
 concurrency:
-  group: cloud-migrator-artifacts-${{ github.sha }}
+  group: cloud-migrator-artifacts-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

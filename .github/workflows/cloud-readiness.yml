@@ -8,9 +8,18 @@ on:
 
 permissions: {}
 
-# Source verification must start outside the full npm release's queue.
+# Source verification must start outside the full npm release's queue, so this
+# group deliberately does not share release.yml's name.
+#
+# The group is keyed on the ref, not the SHA. Keying it on the SHA gave every
+# push to master its own concurrency group, which defeats the only thing a
+# group with cancel-in-progress: false does: successive pushes no longer
+# serialise, they accumulate. Each push enqueued a fresh, uncancellable fan-out
+# of the whole release-verify matrix, so the queue grew by one full matrix per
+# merge instead of staying one deep. This is the same ref-keyed shape
+# docker.yml and refresh-lockfile.yml already use.
 concurrency:
-  group: cloud-readiness-${{ github.sha }}
+  group: cloud-readiness-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
