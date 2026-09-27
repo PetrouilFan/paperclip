@@ -323,8 +323,70 @@ function inReviewNotClaimableRemediation() {
     `resolved interaction crosses in_review -> in_progress. If this task is ` +
     `genuinely being picked up for execution, PATCH the status to in_progress ` +
     `first: that keeps the disposition change visible instead of a side effect ` +
-    `of claiming, and it leaves the pending review artifacts in place.`
+    `of claiming, and it leaves the pending review artifacts in place. ` +
+    // That PATCH is only reachable for a board member, or for a run already
+    // working on this issue. An agent that is not bound to it cannot use it:
+    // the write is cross-issue, and the 403 that stops it also tells the run not
+    // to work around the refusal by binding itself to the issue -- claiming a
+    // task moves it to in_progress, which is the very state change at issue.
+    // So name the route that does not need a cross-issue write, and name it as
+    // the review path rather than a call, because the server performs the claim
+    // once the review artifact is resolved.
+    `That PATCH is a board action, or an action for a run already working on ` +
+    `this issue. A run that is not bound to this issue cannot take it: the ` +
+    `write is cross-issue, and the refusal that stops it also rules out binding ` +
+    `this run to the issue instead. For that case the route is the review ` +
+    `itself -- get the pending review artifact resolved on this issue, and the ` +
+    `resolution wakes a run here and lets the server make the claim. If nothing ` +
+    `is pending on it, raise a child issue with the work in its description and ` +
+    `let a run that owns a task carry it.`
   );
+}
+
+/**
+ * The columns a checkout refusal reports on. Both refusal paths in `checkout`
+ * answer from this shape so they cannot drift into describing different
+ * situations.
+ */
+type CheckoutConflictRow = {
+  id: string;
+  status: string;
+  assigneeAgentId: string | null;
+  checkoutRunId: string | null;
+  executionRunId: string | null;
+};
+
+/**
+ * The one checkout conflict, so the in_review-specific `code` rides on exactly
+ * one condition: the row really is `in_review` and this caller is not
+ * server-cleared for the edge. That condition is deliberately about the *row*.
+ * A caller that sent `expectedStatuses: ["in_review"]` has said nothing about
+ * the issue -- the row is very often `todo`, unassigned and unlocked, and is
+ * then claimable -- so the request alone must never be able to make a refusal
+ * claim a review disposition that does not exist, nor hand that caller advice
+ * about parking a task it is not looking at.
+ */
+function throwCheckoutConflict(
+  current: CheckoutConflictRow,
+  inReviewResumeAuthorized: boolean | undefined,
+): never {
+  throw conflict("Issue checkout conflict", {
+    issueId: current.id,
+    status: current.status,
+    assigneeAgentId: current.assigneeAgentId,
+    checkoutRunId: current.checkoutRunId,
+    executionRunId: current.executionRunId,
+    // Name the in_review refusal explicitly. Without this the caller sees the
+    // same opaque conflict it gets for a live lock, and the natural next move --
+    // retry, or drop in_review from the list and try again -- is what turns a
+    // legible refusal into a guess.
+    ...(current.status === "in_review" && !inReviewResumeAuthorized
+      ? {
+          code: IN_REVIEW_NOT_CLAIMABLE_CODE,
+          remediation: inReviewNotClaimableRemediation(),
+        }
+      : {}),
+  });
 }
 
 function applyStatusSideEffects(
@@ -11618,16 +11680,34 @@ export function issueService(db: Db) {
       // heartbeat service, for a run continuing a *resolved* interaction. Any
       // request that arrives over HTTP routes to the service with this false,
       // because the request body cannot carry the authorization.
+      const readConflictRow = (): Promise<CheckoutConflictRow | null> =>
+        db
+          .select({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+
       const claimableStatuses = options?.inReviewResumeAuthorized
         ? expectedStatuses
         : expectedStatuses.filter((status) => status !== "in_review");
       if (claimableStatuses.length === 0) {
-        throw conflict("Issue checkout conflict", {
-          issueId: id,
-          status: "in_review",
-          code: IN_REVIEW_NOT_CLAIMABLE_CODE,
-          remediation: inReviewNotClaimableRemediation(),
-        });
+        // `inArray(col, [])` is malformed SQL, so the emptied list cannot fall
+        // through to the update below. It must not report from the request
+        // either. Filtering to nothing only means the caller named `in_review`
+        // and nothing else, which says nothing about the row: a `todo` issue
+        // asked for that way is claimable, and pre-#143 it was claimed. Answer
+        // from the row and let the shared conflict decide whether this is the
+        // in_review refusal or an ordinary one, so the two paths cannot
+        // disagree about what they are refusing.
+        const current = await readConflictRow();
+        if (!current) throw notFound("Issue not found");
+        throwCheckoutConflict(current, options?.inReviewResumeAuthorized);
       }
 
       const sameRunAssigneeCondition = checkoutRunId
@@ -11688,17 +11768,7 @@ export function issueService(db: Db) {
         return enriched;
       }
 
-      const current = await db
-        .select({
-          id: issues.id,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
-        .from(issues)
-        .where(eq(issues.id, id))
-        .then((rows) => rows[0] ?? null);
+      const current = await readConflictRow();
 
       if (!current) throw notFound("Issue not found");
 
@@ -11830,23 +11900,7 @@ export function issueService(db: Db) {
         return enriched;
       }
 
-      throw conflict("Issue checkout conflict", {
-        issueId: current.id,
-        status: current.status,
-        assigneeAgentId: current.assigneeAgentId,
-        checkoutRunId: current.checkoutRunId,
-        executionRunId: current.executionRunId,
-        // Name the in_review refusal explicitly. Without this the caller sees
-        // the same opaque conflict it gets for a live lock, and the natural
-        // next move -- retry, or drop in_review from the list and try again --
-        // is what turns a legible refusal into a guess.
-        ...(current.status === "in_review" && !options?.inReviewResumeAuthorized
-          ? {
-              code: IN_REVIEW_NOT_CLAIMABLE_CODE,
-              remediation: inReviewNotClaimableRemediation(),
-            }
-          : {}),
-      });
+      throwCheckoutConflict(current, options?.inReviewResumeAuthorized);
     },
 
     assertCheckoutOwner: async (

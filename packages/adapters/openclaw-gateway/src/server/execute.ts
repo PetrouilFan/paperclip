@@ -444,7 +444,7 @@ function buildWakeText(
     `2) Determine issueId: PAPERCLIP_TASK_ID if present, otherwise issue_id (${issueIdHint}).`,
     '   Replace {issueId} in every endpoint below with that determined id. Never send the literal text "{issueId}" in a URL.',
     "3) If issueId exists:",
-    "   - POST /api/issues/{issueId}/checkout with {\"agentId\":\"$PAPERCLIP_AGENT_ID\",\"expectedStatuses\":[\"todo\",\"backlog\",\"blocked\"]} (in_review is not claimable: a 409 with code in_review_not_claimable means the task is parked on a review path -- PATCH the status if it is really being picked up)",
+    "   - POST /api/issues/{issueId}/checkout with {\"agentId\":\"$PAPERCLIP_AGENT_ID\",\"expectedStatuses\":[\"todo\",\"backlog\",\"blocked\"]} (in_review is not claimable: a 409 with code in_review_not_claimable means the task is parked on a review path. If you are already bound to this task, PATCH the status to in_progress. If you are not bound to it, do not -- that write is cross-issue; get the pending review artifact resolved on the task, or raise a child issue with the work in it)",
     "   - GET /api/issues/{issueId}",
     "   - GET /api/issues/{issueId}/comments",
     "   - Execute the issue instructions exactly. If the issue is actionable, take concrete action in this run; do not stop at a plan unless planning was requested.",
