@@ -97,6 +97,7 @@ import {
 } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
+  issueMonitorSuspensionReason,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
@@ -1368,7 +1369,13 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     latestRun: LatestIssueRun,
   ) {
-    if (issue.monitorNextCheckAt) return true;
+    // An armed monitor is only a durable wait path while the server will
+    // actually dispatch it. Counting a `todo` issue's monitor here made the
+    // stranded sweep skip an issue whose watch could never fire, which is the
+    // absence of a signal on the component whose job is to produce one.
+    if (issue.monitorNextCheckAt && !issueMonitorSuspensionReason(issue.status, issue.assigneeAgentId, issue.assigneeUserId)) {
+      return true;
+    }
     if (
       issue.status === "in_progress" &&
       latestRun?.status === "succeeded" &&

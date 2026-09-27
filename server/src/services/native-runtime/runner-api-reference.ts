@@ -91,7 +91,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "GET /api/issues/{}/diagnostics/blockers": {
     "section": "Issues (Tasks)",
-    "description": "Read-only blocker diagnostic with `diagnosis`, readiness, and bounded anomaly flags. Readiness is null whenever the answer would be partial, including when `unprojectedHold` reports a hold the first-class projection cannot name"
+    "description": "Read-only blocker diagnostic with `diagnosis`, readiness, and bounded anomaly flags. Readiness answers whether a status transition would be refused on dependency blockers, and is null only when the visible blocker set is partial (truncated, or outside the actor's authorization); a hold reported in `unprojectedHold` is an additional fact and does not withhold it"
   },
   "GET /api/issues/{}/diagnostics/wakes": {
     "section": "Issues (Tasks)",

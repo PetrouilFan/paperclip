@@ -298,8 +298,10 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  issueMonitorSuspensionReason,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
+  projectIssueMonitorSuspension,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
@@ -1456,7 +1458,6 @@ function buildIssueBlockerDiagnosticsResponse(input: {
           reason: input.attention.reason,
           sampleBlockerIdentifier,
         };
-  const hasUnprojectedHold = unprojectedHold !== null && unprojectedHold.count > 0;
 
   const blockers: IssueBlockerDiagnosticNode[] = input.visibleBlockers.map(
     (blockerRow) => {
@@ -1480,23 +1481,34 @@ function buildIssueBlockerDiagnosticsResponse(input: {
     },
   );
 
-  // An unprojected hold makes the readiness answer partial, exactly as a
-  // truncated set or an authorization boundary does. Reporting
-  // `isDependencyReady: true` here is the specific defect: the write path
-  // refuses the move on the strength of a hold this object says does not
-  // exist, so the route is telling a reader to attempt something the server
-  // will reject.
-  const readiness: IssueBlockerDiagnosticsReadiness | null =
-    completeVisibleSet && !hasUnprojectedHold
-      ? {
-          allBlockersDone: input.readiness.allBlockersDone,
-          isDependencyReady: input.readiness.isDependencyReady,
-          unresolvedBlockerCount:
-            input.readiness.unresolvedBlockerIssueIds.length,
-          pendingFinalizeBlockerCount:
-            input.readiness.pendingFinalizeBlockerIssueIds.length,
-        }
-      : null;
+  // `readiness` answers one question: will the server refuse this status
+  // transition on the strength of a dependency blocker? The projection that
+  // answers it is complete for that question. Both gates that refuse the move
+  // read the same `blocks` edges this projection walks — the `in_progress`
+  // transition gate and the checkout gate both call
+  // `listIssueDependencyReadinessMap`, whose only edge query is
+  // `eq(issueRelations.type, "blocks")`. The one tree hold that does gate a
+  // write is the operator pause hold, and it gates checkout only.
+  //
+  // So an unprojected hold is not a reason to withhold this answer, and
+  // withholding it is the defect: the holds the aggregate counts beyond
+  // `blocks` (tree children, attention relations, approvals) are ones the gate
+  // never reads, so a reader asking the transition question got `null` where
+  // the answer was definitively "yes, accepted". The hold is reported next to
+  // the answer now, as an additional fact about the issue, instead of
+  // suppressing it. What still genuinely makes the answer partial — and so
+  // still nulls it — is a view the actor cannot see all of: truncation, or a
+  // blocker outside the authorization boundary.
+  const readiness: IssueBlockerDiagnosticsReadiness | null = completeVisibleSet
+    ? {
+        allBlockersDone: input.readiness.allBlockersDone,
+        isDependencyReady: input.readiness.isDependencyReady,
+        unresolvedBlockerCount:
+          input.readiness.unresolvedBlockerIssueIds.length,
+        pendingFinalizeBlockerCount:
+          input.readiness.pendingFinalizeBlockerIssueIds.length,
+      }
+    : null;
   const reportedOmittedUnauthorizedBlockerCount = input.truncated
     ? null
     : omittedUnauthorizedBlockerCount;
@@ -1546,7 +1558,11 @@ function buildIssueBlockerDiagnosis(input: {
   }
   // Checked before the empty-list sentence below, because that sentence is a
   // negative and this is the case that makes it false. `blockers` is empty
-  // here precisely because the hold is not a first-class dependency edge.
+  // here precisely because the hold is not a first-class dependency edge. The
+  // sentence stops there on purpose: it must not claim readiness is withheld,
+  // because the dependency gate does not read any of these holds and still
+  // reports it. Naming the projection's scope is what keeps this from reading
+  // as a refusal.
   if (input.unprojectedHold && input.unprojectedHold.count > 0) {
     const sample = input.unprojectedHold.sampleBlockerIdentifier
       ? ` One of them is ${input.unprojectedHold.sampleBlockerIdentifier}.`
@@ -1557,7 +1573,7 @@ function buildIssueBlockerDiagnosis(input: {
       input.unprojectedHold.count === 1 ? "" : "s"
     } that ${
       input.unprojectedHold.count === 1 ? "is" : "are"
-    } not first-class dependency edges, so they do not appear in the blocker list and readiness is not reported.${sample}`;
+    } not first-class dependency edges, so they do not appear in the blocker list. The reported readiness covers the first-class dependency edges only; the status transition gate reads no other hold.${sample}`;
   }
   if (input.blockers.length === 0) {
     return input.issue.status === "blocked"
@@ -2425,6 +2441,9 @@ async function assertCanManageIssueMonitor(
 
 function summarizeIssueMonitor(
   issue: {
+    status?: string;
+    assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
     monitorNextCheckAt?: Date | null;
     monitorLastTriggeredAt?: Date | null;
     monitorAttemptCount?: number | null;
@@ -2435,6 +2454,17 @@ function summarizeIssueMonitor(
   policy: NormalizedExecutionPolicy | null,
 ) {
   const state = parseIssueExecutionState(issue.executionState);
+  // A stored `scheduled` is a snapshot from arming time. If the issue has since
+  // been pinned to a status no monitor dispatches from, reporting it unchanged
+  // tells the board a healthy cadence for a watch that has stopped. Downgrade to
+  // `suspended` and keep the cadence, so the read is honest and the overdue
+  // slot still fires once the issue becomes runnable again.
+  const suspendedReason = issueMonitorSuspensionReason(
+    issue.status ?? "",
+    issue.assigneeAgentId ?? null,
+    issue.assigneeUserId ?? null,
+  );
+  const storedStatus = state?.monitor?.status ?? (policy?.monitor ? "scheduled" : null);
   return {
     nextCheckAt:
       issue.monitorNextCheckAt?.toISOString() ??
@@ -2467,8 +2497,10 @@ function summarizeIssueMonitor(
       policy?.monitor?.maxAttempts ?? state?.monitor?.maxAttempts ?? null,
     recoveryPolicy:
       policy?.monitor?.recoveryPolicy ?? state?.monitor?.recoveryPolicy ?? null,
-    status: state?.monitor?.status ?? (policy?.monitor ? "scheduled" : null),
+    status:
+      storedStatus === "scheduled" && suspendedReason ? "suspended" : storedStatus,
     clearReason: state?.monitor?.clearReason ?? null,
+    suspendedReason: storedStatus === "scheduled" ? suspendedReason : null,
   };
 }
 
@@ -9262,8 +9294,15 @@ export function issueRoutes(
       "Server-Timing",
       `paperclip_issue;dur=${(performance.now() - requestStartedAt).toFixed(1)}`,
     );
+    // `scheduled` is an arming-time snapshot. A status the monitor cannot
+    // dispatch from makes it a lie, so the client-facing payload reports the
+    // watch as suspended instead of silently green.
+    const projectedMonitorState = projectIssueMonitorSuspension(issue);
     res.json({
       ...issue,
+      ...(projectedMonitorState !== issue.executionState
+        ? { executionState: projectedMonitorState }
+        : {}),
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,

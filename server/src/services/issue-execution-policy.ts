@@ -4,6 +4,7 @@ import type {
   IssueExecutionMonitorClearReason,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorState,
+  IssueExecutionMonitorSuspendedReason,
   IssueExecutionPolicy,
   IssueExecutionStage,
   IssueExecutionStagePrincipal,
@@ -169,8 +170,18 @@ function derivePersistedMonitorState(input: {
   const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
 
   if (nextCheckAt) {
+    // An armed monitor whose host issue cannot dispatch it reads `suspended`,
+    // not `scheduled`. Only the issue-transition path clears a monitor for an
+    // invalid status; a direct status write (execution-recovery settling a dead
+    // run) bypasses it and used to leave the cadence claiming `scheduled` while
+    // both `triggerIssueMonitor` and `tickDueIssueMonitors` refused to fire.
+    const suspendedReason = issueMonitorSuspensionReason(
+      input.issue.status,
+      input.issue.assigneeAgentId ?? null,
+      input.issue.assigneeUserId ?? null,
+    );
     return {
-      status: "scheduled",
+      status: suspendedReason ? "suspended" : "scheduled",
       nextCheckAt,
       lastTriggeredAt,
       attemptCount,
@@ -179,6 +190,7 @@ function derivePersistedMonitorState(input: {
       ...metadata,
       clearedAt: null,
       clearReason: null,
+      suspendedReason,
     };
   }
 
@@ -190,6 +202,7 @@ function derivePersistedMonitorState(input: {
       attemptCount,
       lastTriggeredAt,
       ...metadata,
+      suspendedReason: null,
     };
   }
 
@@ -204,6 +217,7 @@ function derivePersistedMonitorState(input: {
       ...metadata,
       clearedAt: null,
       clearReason: null,
+      suspendedReason: null,
     };
   }
 
@@ -224,6 +238,7 @@ function buildScheduledMonitorState(
     ...monitorMetadataFromPolicy(monitor),
     clearedAt: null,
     clearReason: null,
+    suspendedReason: null,
   };
 }
 
@@ -241,6 +256,7 @@ function buildTriggeredMonitorState(input: {
     ...monitorMetadataFromState(input.previous),
     clearedAt: null,
     clearReason: null,
+    suspendedReason: null,
   };
 }
 
@@ -259,6 +275,7 @@ function buildClearedMonitorState(input: {
     ...monitorMetadataFromState(input.previous),
     clearedAt: input.clearedAt.toISOString(),
     clearReason: input.clearReason,
+    suspendedReason: null,
   };
 }
 
@@ -278,6 +295,26 @@ function monitorClearReasonForIssue(
     return "invalid_status";
   }
   return null;
+}
+
+/**
+ * Why an armed monitor cannot dispatch from the issue's current shape, or null
+ * when it can.
+ *
+ * The set of statuses that qualify is exactly what `triggerIssueMonitor` and
+ * `tickDueIssueMonitors` dispatch from. Terminal statuses are excluded because
+ * they are a *cleared* monitor, not a suspended one — `monitorClearReasonForIssue`
+ * already owns that vocabulary, and calling a torn-down watch "suspended" would
+ * make the two indistinguishable.
+ */
+export function issueMonitorSuspensionReason(
+  status: string,
+  assigneeAgentId: string | null,
+  assigneeUserId: string | null,
+): IssueExecutionMonitorSuspendedReason | null {
+  if (status === "done" || status === "cancelled") return null;
+  if (issueAllowsMonitor(status, assigneeAgentId, assigneeUserId)) return null;
+  return assigneeUserId || !assigneeAgentId ? "host_assignee" : "host_status";
 }
 
 function parseMonitorDate(value: string | null | undefined) {
@@ -1160,12 +1197,44 @@ export function buildInitialIssueMonitorFields(input: {
   };
 }
 
+/**
+ * Read-side projection for the client-facing issue payload.
+ *
+ * A stored `monitor.status = "scheduled"` is a snapshot taken when the watch was
+ * armed. Any write that moves the host issue into a status no monitor dispatches
+ * from — most often `execution-recovery` settling a dead run and pinning
+ * `executionBlocker` straight onto the row — leaves that snapshot untouched, and
+ * every consumer then reads a healthy cadence for a watch that has stopped.
+ *
+ * This downgrades `scheduled` to `suspended` and nothing else. `cleared` and
+ * `triggered` are terminal readings and are left alone; the cadence itself is not
+ * touched, so the overdue slot still fires the moment the issue becomes runnable
+ * again.
+ *
+ * Returns the stored value itself — not a re-serialized copy — when there is
+ * nothing to downgrade, so callers can use identity to skip the override.
+ */
+export function projectIssueMonitorSuspension(issue: IssueLike): IssueLike["executionState"] {
+  const stored = issue.executionState ?? null;
+  const state = parseIssueExecutionState(stored);
+  if (!state?.monitor || state.monitor.status !== "scheduled") return stored;
+  const suspendedReason = issueMonitorSuspensionReason(
+    issue.status,
+    issue.assigneeAgentId ?? null,
+    issue.assigneeUserId ?? null,
+  );
+  if (!suspendedReason) return stored;
+  return {
+    ...(stored as Record<string, unknown>),
+    monitor: { ...state.monitor, status: "suspended", suspendedReason },
+  };
+}
+
 export function buildIssueMonitorTriggeredPatch(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
   triggeredAt: Date;
-}) {
-  const existingState = parseIssueExecutionState(input.issue.executionState);
+}) {  const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentMonitorState = derivePersistedMonitorState({
     issue: input.issue,
     state: existingState,
