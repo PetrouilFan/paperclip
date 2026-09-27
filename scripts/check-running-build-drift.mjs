@@ -14,14 +14,28 @@
  * provenance. So this check asserts *content*: a fix is deployed when a stable
  * identifier it introduced is present in the artifact the server loads.
  *
- * Each sentinel is checked twice, and both halves must hold:
+ * Each sentinel is checked three times, and all three must hold:
  *
- *   1. source — the marker must appear in the named source file at HEAD, so a
- *      renamed or deleted guard fails here instead of silently passing forever;
- *   2. deployed — the marker must appear in the running artifact.
+ *   1. anchor — the marker must appear in the named source file *as of the
+ *      commit the sentinel names*, so `sinceCommit` is a claim the manifest
+ *      is held to rather than a string it is allowed to get wrong;
+ *   2. source — the marker must appear in that file at HEAD, so a renamed or
+ *      deleted guard fails here instead of silently passing forever;
+ *   3. deployed — the marker must appear in the running artifact.
  *
- * Check 1 is what keeps this honest. Without it the manifest is a hand-typed
- * list that drifts from the code and reports a permanently green board.
+ * Check 1 is what makes the report's own words true. When a sentinel fires the
+ * report prints `committed at <sinceCommit>`, and that is the only thing
+ * telling an operator which commit to go and look at. Reading the source at
+ * HEAD alone cannot catch a manifest that names the wrong commit: HEAD has
+ * every marker a shipped fix introduced, so the check reads green while
+ * pointing the operator at a commit that never carried half of them. Two
+ * sentinels did exactly that — one anchor claimed a payload key that arrived
+ * in a later commit — and the only assertion covering `sinceCommit` was a hex
+ * format check on a fabricated value.
+ *
+ * Checks 1 and 2 are what keeps this honest. Without them the manifest is a
+ * hand-typed list that drifts from the code and reports a permanently green
+ * board.
  *
  * A third question is reported alongside the two, and it is the one a deploy
  * decision actually turns on: "present" and "durably present" are different
@@ -34,10 +48,10 @@
  * `docs/deploy/shadowed-server-install.md`.
  *
  * Exit codes: 0 no drift, 1 drift found, 2 the check could not be evaluated
- * (no running build found, a manifest/source mismatch, or an unreadable source
- * tree — the last two are bugs in this file, not deploy states). Every
- * unevaluated path returns 2, never 1, so a broken check can never be read as
- * a deploy finding.
+ * (no running build found, a manifest/source mismatch, an anchor that does not
+ * contain the marker it claims, or an unreadable source tree — the middle three
+ * are bugs in this file, not deploy states). Every unevaluated path returns 2,
+ * never 1, so a broken check can never be read as a deploy finding.
  */
 
 import { execFileSync } from "node:child_process";
@@ -97,36 +111,54 @@ export const RUNNING_BUILD_SENTINELS = [
     summary: "the run-bound cross-issue fallback only trusts an active run",
   },
   {
-    // `no_context_source_and_target_unbound` is a reason-code string literal,
-    // so it survives compilation unconditionally — which means it also survives
-    // in builds that predate everything this guard has since grown. A build
-    // that names the reason and nothing else satisfied this sentinel on its
-    // own, so it read `ok` on a build missing the payload and the exemption
-    // below. Requiring a payload key as well keeps the reason string necessary
-    // without letting it be sufficient on its own.
+    // The reason string alone is a weak guard, because it is a reason-code
+    // literal and so survives compilation in every build that has ever named
+    // the gate — including builds predating the payload below. But that is an
+    // argument for guarding the payload separately, not for bolting it onto
+    // this claim: `f80a08c00` is "name the failing gate in the 403 details" and
+    // is the only commit that introduced the reason, so this sentinel is
+    // exactly what that commit did. A build that names the reason and no
+    // payload is genuine drift, reported by the two sentinels below, each of
+    // which the build is actually missing.
     id: "cross-issue-403-names-the-gate",
     sinceCommit: "f80a08c00",
     sourcePath: "server/src/services/cross-issue-influence-limit.ts",
     distPath: "services/cross-issue-influence-limit.js",
-    markers: ["no_context_source_and_target_unbound", "targetAssignedToOtherActor"],
+    markers: ["no_context_source_and_target_unbound"],
     summary: "the 403 details carry the reason that fired",
   },
   {
-    // The self-assigned-target exemption. An agent writing to the issue it is
-    // assigned needs no run to attribute the write to, and the guard used to
-    // refuse it as `no_context_source_and_target_unbound` after the permission
-    // layer had already said yes. Every `blocked` issue was affected, because a
-    // blocked issue cannot check out and so can never reach a binding.
+    // The self-assigned-target exemption (#85). An agent writing to the issue
+    // it is assigned needs no run to attribute the write to, and the guard used
+    // to refuse it as `no_context_source_and_target_unbound` after the
+    // permission layer had already said yes. Every `blocked` issue was
+    // affected, because a blocked issue cannot check out and so can never
+    // reach a binding.
     //
-    // Both payload keys are required: either alone is carried by builds that
-    // name the holder but not the binding, or the binding but not the
-    // assignee, and neither state is the fix.
+    // The exemption *is* the assignee appearing in the payload: the guard keys
+    // its decision off it, so there is no second symbol to require. Requiring
+    // the holder key as well would attribute #137's work to #85 — the refusal
+    // grew its own commit, and a sentinel whose anchor does not carry its
+    // markers is the one thing that must never survive here.
     id: "run-context-allows-self-assigned-target",
     sinceCommit: "1220016a",
     sourcePath: "server/src/services/cross-issue-influence-limit.ts",
     distPath: "services/cross-issue-influence-limit.js",
-    markers: ["targetAssignedToOtherActor", "targetHeldByAnotherRun"],
+    markers: ["targetAssignedToOtherActor"],
     summary: "the assignee may write the issue it is assigned without a run to attribute it to",
+  },
+  {
+    // #137, the follow-on to the exemption above. The refusal named a checkout
+    // it would have refused, so the payload gained the run that actually
+    // holds the target. A separate commit from the exemption, so a separate
+    // sentinel: the two drifted independently and #137 arrived on a build that
+    // already carried the exemption.
+    id: "run-context-refusal-names-the-holder",
+    sinceCommit: "8d1fd267",
+    sourcePath: "server/src/services/cross-issue-influence-limit.ts",
+    distPath: "services/cross-issue-influence-limit.js",
+    markers: ["targetHeldByAnotherRun"],
+    summary: "the refusal names the run that holds the target, not a checkout it would refuse",
   },
   {
     // `blockedByIssueIds` used to be write-only: PATCH accepted it, and no read
@@ -268,6 +300,22 @@ function readSourceAtHead(sourcePath, git) {
 }
 
 /**
+ * The source file as of the commit a sentinel names.
+ *
+ * Returns `null` when the commit is not in this checkout, which is a shallow
+ * clone rather than a lie in the manifest. The two are reported apart: a
+ * missing commit cannot be told from a wrong one by the check, so it must not
+ * be guessed at.
+ */
+function readSourceAtAnchor(sourcePath, sinceCommit, git) {
+  try {
+    return git(["show", `${sinceCommit}:${sourcePath}`]);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Evaluate every sentinel against a running dist root.
  *
  * `git` is injected so the test can drive this without a repository, and so a
@@ -275,9 +323,17 @@ function readSourceAtHead(sourcePath, git) {
  */
 export function evaluateSentinels(sentinels, { distRoot, git, exists = existsSync }) {
   return sentinels.map((sentinel) => {
+    const sourceAtHead = readSourceAtHead(sentinel.sourcePath, git);
+    const sourceAtAnchor = readSourceAtAnchor(sentinel.sourcePath, sentinel.sinceCommit, git);
     const sourceMissingFromHead = sentinel.markers.filter(
-      (marker) => !readSourceAtHead(sentinel.sourcePath, git).includes(marker),
+      (marker) => !sourceAtHead.includes(marker),
     );
+    // The half that catches a wrong anchor: the marker is present in the
+    // source today, so nothing else here would ever report it.
+    const anchorMissing =
+      sourceAtAnchor === null
+        ? []
+        : sentinel.markers.filter((marker) => !sourceAtAnchor.includes(marker));
     const distFile = join(distRoot, sentinel.distPath);
     const deployedExists = exists(distFile);
     const deployedText = deployedExists ? readFileSync(distFile, "utf8") : "";
@@ -291,11 +347,15 @@ export function evaluateSentinels(sentinels, { distRoot, git, exists = existsSyn
       deployedExists,
       missingFromDeployed,
       sourceMissingFromHead,
+      anchorMissing,
+      anchorUnresolved: sourceAtAnchor === null,
       state:
         // A manifest that no longer matches the source is a defect in this
         // file. It is reported as its own state so it can never be confused
-        // with "deployed and current".
-        sourceMissingFromHead.length > 0
+        // with "deployed and current" — and an anchor that does not contain
+        // the claim is the same class of defect, one step earlier: the report
+        // would otherwise print a commit that never carried the fix.
+        sourceMissingFromHead.length > 0 || anchorMissing.length > 0
           ? "manifest_mismatch"
           : missingFromDeployed.length > 0
             ? "drifted"
@@ -310,6 +370,7 @@ export function summarize(results) {
     deployed: results.filter((r) => r.state === "deployed").length,
     drifted: results.filter((r) => r.state === "drifted").map((r) => r.id),
     manifestMismatch: results.filter((r) => r.state === "manifest_mismatch").map((r) => r.id),
+    anchorUnresolved: results.filter((r) => r.anchorUnresolved).map((r) => r.id),
   };
 }
 
@@ -322,8 +383,15 @@ export function formatReport(report) {
         (result.state === "drifted"
           ? `\n         committed at ${result.sinceCommit} but absent from ${result.distFile}`
           : "") +
-        (result.state === "manifest_mismatch"
+        (result.sourceMissingFromHead.length > 0
           ? `\n         marker not in ${result.sourcePath} at HEAD: ${result.sourceMissingFromHead.join(", ")}`
+          : "") +
+        (result.anchorMissing.length > 0
+          ? `\n         ${result.sinceCommit} does not contain: ${result.anchorMissing.join(", ")}` +
+            `\n         the commit this sentinel names did not introduce that marker`
+          : "") +
+        (result.anchorUnresolved
+          ? `\n         cannot read ${result.sinceCommit}:${result.sourcePath} — that commit is not in this checkout`
           : ""),
     );
   }
@@ -331,7 +399,16 @@ export function formatReport(report) {
     lines.push(
       "",
       "This is a bug in check-running-build-drift.mjs: a sentinel no longer matches the",
-      "source it claims to guard. Fix the manifest before trusting any result here.",
+      "source it claims to guard, or names a commit that never carried the fix. Fix the",
+      "manifest before trusting any result here — a drifted line would send you to a",
+      "commit that does not contain what it is reporting as missing.",
+    );
+  } else if (report.anchorUnresolved.length > 0) {
+    lines.push(
+      "",
+      "A sentinel's commit is not in this checkout, so its provenance is unverified and",
+      "its deployed state cannot be trusted. Re-run against a full clone (git fetch",
+      "--unshallow) rather than reading the missing sentinel as a deploy finding.",
     );
   } else if (report.drifted.length > 0) {
     lines.push(
@@ -419,6 +496,9 @@ export function runCheck({
   };
   write(asJson ? `${JSON.stringify(report, null, 2)}\n` : `${formatReport(report)}\n`);
   if (report.manifestMismatch.length > 0) return EXIT_UNEVALUATED;
+  // An unverified anchor means the report would print a commit it never read.
+  // That is a broken check, so it borrows the unevaluated code, never drift.
+  if (report.anchorUnresolved.length > 0) return EXIT_UNEVALUATED;
   return report.drifted.length > 0 ? EXIT_DRIFT : EXIT_OK;
 }
 

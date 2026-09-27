@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -41,11 +42,39 @@ function distRootWithPaths(files) {
   return root;
 }
 
-/** A `git show HEAD:<path>` stub that serves one file body. */
+/**
+ * A `git show <ref>:<path>` stub that serves one file body.
+ *
+ * The same body is served at every ref, because that is what a correct
+ * manifest means: the anchor contains the marker, and so does HEAD. A stub
+ * that answered `HEAD:` and threw for every other ref would leave the anchor
+ * half of the check untested, which is exactly how a wrong `sinceCommit`
+ * survived a green suite. `gitServingWithAnchorMissing` models a wrong one.
+ */
 function gitServing(sourcePath, body) {
   return (args) => {
     const spec = args[1];
-    if (spec === `HEAD:${sourcePath}`) return body;
+    if (spec?.endsWith(`:${sourcePath}`)) return body;
+    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+  };
+}
+
+/** A stub where the anchor resolves, but predates the marker it is required to carry. */
+function gitServingWithAnchorMissing(sourcePath, headBody, anchorBody) {
+  return (args) => {
+    const spec = args[1];
+    if (spec === `HEAD:${sourcePath}`) return headBody;
+    if (spec?.endsWith(`:${sourcePath}`)) return anchorBody;
+    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+  };
+}
+
+/** A stub where the named commit is not in the checkout at all. */
+function gitServingWithoutAnchor(sourcePath, headBody) {
+  return (args) => {
+    const spec = args[1];
+    if (spec === `HEAD:${sourcePath}`) return headBody;
+    if (spec?.endsWith(`:${sourcePath}`)) throw new Error(`unknown revision: ${spec}`);
     throw new Error(`unexpected git invocation: ${args.join(" ")}`);
   };
 }
@@ -168,6 +197,121 @@ test("sentinel ids are unique so a report never double-counts one fix", () => {
   assert.equal(new Set(ids).size, ids.length);
 });
 
+test("a sentinel whose anchor lacks the marker is a manifest bug, not a deploy finding", () => {
+  // The shape that shipped: the marker is in the source today, so reading HEAD
+  // passes, and the artifact is stale so the deployed half reports drift. The
+  // report would print `committed at 1220016a` and send the operator to a commit
+  // that never carried the key — the one combination nothing else can see.
+  const root = distRootWith({ "example.js": "nothing here\n" });
+  const [result] = evaluateSentinels([FIXTURE], {
+    distRoot: root,
+    git: gitServingWithAnchorMissing(
+      FIXTURE.sourcePath,
+      "const GUARD_SYMBOL = 1;\n",
+      "const EARLIER_NAME = 1;\n",
+    ),
+  });
+  // Deployed is genuinely true, and the report must still refuse to be trusted.
+  assert.deepEqual(result.missingFromDeployed, ["GUARD_SYMBOL"]);
+  assert.deepEqual(result.sourceMissingFromHead, []);
+  assert.deepEqual(result.anchorMissing, ["GUARD_SYMBOL"]);
+  assert.equal(result.state, "manifest_mismatch");
+  assert.deepEqual(summarize([result]).manifestMismatch, ["fixture"]);
+  assert.deepEqual(summarize([result]).drifted, []);
+  // And it is reported as the unevaluated code, never as drift.
+  const quiet = () => {};
+  assert.equal(
+    runCheck({ distRoot: root, git: gitServingWithAnchorMissing(
+      FIXTURE.sourcePath,
+      "const GUARD_SYMBOL = 1;\n",
+      "const EARLIER_NAME = 1;\n",
+    ), sentinels: [FIXTURE], write: quiet }),
+    EXIT_UNEVALUATED,
+  );
+});
+
+test("a report naming a wrong anchor says which marker the commit did not introduce", () => {
+  const root = distRootWith({ "example.js": "nothing here\n" });
+  const result = evaluateSentinels([FIXTURE], {
+    distRoot: root,
+    git: gitServingWithAnchorMissing(
+      FIXTURE.sourcePath,
+      "const GUARD_SYMBOL = 1;\n",
+      "const EARLIER_NAME = 1;\n",
+    ),
+  })[0];
+  const text = formatReport({ distRoot: root, ...summarize([result]), results: [result] });
+  assert.match(text, /BUG   fixture/);
+  assert.match(text, /abc1234 does not contain: GUARD_SYMBOL/);
+  assert.match(text, /did not introduce that marker/);
+  // The operator must not be handed the drift line naming the wrong commit,
+  // nor an empty "not at HEAD" line for a marker that is present at HEAD.
+  assert.doesNotMatch(text, /committed at abc1234 but absent/);
+  assert.doesNotMatch(text, /at HEAD: *$/m);
+});
+
+test("an anchor that is not in the checkout is unevaluated, never a deploy finding", () => {
+  // A shallow clone cannot read the anchor. That is not evidence the manifest is
+  // wrong, but the deployed line would still be unbacked by the commit it
+  // names — so it borrows the unevaluated code rather than guessing.
+  const root = distRootWith({ "example.js": "function GUARD_SYMBOL() {}\n" });
+  const git = gitServingWithoutAnchor(FIXTURE.sourcePath, "const GUARD_SYMBOL = 1;\n");
+  const [result] = evaluateSentinels([FIXTURE], { distRoot: root, git });
+  assert.equal(result.anchorUnresolved, true);
+  assert.deepEqual(result.anchorMissing, []);
+  // A build that genuinely has the fix is not drift, and not a green tick
+  // either: the check could not verify what it is about to assert.
+  assert.notEqual(result.state, "drifted");
+  assert.deepEqual(summarize([result]).anchorUnresolved, ["fixture"]);
+  const quiet = () => {};
+  assert.equal(runCheck({ distRoot: root, git, sentinels: [FIXTURE], write: quiet }), EXIT_UNEVALUATED);
+  let out = "";
+  runCheck({
+    distRoot: root,
+    git,
+    sentinels: [FIXTURE],
+    write: (text) => {
+      out += text;
+    },
+  });
+  assert.match(out, /cannot read abc1234:server\/src\/services\/example\.ts/);
+  assert.match(out, /not in this checkout/);
+});
+
+test("every shipped sentinel's sinceCommit contains every marker it requires", () => {
+  // The regression that closes the class rather than the instance. Two
+  // sentinels named an anchor that lacked half their markers, and the only
+  // assertion covering `sinceCommit` was a hex format check on "abc1234" —
+  // while `gitServingAllShippedSentinels` served a hand-written body at both
+  // refs, so the stub agreed with whatever the manifest claimed.
+  //
+  // This resolves every anchor for real, so it fails when the manifest is wrong
+  // rather than when the stub is. It deliberately does not belong in the
+  // stubbed suite: a stub cannot disagree with the manifest it is written
+  // against, and that is the whole failure mode.
+  const git = (args) => execFileSync("git", args, { encoding: "utf8" });
+  for (const sentinel of RUNNING_BUILD_SENTINELS) {
+    let atAnchor;
+    try {
+      atAnchor = git(["show", `${sentinel.sinceCommit}:${sentinel.sourcePath}`]);
+    } catch {
+      // A shallow clone cannot answer this, and must not be read as a pass.
+      assert.fail(
+        `cannot resolve ${sentinel.sinceCommit}:${sentinel.sourcePath} for ${sentinel.id}; ` +
+          "this check needs full history (git fetch --unshallow), and a shallow clone " +
+          "cannot verify the manifest at all",
+      );
+    }
+    for (const marker of sentinel.markers) {
+      assert.ok(
+        atAnchor.includes(marker),
+        `${sentinel.id}: ${sentinel.sinceCommit} does not contain ${marker}, so a drift ` +
+          "report for it would send the operator to a commit that never carried the fix",
+      );
+    }
+  }
+});
+
 test("the source-attribution sentinel is not satisfied by the superseded fallback variant", () => {
   // The variant that shipped as a hand-patch, reproduced from the running
   // build. It carries TERMINAL_HEARTBEAT_RUN_STATUSES, so the older
@@ -263,17 +407,24 @@ test("the reason string alone does not make the cross-issue guard look deployed"
   const results = evaluateSentinels(RUNNING_BUILD_SENTINELS, { distRoot: root, git });
   const byId = Object.fromEntries(results.map((r) => [r.id, r]));
 
-  // The reason string is present, so the old single-marker requirement is
-  // satisfied; the payload key is what makes it drift.
+  // The reason string is present, so `cross-issue-403-names-the-gate` is
+  // satisfied — and correctly so, since that sentinel is exactly the commit
+  // that introduced the reason. The reason string being a weak guard is why the
+  // payload claims are sentinels in their own right: the build is genuinely
+  // missing them, so each reports drift and the operator still sees it.
   assert.match(reasonStringOnly, /no_context_source_and_target_unbound/);
-  assert.equal(byId["cross-issue-403-names-the-gate"].state, "drifted");
-  assert.deepEqual(byId["cross-issue-403-names-the-gate"].missingFromDeployed, [
-    "targetAssignedToOtherActor",
-  ]);
+  assert.equal(byId["cross-issue-403-names-the-gate"].state, "deployed");
   assert.equal(byId["run-context-allows-self-assigned-target"].state, "drifted");
   assert.deepEqual(
     byId["run-context-allows-self-assigned-target"].missingFromDeployed,
-    ["targetAssignedToOtherActor", "targetHeldByAnotherRun"],
+    ["targetAssignedToOtherActor"],
+  );
+  // #137 grew the refusal's own payload key after the exemption, and a build
+  // carrying only the reason is missing that too.
+  assert.equal(byId["run-context-refusal-names-the-holder"].state, "drifted");
+  assert.deepEqual(
+    byId["run-context-refusal-names-the-holder"].missingFromDeployed,
+    ["targetHeldByAnotherRun"],
   );
   // The sentinel that only ever needed the reason's sibling is unaffected.
   assert.equal(byId["run-bound-fallback-attributes-source"].state, "deployed");
@@ -368,7 +519,7 @@ test("exit codes stay distinct: deployed is 0, drift is 1, and never the reverse
   assert.notEqual(EXIT_UNEVALUATED, EXIT_OK);
 });
 
-/** A `git show HEAD:<path>` stub serving every shipped sentinel's source path. */
+/** A `git show <ref>:<path>` stub serving every shipped sentinel's source path. */
 function gitServingAllShippedSentinels(overrides = {}) {
   const defaults = {
     "server/src/services/cross-issue-influence-limit.ts": [
@@ -391,8 +542,8 @@ function gitServingAllShippedSentinels(overrides = {}) {
   const bodies = { ...defaults, ...overrides };
   return (args) => {
     const spec = args[1];
-    if (spec?.startsWith("HEAD:")) {
-      const body = bodies[spec.slice("HEAD:".length)];
+    if (spec?.includes(":")) {
+      const body = bodies[spec.slice(spec.indexOf(":") + 1)];
       if (body === undefined) throw new Error(`unexpected git invocation: ${args.join(" ")}`);
       return body;
     }
@@ -475,11 +626,14 @@ test("the run shape of the live build still reports exactly the findings it has"
   assert.equal(code, EXIT_DRIFT);
   assert.match(out, /DRIFT checkout-refuses-terminal-run/);
   assert.match(out, /DRIFT run-bound-fallback-attributes-source/);
-  // `cross-issue-403-names-the-gate` used to be green here. This artifact
-  // names the reason and nothing else, and requiring a payload key alongside
-  // the reason is what stops that from reading as deployed.
-  assert.match(out, /DRIFT cross-issue-403-names-the-gate/);
+  // This artifact names the reason and nothing else. It is honest to call that
+  // deployed for the sentinel that is exactly "the 403 names the gate", and it
+  // is drift on the two payload claims the build never got — which is what the
+  // operator acts on. The point of guarding the payload separately is that
+  // neither line can be a lie about which commit carried what.
+  assert.match(out, /ok   cross-issue-403-names-the-gate/);
   assert.match(out, /DRIFT run-context-allows-self-assigned-target/);
+  assert.match(out, /DRIFT run-context-refusal-names-the-holder/);
   assert.match(out, /DRIFT blocked-issue-ids-readable-on-single-read/);
   assert.match(out, /DRIFT blocked-issue-ids-readable-on-list-read/);
   // The one sentinel the superseded variant does satisfy stays green, which is
