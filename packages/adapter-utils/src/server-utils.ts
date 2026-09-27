@@ -569,6 +569,7 @@ type PaperclipWakeIssue = {
   title: string | null;
   description: string | null;
   descriptionTruncated: boolean;
+  descriptionLength: number | null;
   status: string | null;
   workMode: string | null;
   priority: string | null;
@@ -944,6 +945,10 @@ function normalizePaperclipWakeIssue(
     title,
     description,
     descriptionTruncated: asBoolean(issue.descriptionTruncated, false),
+    descriptionLength:
+      issue.descriptionLength == null
+        ? null
+        : asNumber(issue.descriptionLength, description?.length ?? 0),
     status,
     workMode,
     priority,
@@ -2520,7 +2525,11 @@ function renderPaperclipWakePromptBody(
     );
     if (normalized.issue?.descriptionTruncated) {
       lines.push(
-        "[issue description truncated; fetch the issue for the full brief]",
+        `[issue description truncated${
+          normalized.issue.descriptionLength
+            ? `; showing ${issueDescription.length} of ${normalized.issue.descriptionLength} characters`
+            : ""
+        }; fetch the issue for the full brief]`,
       );
     }
   } else if (issueDescription !== null && resumeOmitsIssueDescription) {

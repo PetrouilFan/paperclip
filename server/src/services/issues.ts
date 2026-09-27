@@ -2103,6 +2103,44 @@ function decodeDatabaseTextPreview(
   );
 }
 
+/**
+ * A list projection must never hand a consumer a silently shortened brief. The
+ * cut is marked in-band so a consumer that forwards, renders, logs, or pipes
+ * `description` without reading the sibling `descriptionTruncated` /
+ * `descriptionLength` fields can still tell a complete brief from a cut one.
+ */
+function markTruncatedDescriptionPreview(
+  preview: string | null,
+  fullLength: number | null | undefined,
+): string | null {
+  if (preview == null) return null;
+  const total = Number(fullLength);
+  if (!Number.isFinite(total) || total <= preview.length) return preview;
+  return `${preview}\n\n[description truncated: showing ${preview.length} of ${total} characters — fetch the issue for the full description]`;
+}
+
+function projectIssueListDescription(row: {
+  description: string | null;
+  descriptionTruncated?: boolean | null;
+  descriptionLength?: number | null;
+}): { description: string | null; descriptionLength: number | null } {
+  const preview = decodeDatabaseTextPreview(
+    row.description,
+    ISSUE_LIST_DESCRIPTION_MAX_CHARS,
+  );
+  const rawLength = row.descriptionLength == null ? null : Number(row.descriptionLength);
+  const descriptionLength = Number.isFinite(rawLength as number)
+    ? (rawLength as number)
+    : preview?.length ?? null;
+  return {
+    description:
+      row.descriptionTruncated === true
+        ? markTruncatedDescriptionPreview(preview, descriptionLength)
+        : preview,
+    descriptionLength,
+  };
+}
+
 function appendAcceptanceCriteriaToDescription(
   description: string | null | undefined,
   acceptanceCriteria: string[] | undefined,
@@ -4908,6 +4946,12 @@ const issueListSelect = {
       ELSE length(${issues.description}) > ${ISSUE_LIST_DESCRIPTION_MAX_CHARS}
     END
   `,
+  descriptionLength: sql<number | null>`
+    CASE
+      WHEN ${issues.description} IS NULL THEN NULL
+      ELSE length(${issues.description})
+    END
+  `,
   status: issues.status,
   statusVersion: issues.statusVersion,
   lastStatusDecisionId: issues.lastStatusDecisionId,
@@ -6385,10 +6429,7 @@ async function listBlockedInboxIssues(
       )
   ).map((row: any) => ({
     ...row,
-    description: decodeDatabaseTextPreview(
-      row.description,
-      ISSUE_LIST_DESCRIPTION_MAX_CHARS,
-    ),
+    ...projectIssueListDescription(row),
   }));
   const withLabels = await withIssueLabels(dbOrTx, rows);
   const withRuns = withActiveRuns(
@@ -8119,10 +8160,7 @@ export function issueService(db: Db) {
             : baseQuery.limit(limit);
       const rows = (await pageQuery).map((row) => ({
         ...row,
-        description: decodeDatabaseTextPreview(
-          row.description,
-          ISSUE_LIST_DESCRIPTION_MAX_CHARS,
-        ),
+        ...projectIssueListDescription(row),
       }));
       const withLabels = await withIssueLabels(db, rows);
       const runMap = await activeRunMapForIssues(db, withLabels);
