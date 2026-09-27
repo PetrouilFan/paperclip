@@ -1324,6 +1324,18 @@ const BOARD_ONLY_PREFIXES = [
   "/api/instance/",
 ];
 
+/**
+ * Board-only operations the route-source derivation cannot reach: gates
+ * applied by router-level middleware, by a helper in another file, or by a
+ * resource condition rather than the actor type. Every operation the
+ * derivation *does* prove is enumerated in `BOARD_ONLY_DERIVED_OPERATIONS`
+ * below, so adding a `assertBoard` call to a handler no longer requires
+ * remembering this set.
+ *
+ * `server/src/__tests__/route-authorization-contract.test.ts` derives the
+ * board-gated set from `server/src/routes/` and fails the build when a
+ * provable gate is missing from either list.
+ */
 const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
@@ -1623,6 +1635,168 @@ const CREATED_OPERATIONS = new Set([
   "POST /api/tool-gateway/sessions",
 ]);
 
+/**
+ * Operations the route-source derivation proves are board-gated: an
+ * `assertBoard`, `assertBoardOrgAccess` or `assertInstanceAdmin` call that
+ * every agent request provably reaches.
+ *
+ * GENERATED from `server/src/routes/` by the derivation in
+ * `server/src/__tests__/helpers/route-authz-derivation.ts`, not maintained by
+ * hand. Every entry here was additionally confirmed with a real agent bearer
+ * key: the route answered `403` with the gate's own message. The list is
+ * checked in because the derivation reads TypeScript source that the published
+ * package does not ship, and the document is generated at runtime.
+ */
+const BOARD_ONLY_DERIVED_OPERATIONS = [
+  // /api/adapters
+  "DELETE /api/adapters/{type}",
+  "GET /api/adapters",
+  "GET /api/adapters/{type}",
+  "GET /api/adapters/{type}/config-schema",
+  "GET /api/adapters/{type}/ui-parser.js",
+  "PATCH /api/adapters/{type}",
+  "PATCH /api/adapters/{type}/override",
+  "POST /api/adapters/install",
+  "POST /api/adapters/{type}/reinstall",
+  "POST /api/adapters/{type}/reload",
+
+  // /api/agents
+  "DELETE /api/agents/{id}",
+  "DELETE /api/agents/{id}/keys/{keyId}",
+  "GET /api/agents/{id}/keys",
+  "GET /api/agents/{id}/runtime-state",
+  "GET /api/agents/{id}/task-sessions",
+  "PATCH /api/agents/{agentId}/budgets",
+  "POST /api/agents/{id}/approve",
+  "POST /api/agents/{id}/claude-login",
+  "POST /api/agents/{id}/clear-error",
+  "POST /api/agents/{id}/keys",
+  "POST /api/agents/{id}/pause",
+  "POST /api/agents/{id}/runtime-state/reset-session",
+  "POST /api/agents/{id}/terminate",
+
+  // /api/companies
+  "DELETE /api/companies/{companyId}",
+  "GET /api/companies/{companyId}/adapters/{type}/login-sessions/active",
+  "GET /api/companies/{companyId}/adapters/{type}/login-sessions/{sessionId}",
+  "GET /api/companies/{companyId}/attention",
+  "GET /api/companies/{companyId}/audit/agent-actions.csv",
+  "GET /api/companies/{companyId}/costs/quota-windows",
+  "GET /api/companies/{companyId}/decision-training",
+  "GET /api/companies/{companyId}/decision-training/export.jsonl",
+  "GET /api/companies/{companyId}/environments",
+  "GET /api/companies/{companyId}/environments/capabilities",
+  "GET /api/companies/{companyId}/feedback-traces",
+  "GET /api/companies/{companyId}/provider-traces",
+  "GET /api/companies/{companyId}/secret-proposals",
+  "GET /api/companies/{companyId}/secret-providers",
+  "GET /api/companies/{companyId}/secrets",
+  "GET /api/companies/{companyId}/sidebar-preferences/me",
+  "PATCH /api/companies/{companyId}/budgets",
+  "POST /api/companies/{companyId}/activity",
+  "POST /api/companies/{companyId}/adapters/{type}/login-sessions/{sessionId}/cancel",
+  "POST /api/companies/{companyId}/archive",
+  "POST /api/companies/{companyId}/budget-incidents/{incidentId}/resolve",
+  "POST /api/companies/{companyId}/budgets/policies",
+  "POST /api/companies/{companyId}/environments",
+  "POST /api/companies/{companyId}/environments/probe-config",
+  "POST /api/companies/{companyId}/finance-events",
+  "POST /api/companies/{companyId}/secret-proposals/{id}/approve",
+  "POST /api/companies/{companyId}/secret-proposals/{id}/reject",
+  "POST /api/companies/{companyId}/secrets",
+  "POST /api/companies/import/preview",
+  "PUT /api/companies/{companyId}/sidebar-preferences/me",
+
+  // /api/environments
+  "DELETE /api/environments/{environmentId}/custom-image-template",
+  "DELETE /api/environments/{id}",
+  "GET /api/environments/{environmentId}/custom-image-template",
+  "GET /api/environments/{id}",
+  "GET /api/environments/{id}/delete-blast-radius",
+  "GET /api/environments/{id}/leases",
+  "GET /api/environments/{id}/secret-refs",
+  "PATCH /api/environments/{id}",
+  "POST /api/environments/{environmentId}/custom-image-setup-sessions",
+  "POST /api/environments/{environmentId}/custom-image-template/relink",
+  "POST /api/environments/{environmentId}/custom-image-template/rollback",
+  "POST /api/environments/{id}/probe",
+
+  // /api/heartbeat-runs
+  "DELETE /api/heartbeat-runs/{runId}/provider-trace",
+  "GET /api/heartbeat-runs/{runId}/provider-trace",
+  "GET /api/heartbeat-runs/{runId}/provider-trace/download",
+  "POST /api/heartbeat-runs/{runId}/cancel",
+  "POST /api/heartbeat-runs/{runId}/provider-trace/frames/{frameId}/reveal",
+  "POST /api/heartbeat-runs/{runId}/provider-trace/reproject-workspace-diffs",
+  "POST /api/heartbeat-runs/{runId}/runtime-requests/{requestId}/resolve",
+
+  // /api/issues
+  "DELETE /api/issues/{id}/queued-comments/{commentId}",
+  "GET /api/issues/{id}/tree-control/state",
+  "GET /api/issues/{id}/tree-holds",
+  "GET /api/issues/{id}/tree-holds/{holdId}",
+  "PATCH /api/issues/{id}/queued-comments/{commentId}",
+  "POST /api/issues/{id}/admin/force-release",
+  "POST /api/issues/{id}/interactions/{interactionId}/cancel",
+  "POST /api/issues/{id}/queued-comments/{commentId}/steer",
+  "POST /api/issues/{id}/queued-comments/interrupt",
+  "POST /api/issues/{id}/scheduled-retry/retry-now",
+  "POST /api/issues/{id}/stalled-review-decision",
+  "POST /api/issues/{id}/tree-control/preview",
+  "POST /api/issues/{id}/tree-holds",
+  "POST /api/issues/{id}/tree-holds/{holdId}/release",
+  "PUT /api/issues/{id}/queued-comments/order",
+
+  // /api/secrets
+  "DELETE /api/secrets/{id}",
+  "PATCH /api/secrets/{id}",
+  "POST /api/secrets/{id}/rotate",
+
+  // /api/decision-training
+  "GET /api/decision-training/{id}",
+
+  // /api/environment-custom-image-setup-sessions
+  "GET /api/environment-custom-image-setup-sessions/{sessionId}",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/cancel",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/finish",
+  "POST /api/environment-custom-image-setup-sessions/{sessionId}/terminal-session-token",
+
+  // /api/environment-leases
+  "GET /api/environment-leases/{leaseId}",
+
+  // /api/sidebar-preferences
+  "GET /api/sidebar-preferences/me",
+  "PUT /api/sidebar-preferences/me",
+
+  // /api/tool-connections
+  "GET /api/tool-connections/{connectionId}/installs",
+  "PUT /api/tool-connections/{connectionId}/grants/{grantId}/members",
+  "PUT /api/tool-connections/{connectionId}/installs",
+
+  // /api/tools
+  "GET /api/tools/oauth/cloud-connector/callback",
+  "GET /api/tools/oauth/cloud-connector/enrollment",
+  "GET /api/tools/oauth/cloud-connector/enrollment-callback",
+  "GET /api/tools/oauth/paperclip-id/callback",
+  "POST /api/tools/oauth/cloud-connector/enrollment",
+
+  // /api/decisions
+  "POST /api/decisions/{id}/decide",
+  "POST /api/decisions/{id}/dismiss",
+];
+
+const BOARD_ONLY_DERIVED = new Set(BOARD_ONLY_DERIVED_OPERATIONS);
+
+/**
+ * Every operation either list declares board-only. Exported so
+ * `route-authorization-contract.test.ts` can assert the two against the route
+ * source without re-reading the literal.
+ */
+export const BOARD_ONLY_DECLARED_OPERATIONS: ReadonlySet<string> = new Set([
+  ...BOARD_ONLY_OPERATIONS,
+  ...BOARD_ONLY_DERIVED,
+]);
+
 const ACCEPTED_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/email/send",
   "POST /api/companies/import",
@@ -1645,7 +1819,7 @@ function operationKey(method: string, path: string) {
 
 function isBoardOnlyOperation(method: string, path: string) {
   const key = operationKey(method, path);
-  if (BOARD_ONLY_OPERATIONS.has(key)) return true;
+  if (BOARD_ONLY_DECLARED_OPERATIONS.has(key)) return true;
   return BOARD_ONLY_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
