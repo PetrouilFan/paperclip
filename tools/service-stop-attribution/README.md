@@ -168,6 +168,49 @@ Narrowing `NotifyAccess` therefore needs the notifier to send from the main
 process first. Until that happens, `NotifyAccess=all` is load-bearing and must
 not be changed on its own.
 
+### The notifier cannot be the main process, in node
+
+The precondition above is not merely unmet, it is unreachable from a node
+server. Writing the datagram in-process needs an `AF_UNIX` `SOCK_DGRAM` send,
+and node has none. Measured on this host, node v26.9.0:
+
+| attempt                                                       | result                                                             |
+| ------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `dgram.createSocket({ type: "unix_dgram" })`                   | throws `ERR_SOCKET_BAD_TYPE`, "Valid types are: udp4, udp6"        |
+| `net.createConnection({ path, type: "unix_dgram" })`           | connects to a `SOCK_STREAM` listener; `EPROTOTYPE` at a datagram one |
+
+The second row is the one to be careful with. The `type` option is accepted, no
+warning is printed, and a socket is created — it is simply not a datagram
+socket. `server/src/services/systemd-notify.test.ts` pins both rows, so the next
+reader does not have to rediscover this from a `node -e` session.
+
+There is exactly one shape that would make `NotifyAccess=main` correct:
+
+```ini
+ExecStart=/usr/bin/systemd-notify --ready --exec <server argv…>
+```
+
+`--exec` sends the datagram and then becomes the server in the same pid, so the
+sender is the pid systemd records as `MainPID`. It costs the meaning of
+`READY=1`: the datagram would go out before the server process exists, while
+`READY=1` today means the server is listening and migrations have run — and the
+embedded postmaster lives in the same cgroup, so "ready" currently means the
+database is up too (`doc/DEVELOPING.md`). That is a worse unit than a wider
+`NotifyAccess`, and it is a deployment change besides.
+
+What contains a run child is therefore the environment half, not the unit half:
+`scrubSystemdIpcEnv` at the spawn chokepoint in
+`packages/adapter-utils/src/server-utils.ts` strips `NOTIFY_SOCKET` and the
+`LISTEN_*` triple from the merged child environment, so no run process holds the
+address to send from. Keep the shim, keep `NotifyAccess=all`, and spend the
+remaining effort on the scrub.
+
+One child on the notify path is left, and it is now pinned down: the server
+still spawns the notifier, so `server/src/services/systemd-notify.ts` resolves it
+to an absolute path instead of through `PATH` and hands it `NOTIFY_SOCKET` and
+nothing else. The server's `PATH` is not a boundary the server controls, and a
+hijacked notifier is a process that can send `STOPPING=1`.
+
 ## Safety
 
 Nothing in this tool sends a notification, stops a unit, or writes to the unit.

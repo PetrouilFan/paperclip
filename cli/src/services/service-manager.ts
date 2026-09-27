@@ -378,6 +378,16 @@ StartLimitBurst=12
 
 [Service]
 Type=notify
+# NotifyAccess=all is load-bearing, not a default left behind. The server sends
+# READY=1 by running the systemd-notify binary as a child process, and
+# NotifyAccess=main accepts a datagram only from the pid systemd records as
+# MainPID, so a main unit refuses the readiness datagram, never reaches active,
+# and sits out TimeoutStartSec before it is killed and restarted. Node cannot
+# send the datagram itself, so there is no in-process sender to promote. What
+# keeps a run from holding the notify socket is the scrub at the spawn
+# chokepoint (scrubSystemdIpcEnv in
+# packages/adapter-utils/src/server-utils.ts), not this setting; read
+# tools/service-stop-attribution/README.md before narrowing it.
 NotifyAccess=all
 ExecStart="${escapeSystemd(input.shimPath)}" run --instance "${escapeSystemd(input.instanceId)}"
 Environment="PAPERCLIP_SERVICE_MANAGED=1"
