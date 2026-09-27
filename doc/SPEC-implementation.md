@@ -1123,7 +1123,7 @@ not create issue comments.
 ```json
 {
   "agentId": "uuid",
-  "expectedStatuses": ["todo", "backlog", "blocked", "in_review"]
+  "expectedStatuses": ["todo", "backlog", "blocked"]
 }
 ```
 

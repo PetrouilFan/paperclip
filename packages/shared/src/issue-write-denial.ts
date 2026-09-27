@@ -401,11 +401,22 @@ export function describeIssueWriteDenial(
             `wake arrives with no task by construction, so a run whose whole job is ` +
             `cross-issue cannot make this write at all until it has one.`,
           whoCanAct: `${actor}, once the run is working on a task.`,
+          // Deliberately does not name a state-changing call. This 403 cannot
+          // see the target's status, and status is the entire question: the only
+          // task a task-less run has is a parked issue of its own, and binding a
+          // run to it moves it to in_progress. Recommending `POST /checkout`
+          // here therefore converted a denied write into a wrong state change on
+          // the one issue class whose status encodes a decision. The honest
+          // recovery needs no state change at all: the run's own output is not
+          // cross-issue, so returning the finding there costs it nothing.
           sanctionedPath:
-            `Give the run a task, then post here. Check one out (` +
-            `\`POST /api/issues/<id>/checkout\`) and the write counts against the ` +
-            `per-run cap like any other, or record the finding on the issue you checked ` +
-            `out. If this run is a scheduled watch that owns no task at all, it needs a ` +
+            `Report this on your run's own output and let the board route it — a run ` +
+            `with no task has no chargeable target, and the write is recoverable by ` +
+            `re-sending it from a run that is working on a task. Do not bind this run ` +
+            `to another task to get past this: claiming a task moves it to ` +
+            `\`in_progress\`, including one parked in \`in_review\` on a reviewer or a ` +
+            `pending card, which turns a denied write into a wrong state change. If ` +
+            `this run is a scheduled watch that owns no task at all, it needs a ` +
             `standing host issue: set \`runtimeConfig.heartbeat.standingWatchIssueId\` on ` +
             `the agent to the issue that holds the watch, and every timer wake carries ` +
             `that issue as its write source. Do not resend \`X-Paperclip-Run-Id\` — this ` +

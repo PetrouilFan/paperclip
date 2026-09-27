@@ -345,7 +345,11 @@ export const issuesApi = {
   checkout: (id: string, agentId: string) =>
     api.post<Issue>(`/issues/${id}/checkout`, {
       agentId,
-      expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      // No "in_review": a binding call may not take an issue off its review
+      // path. The API answers 409 reason "in_review_not_claimable", so a person
+      // who genuinely wants to resume an in_review task PATCHes the status --
+      // a visible disposition change rather than a side effect of claiming.
+      expectedStatuses: ["todo", "backlog", "blocked"],
     }),
   release: (id: string) => api.post<Issue>(`/issues/${id}/release`, {}),
   listComments: (

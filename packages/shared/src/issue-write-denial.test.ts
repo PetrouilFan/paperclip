@@ -91,14 +91,23 @@ describe("describeIssueWriteDenial", () => {
   // report on the other branch therefore needed no test, and the corrected
   // advice could be reverted silently. These cases tie the message to its
   // effect, which is the obligation plan §6 sets for every denial.
-  it("tells a resolved run to check out a task, not to resend the run header", () => {
+  it("tells a resolved run a step that succeeds, not to resend the run header", () => {
     const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
       runContextReason: "no_context_source_and_target_unbound",
       issueIdentifier: "TASK-482",
       actorLabel: "Fable",
     });
-    // The step named has to be one that actually succeeds.
-    expect(copy.sanctionedPath).toContain("POST /api/issues/<id>/checkout");
+    // The step named has to be one that actually succeeds. This copy is
+    // deliberately narrow about it: the previously named step was
+    // `POST /api/issues/<id>/checkout`,
+    // which does succeed and is also destructive. This 403 cannot see the
+    // target's status, and status is the whole question -- the only task a
+    // task-less run has is a parked issue of its own, so the instruction
+    // bound the run and moved that issue to in_progress, dismantling whatever
+    // review path (a real reviewer, a pending card) justified reading it. The
+    // named step must therefore be one that needs no state change at all.
+    expect(copy.sanctionedPath).toContain("run's own output");
+    expect(copy.sanctionedPath).not.toContain("POST /api/issues/<id>/checkout");
     // And the step that provably does nothing must not be named as a fix.
     expect(copy.sanctionedPath).not.toContain("`X-Paperclip-Run-Id` header with your current run");
     expect(copy.sanctionedPath).toContain("Do not resend `X-Paperclip-Run-Id`");
@@ -143,20 +152,64 @@ describe("describeIssueWriteDenial", () => {
       runContextReason: "no_context_source_and_target_unbound",
     });
     expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id header with your current run");
-    expect(copy.sanctionedPath).toContain("checkout");
     expect(copy.title).toContain("no task to attribute");
   });
 
   it("names the standing-watch config, because a watch owns no task to check out", () => {
-    // "Check out the task this run is working on" is unfollowable for
-    // the one role that hits this wall on purpose: a scheduled watch has no
-    // task, so the only sanctioned path it can actually take is the standing
-    // host issue, or it produces nothing on the board in silence.
+    // A scheduled watch has no task, so the standing host issue is the only
+    // sanctioned path it can actually take, or it produces nothing on the board
+    // in silence. That advice is orthogonal to the copy above and is kept: a
+    // standing host issue is a real task, and claiming one moves it to
+    // in_progress, which is what the operator asked for when they set it.
     const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
       runContextReason: "no_context_source_and_target_unbound",
     });
     expect(copy.sanctionedPath).toContain("standingWatchIssueId");
     expect(copy.description).toContain("no task by construction");
+  });
+
+  it("never routes a task-less run at a state-changing call", () => {
+    // The old copy answered this 403 with `POST /api/issues/<id>/checkout`
+    // and that was a trap, not advice. This 403 cannot see the target's status,
+    // and status is the whole question: the only task a task-less run has is a
+    // parked issue of its own, so following the instruction bound the run and
+    // moved that issue to in_progress -- destroying the review path (a real
+    // reviewer, a pending card) that made the issue worth reading. A denied
+    // write became a wrong state change. The recovery must need no state change.
+    // Stated over both reasons where the run itself resolved, so a future
+    // branch cannot quietly reintroduce an endpoint: the fall-through case used
+    // to name `POST /checkout`, and `terminal_status` is the one case where a
+    // checkout could never have worked at all.
+    for (const runContextReason of [
+      "no_context_source_and_target_unbound",
+      "terminal_status",
+    ] as const) {
+      const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+        runContextReason,
+      });
+      expect(copy.sanctionedPath).not.toContain("POST /api");
+    }
+  });
+
+  it("names the run's own output as the recovery, which costs no state change", () => {
+    // The refusal only has to be *recoverable*, and the run's own output is not
+    // a cross-issue write, so reporting there is free. A recovery that requires a
+    // binding call is what made the original advice a trap.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "no_context_source_and_target_unbound",
+    });
+    expect(copy.sanctionedPath).toContain("run's own output");
+    expect(copy.sanctionedPath).not.toContain("checkout");
+  });
+
+  it("warns that binding a run to a parked task moves it to in_progress", () => {
+    // The refusal is only safe if the agent knows why not to route around it, so
+    // the copy has to name the consequence rather than just withhold the endpoint.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "no_context_source_and_target_unbound",
+    });
+    expect(copy.sanctionedPath).toContain("in_progress");
+    expect(copy.sanctionedPath).toContain("in_review");
   });
 
   it("keeps the run-header fix for the reasons where the run really is absent", () => {

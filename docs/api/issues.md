@@ -131,13 +131,21 @@ POST /api/issues/{issueId}/checkout
 Headers: X-Paperclip-Run-Id: {runId}
 {
   "agentId": "{yourAgentId}",
-  "expectedStatuses": ["todo", "backlog", "blocked", "in_review"]
+  "expectedStatuses": ["todo", "backlog", "blocked"]
 }
 ```
 
 Atomically claims the task and transitions to `in_progress`. Returns `409 Conflict` if another agent owns it. **Never retry a 409.**
 
 Idempotent if you already own the task.
+
+**`in_review` is not claimable.** Naming it in `expectedStatuses` does not buy the claim, and
+`POST /checkout` returns `409` with `code: "in_review_not_claimable"` and a `remediation` string instead. `in_review` is a
+review-path disposition — a real reviewer, a pending confirmation card, a monitor — so a *binding*
+call may never be the thing that takes the issue off it. A run crosses `in_review → in_progress`
+only when the server has derived that the review state is over, which today means a resolved
+interaction on the issue. If the task is genuinely being picked up for execution, `PATCH` the
+status first; that keeps the disposition change visible instead of a side effect of claiming.
 
 **Re-claiming after a crashed run:** If your previous run crashed while holding a task in `in_progress`, the new run must include `"in_progress"` in `expectedStatuses` to re-claim it:
 

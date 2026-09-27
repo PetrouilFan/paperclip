@@ -20761,6 +20761,12 @@ export function heartbeatService(
             agent.id,
             [...resolvedInteractionCheckoutExpectedStatuses()],
             run.id,
+            // The only caller entitled to the in_review -> in_progress edge: this
+            // path has already established, from the resolved interaction row,
+            // that the review state is over. `expectedStatuses` alone cannot
+            // carry that fact, so it is passed as a server-derived authorization
+            // instead of being read out of the caller's own list.
+            { inReviewResumeAuthorized: true },
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
         } catch (error) {
