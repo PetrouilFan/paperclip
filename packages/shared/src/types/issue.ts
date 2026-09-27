@@ -257,9 +257,13 @@ export interface IssueBlockerDiagnosticsReadiness {
  *
  * `blockers` lists first-class dependency edges only. `blockerAttention`
  * aggregates more than that — tree holds and attention/watchdog relations
- * among them — so an issue can be held, refused every status change, and
- * still come back from this route with an empty `blockers` array. That is the
- * case this type exists to make visible.
+ * among them — so an issue can be held and still come back from this route
+ * with an empty `blockers` array. That is the case this type exists to make
+ * visible.
+ *
+ * It is an additional fact about the issue, not a modifier of `readiness`:
+ * the status transition gate reads first-class `blocks` edges only, so a hold
+ * counted here does not by itself make the server refuse a move.
  */
 export interface IssueBlockerDiagnosticsUnprojectedHold {
   /** Holds the server is enforcing that this projection does not model. */
@@ -274,9 +278,11 @@ export interface IssueBlockerDiagnosticsResponse {
   issue: IssueBlockerDiagnosticIssueSummary;
   diagnosis: string | null;
   /**
-   * `null` when the answer would be partial — truncated, partly outside the
-   * actor's authorization, or carrying an unprojected hold. It is never
-   * `isDependencyReady: true` for an issue the write path refuses to move.
+   * Will the server refuse a status transition on the strength of a dependency
+   * blocker? `null` when the visible blocker set is partial — truncated, or
+   * partly outside the actor's authorization — and never for a hold reported
+   * in `unprojectedHold`, which the transition gate does not read. See
+   * `IssueBlockerDiagnosticsUnprojectedHold`.
    */
   readiness: IssueBlockerDiagnosticsReadiness | null;
   blockers: IssueBlockerDiagnosticNode[];
