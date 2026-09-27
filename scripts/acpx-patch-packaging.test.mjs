@@ -170,38 +170,66 @@ test("published packages preserve the patched embedded-postgres runtime", () => 
 // patch with `patch -p1`, and the tarball carries the result. A patched
 // dependency that is a runtime dependency of a published package but is absent
 // from `bundleDependencies` is invisible to every registry consumer.
-test("a patched runtime dependency of a published package is bundled, so the patch can ship", () => {
-  const shippedInATarball = new Set([
-    ...(dbPackage.bundleDependencies ?? []),
-    ...(serverPackage.bundleDependencies ?? []),
-    ...(adapterUtilsPackage.bundleDependencies ?? []),
-    ...bundledCliNpmDependencies,
-  ]);
+//
+// `postgres` is the case this pull request fixed. The edges below are the same
+// defect in packages this pull request does not change, recorded rather than
+// left to be rediscovered: they are known, they are reviewed here, and they are
+// the reason a new unbundled patch must fail this test. Remove an entry only
+// when its patch is actually shipped or actually removed.
+const KNOWN_UNBUNDLED_PATCHED_EDGES = new Set([
+  "@paperclipai/adapter-claude-local -> @agentclientprotocol/claude-agent-acp",
+  "@paperclipai/adapter-codex-local -> @agentclientprotocol/codex-acp",
+]);
 
-  // Every patch whose package is a runtime dependency of a published package has
-  // to be one of the mechanisms above, or its patch is dead weight in
-  // production. Assert the shipped set explicitly so adding a patch forces a
-  // decision instead of silently shipping nothing.
-  for (const [specifier, patchPath] of Object.entries(rootPackage.pnpm.patchedDependencies)) {
-    const name = specifier.slice(0, specifier.lastIndexOf("@"));
-    const isRuntimeDependencyOfDb = name in (dbPackage.dependencies ?? {});
-    const isRuntimeDependencyOfServer = name in (serverPackage.dependencies ?? {});
-    const isRuntimeDependencyOfAdapterUtils = name in (adapterUtilsPackage.dependencies ?? {});
-    if (!isRuntimeDependencyOfDb && !isRuntimeDependencyOfServer && !isRuntimeDependencyOfAdapterUtils) {
-      continue;
+test("a patched runtime dependency of a published package is bundled, so the patch can ship", () => {
+  const publishedManifest = JSON.parse(
+    readFileSync(fileURLToPath(new URL("./release-package-manifest.json", import.meta.url)), "utf8"),
+  );
+  const patchedNames = new Set(
+    Object.keys(rootPackage.pnpm.patchedDependencies).map((specifier) =>
+      specifier.slice(0, specifier.lastIndexOf("@")),
+    ),
+  );
+
+  // The CLI bundle is a second way a patched copy ships, for a dependency that
+  // is not a `bundleDependencies` entry of any published package.
+  const cliBundled = new Set(bundledCliNpmDependencies);
+
+  const found = new Set();
+  for (const entry of publishedManifest) {
+    const packageJsonPath = fileURLToPath(new URL(`../${entry.dir}/package.json`, import.meta.url));
+    if (!existsSync(packageJsonPath)) continue;
+    const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    const bundled = new Set(pkg.bundleDependencies ?? []);
+    for (const name of Object.keys(pkg.dependencies ?? {})) {
+      if (!patchedNames.has(name) || bundled.has(name) || cliBundled.has(name)) continue;
+      const edge = `${pkg.name} -> ${name}`;
+      found.add(edge);
+      assert.equal(
+        KNOWN_UNBUNDLED_PATCHED_EDGES.has(edge),
+        true,
+        `${edge} is a patched runtime dependency of a published package but ships in no ` +
+          `tarball, so its patch never reaches a registry consumer. Add "${name}" to ` +
+          `"${pkg.name}" bundleDependencies, or, if the edge is already a recorded known ` +
+          `gap, add "${edge}" to KNOWN_UNBUNDLED_PATCHED_EDGES so the decision is reviewed.`,
+      );
     }
+  }
+
+  // A recorded gap that got fixed must be removed, so the list cannot become a
+  // place where resolved issues are forgotten.
+  for (const edge of KNOWN_UNBUNDLED_PATCHED_EDGES) {
+    assert.equal(found.has(edge), true, `${edge} is recorded as unbundled but no longer is; remove it from KNOWN_UNBUNDLED_PATCHED_EDGES`);
+  }
+  assert.ok(found.size > 0, "expected the recorded known gaps to still be present");
+});
+
+test("every configured patch file exists", () => {
+  for (const [specifier, patchPath] of Object.entries(rootPackage.pnpm.patchedDependencies)) {
     assert.equal(
       existsSync(fileURLToPath(new URL(`../${patchPath}`, import.meta.url))),
       true,
       `${specifier} names a patch that does not exist`,
-    );
-    assert.equal(
-      shippedInATarball.has(name),
-      true,
-      `${specifier} is a runtime dependency of a published package but is not in any ` +
-        `bundleDependencies or bundledCliNpmDependencies, so its patch never reaches a ` +
-        `registry consumer. Add "${name}" to the depending package's bundleDependencies, ` +
-        `or accept that the patch only applies to this workspace.`,
     );
   }
 });
