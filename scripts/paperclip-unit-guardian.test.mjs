@@ -291,3 +291,48 @@ test("the step 6b threshold fires when a majority of the cgroup is stopped", () 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("the step 6b ALERT reaches the log, not just the condition", () => {
+  // The test above proves the condition can be true. This one proves that being
+  // true results in the operator actually being told, by running the shipped
+  // threshold together with the shipped `log` call and nothing else. The two
+  // halves drifted apart once already: a threshold that could never be true left
+  // the ALERT text in the file, present for every text-based check to find and
+  // unreachable in practice.
+  const lines = script.split("\n");
+  const start = lines.findIndex((l) => l.includes('if [ "$total" -ge 8 ]'));
+  assert.ok(start >= 0, "could not find the step 6b threshold in the guardian");
+  const end = lines.findIndex((l, i) => i > start && l.trim() === "fi");
+  assert.ok(end > start, "the step 6b threshold has no closing fi");
+  const block = lines.slice(start, end + 1).join("\n");
+
+  const dir = mkdtempSync(join(tmpdir(), "guardian-6b-log-"));
+  const helper = join(dir, "block.sh");
+  // `log` is redefined rather than stubbed at the filesystem, so this stays a test
+  // of the shipped control flow with the one side effect observed.
+  writeFileSync(helper, `#!/usr/bin/env bash\nset -uo pipefail\nlog() { echo "LOGGED: $*"; }\nUNIT=paperclipai.service\nCG=/system.slice/user.slice/x\n${block.replace(/^ {4}/gm, "")}\n`);
+  try {
+    const run = (total, stopped) =>
+      spawnSync("bash", [helper], {
+        encoding: "utf8",
+        env: { ...process.env, total: String(total), stopped_total: String(stopped) },
+      });
+
+    const fired = run(10, 6);
+    assert.equal(fired.stderr, "", `step 6b wrote to stderr: ${fired.stderr.trim()}`);
+    assert.match(
+      fired.stdout,
+      /^LOGGED: ALERT 6 of 10 processes in \/system\.slice\/user\.slice\/x are stopped/m,
+      "a stopped majority must reach the log with both counts and the cgroup named",
+    );
+    // The advice line is the part a human acts on, so it has to survive too.
+    assert.match(fired.stdout, /--kill-whom=all --signal=SIGCONT/);
+    // And the count the operator reads must be the measured one, not a literal.
+    assert.match(fired.stdout, /6 of 10/);
+
+    assert.doesNotMatch(run(10, 5).stdout, /LOGGED/, "half is not a majority and must stay silent");
+    assert.doesNotMatch(run(7, 7).stdout, /LOGGED/, "below the floor of 8 it must stay silent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
