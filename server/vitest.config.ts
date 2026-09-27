@@ -16,6 +16,13 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
+    // Fixtures are not suites. `src/__tests__/fixtures/` holds programs a test
+    // spawns as a child process (a systemd probe harness, plugin worker stubs),
+    // and they must not be collected: several of them `process.exit()` at module
+    // top level, which would take the vitest worker down with them. The `include`
+    // above already excludes them by extension, so this makes the safety
+    // explicit instead of leaving it to a glob that a future edit could widen.
+    exclude: ["src/__tests__/fixtures/**"],
     // Each server suite boots + tears down its own embedded Postgres in
     // beforeAll/afterAll. Under the loaded serial shard (maxWorkers=1) the
     // graceful shutdown can occasionally cross vitest's default 10s hookTimeout,

@@ -257,7 +257,7 @@ describe("finalizeServerShutdown Sentry teardown", () => {
       stopEmbeddedPostgres: null,
       shutdownInstrumentation,
       shutdownSentry,
-      log: { info: vi.fn(), error: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     });
 
     expect(order).toEqual(["instrumentation", "sentry"]);

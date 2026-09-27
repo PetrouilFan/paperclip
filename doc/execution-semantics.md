@@ -1254,6 +1254,17 @@ turn finishes during shutdown, its release checkpoints the session before
 returning instead of leaving a new idle owner behind. If checkpointing fails,
 the retained state continues to block unverified reuse.
 
+That guarantee is bounded by the stop budget, not unconditional. The graceful run
+drain waits at most `resolveHeartbeatDrainBudgetMs()` — the unit's
+`TimeoutStopSec` minus a reserve for the teardown — and a run that outruns it is
+abandoned rather than awaited, so its release may never run. An abandoned run's
+output still reaches the run log through the in-flight run-log mirror flush that
+immediately follows, and its `running` row is left for the orphan reaper, which is
+the same place a SIGKILLed run leaves it. See the stop-budget section of
+`doc/DEVELOPING.md` for why the drain has to be bounded: an in-flight agent run
+can want an hour inside a five-minute stop budget, and a drain that overruns the
+budget is a cgroup-wide SIGKILL rather than a slow stop.
+
 ### Warm sandbox continuity
 
 A warm sandbox's shared workspace binding persists independently of the

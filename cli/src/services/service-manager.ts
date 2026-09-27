@@ -521,6 +521,25 @@ RestartMaxDelaySec=60
 # a measured boot on this host; boot duration is not the control plane's to
 # police, so the budget is generous rather than tuned.
 TimeoutStartSec=600
+# TimeoutStopSec is a shared budget that the server spends against, not a number
+# it can extend. The coordinated shutdown has to fit the notify, the scheduler
+# quiescence wait, the graceful agent-run drain, the listener close, the pool end,
+# the embedded postmaster stop, and the OTel/Sentry flushes inside it; anything it
+# overruns, systemd SIGKILLs cgroup-wide. So the server derives its own deadlines
+# from this value and holds back a reserve for the teardown — see the stop-budget
+# section of doc/DEVELOPING.md and resolveHeartbeatDrainBudgetMs in
+# server/src/shutdown.ts.
+#
+# The reserve is not optional politeness. adapter_config.timeoutSec is 3600 on
+# every opencode_local agent, so an unbounded graceful drain can want an hour
+# here, and a drain that overruns the budget is a guaranteed cgroup SIGKILL
+# rather than a slow stop.
+#
+# Lowering this value is therefore a coordinated change: lower
+# SHUTDOWN_STOP_BUDGET_MS and SHUTDOWN_STOP_RESERVE_MS in server/src/shutdown.ts
+# with it. server/src/__tests__/shutdown-stop-budget.test.ts parses this line and
+# fails if the two stop fitting together, so landing the reduction alone cannot
+# merge quietly.
 TimeoutStopSec=300
 # Only the server itself is signalled: the default KillMode=control-group
 # would SIGTERM detached local-agent runs and embedded PostgreSQL in the same

@@ -31,6 +31,29 @@ to READY=1.` **only** when a `STOPPING=1` is followed by a `READY=1` attempt. A
 that line is not evidence that no `STOPPING=1` arrived. This tool calls that
 state `silent` and reports it as its own class rather than guessing.
 
+### The middle row is no longer reachable from the control plane
+
+The table above is a property of systemd, not of the control plane, and it
+described a real failure: the server's coordinated shutdown is `void`-ed from the
+signal handler, so an await that never settles between the signal and
+`process.exit(0)` leaves the process alive inside a stop budget systemd is already
+counting. The 2026-09-27 stops show the result: the full `TimeoutStopSec`, then a
+cgroup-wide SIGKILL.
+
+That is fixed. `server/src/shutdown.ts` bounds every await on the path and arms an
+exit watchdog whose deadline is inside the stop budget, and the whole signature
+is now a test — `server/src/__tests__/notify-stop-hang-probe.test.ts` runs a
+throwaway `Type=notify` unit with `KillMode=control-group`, hangs one await at a
+time, and asserts the recorded outcome is an **exit** (`Result=success`,
+`ExecMainCode=0`) rather than a `timeout`. Reverting any one of the three bounds
+individually turns that arm back into a `Result=timeout` cgroup kill, which is how
+the test is known not to be vacuous. See the stop-budget section of
+`doc/DEVELOPING.md`.
+
+The table is kept because the tool is still the right instrument for the rows
+above and below it, and because a `Result=timeout` on a `notify` stop is now a
+**regression signal** rather than an explanation.
+
 ## What it produces
 
 `report` prints one line per stop in the journal window:
@@ -159,10 +182,15 @@ The two halves are separate changes, and the unit-side one has a precondition
 that is not met yet. The server sends its readiness datagram by running the
 `systemd-notify` binary as a child process: `server/src/index.ts` calls
 `systemdNotify(["--ready", ...])`, and `server/src/services/systemd-notify.ts`
-implements that with `execFile`. `NotifyAccess=main` accepts a datagram only from
-the unit's main process, so a child would be refused. The unit is
-`Type=notify`, so a refused `READY=1` means the unit never reaches `active` and
-sits out `TimeoutStartSec=600` before it is killed and restarted.
+implements that with `execFile`. The `execFile` is bounded — it carries a
+`timeout`, and the whole notify is additionally wrapped in a deadline that also
+covers resolving the binary, because an unbounded await on the notify path is
+what wedged the 2026-09-27 stops (see the section above). The bound is what makes
+the child survivable as a notifier; it does nothing for `NotifyAccess`.
+`NotifyAccess=main` accepts a datagram only from the unit's main process, so a
+child would be refused. The unit is `Type=notify`, so a refused `READY=1` means
+the unit never reaches `active` and sits out `TimeoutStartSec=600` before it is
+killed and restarted.
 
 Narrowing `NotifyAccess` therefore needs the notifier to send from the main
 process first. Until that happens, `NotifyAccess=all` is load-bearing and must

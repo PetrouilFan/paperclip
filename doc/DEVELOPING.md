@@ -275,6 +275,62 @@ When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eage
 snapshot and any required drain complete while the database is still available;
 the coordinated shutdown path stops embedded PostgreSQL afterward.
 
+## The stop budget
+
+`TimeoutStopSec=300` is a shared budget, not a number the server gets to spend.
+Everything the coordinated shutdown does — the notify, the scheduler quiescence
+wait, the graceful run drain, the listener close, the pool end, the embedded
+postmaster stop, the OTel and Sentry flushes — has to fit inside it, or systemd
+SIGKILLs the cgroup and takes the database and every in-flight run with it.
+
+That makes the budget an arithmetic constraint rather than a tuning knob, and it
+is enforced in `server/src/shutdown.ts`:
+
+- `SHUTDOWN_STOP_BUDGET_MS` mirrors the rendered `TimeoutStopSec`. The unit is
+  not readable from inside the process, so this is a mirror; it is kept honest by
+  `server/src/__tests__/shutdown-stop-budget.test.ts`, which parses
+  `cli/src/services/service-manager.ts` and fails if the two stop fitting
+  together. Lowering `TimeoutStopSec` without lowering the mirror and the reserve
+  is a test failure, not a slow stop.
+- `resolveHeartbeatDrainBudgetMs()` is the stop budget minus
+  `SHUTDOWN_STOP_RESERVE_MS` (60 s for the teardown). The graceful run drain waits
+  on an in-flight agent run, and `adapter_config.timeoutSec` is 3600 on every
+  `opencode_local` agent — so an unbounded drain can want an hour inside a
+  five-minute budget, which makes a healthy shutdown impossible and guarantees the
+  cgroup SIGKILL. A run that outruns the budget is abandoned rather than awaited;
+  its output reaches the run log through `flushInFlightRunLogMirrors()`, which runs
+  immediately afterwards.
+- The scheduler quiescence wait is capped at `SHUTDOWN_SCHEDULER_IDLE_TIMEOUT_MS`
+  (10 s), taken out of the reserve rather than added to it. Its tracked work is
+  DB-backed — six execution-control sweeps among it — and nothing in a shutdown
+  can force a query already in flight on a dying database to return. When the
+  wait gives up it names the sweeps it abandoned, because that log line is the
+  only record a truncated drain leaves.
+- `startShutdownExitWatchdog()` is armed before the first await and disarmed once
+  the ordered teardown completes. Its deadline is *larger* than the two bounded
+  waits it guards (arming it below the run-drain budget would turn a slow stop
+  into the SIGKILL it exists to prevent) and still inside the stop budget, so the
+  exit it produces is the server's own `exit(0)` and systemd records a clean exit
+  rather than a timeout. It is a backstop for the awaits nobody has found yet, not
+  a substitute for the bounds above.
+
+`shutdown()` is `void`-ed from the signal handler, so nothing observes its promise.
+That is the whole reason every one of these is bounded: an await that never
+settles is not a slow shutdown, it is a unit that is billed the full
+`TimeoutStopSec` and then SIGKILLed cgroup-wide, with no signal ever delivered
+and no `Stopping <unit>` job line ever logged. The scheduler latch
+(`heartbeatSchedulerStopped`) is set *before* the `STOPPING=1` notify rather than
+after it, because a latch set after an await that never returns is a latch that
+never gets set — and an unlatched scheduler keeps enqueueing runs against a unit
+that is already stopping. `server/src/__tests__/notify-stop-hang-probe.test.ts`
+reproduces the whole thing against a real systemd user manager, one arm per await,
+and asserts the recorded *reason* is an exit rather than a timeout.
+
+Note that the generated unit pairs this ordering with `KillMode=process` (below),
+so the SIGKILL a hung stop would have caused is narrower here than the
+`control-group` case the probe exercises. The fix is not conditional on that: the
+budget has to hold either way.
+
 The generated systemd unit pairs with that ordering: it emits `KillMode=process`
 so a supervisor stop signals only the Paperclip server, not every process in the
 cgroup. With the systemd default `control-group`, `systemctl stop`/`restart`
