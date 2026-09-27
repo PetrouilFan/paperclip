@@ -117,6 +117,7 @@ describe("buildMonitorSurfaceCopy", () => {
     const copy = buildMonitorSurfaceCopy(
       derived({
         state: "suspended",
+        suspendedReason: "host_status",
         nextCheckAt: new Date(NOW.getTime() + 2 * 60 * 60_000).toISOString(),
         attemptCount: 9,
         serviceName: "model-liveness-probe",
@@ -134,6 +135,47 @@ describe("buildMonitorSurfaceCopy", () => {
     expect(copy!.bannerMeta.join(" ")).toMatch(/cannot run/i);
     expect(copy!.bannerMeta).toContain("Attempt 9");
     expect(copy!.bannerMeta).toContain("Watching: model-liveness-probe");
+  });
+
+  it("names the assignee as the unblock when that is what is holding the watch", () => {
+    // `issueMonitorSuspensionReason` gives the assignee precedence, so a held
+    // issue with nobody to run it reports `host_assignee`. Telling the operator
+    // to move the issue back to in progress would send them to the wrong control
+    // — it would not start until an agent is assigned.
+    const copy = buildMonitorSurfaceCopy(
+      derived({
+        state: "suspended",
+        suspendedReason: "host_assignee",
+        nextCheckAt: new Date(NOW.getTime() + 2 * 60 * 60_000).toISOString(),
+        attemptCount: 9,
+      }),
+      NOW,
+    );
+
+    expect(copy!.bannerTitle).toBe("Monitor paused — no agent is assigned to run it");
+    expect(copy!.stripTitle).toBe("Monitor paused");
+    const text = copy!.bannerMeta.join(" ");
+    expect(text).toMatch(/assign an agent/i);
+    expect(text).not.toMatch(/back in progress/i);
+    expect(copy!.stripMeta.join(" ")).toMatch(/assign an agent/i);
+    expect(text).not.toMatch(/resumes in|overdue by|due now/i);
+  });
+
+  it("says the watch is paused without inventing a cause it was not given", () => {
+    // A payload can report `suspended` without naming a reason. Naming a cause
+    // anyway is the defect this replaced.
+    const copy = buildMonitorSurfaceCopy(
+      derived({ state: "suspended", nextCheckAt: new Date(NOW.getTime() + 2 * 60 * 60_000).toISOString() }),
+      NOW,
+    );
+
+    expect(copy!.bannerTitle).toBe("Monitor paused");
+    expect(copy!.stripTitle).toBe("Monitor paused");
+    expect(copy!.tone).toBe("warning");
+    expect(copy!.checkNowRejected).toBe(true);
+    const text = copy!.bannerMeta.join(" ");
+    expect(text).toMatch(/cannot run/i);
+    expect(text).not.toMatch(/assign an agent|back in progress/i);
   });
 
   it("hides both surfaces when cleared, none, or without a next check", () => {

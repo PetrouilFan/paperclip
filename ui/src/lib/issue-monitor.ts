@@ -1,4 +1,9 @@
 import { useEffect, useState } from "react";
+import {
+  issueMonitorSuspensionReason,
+  type IssueExecutionMonitorStateStatus,
+  type IssueExecutionMonitorSuspendedReason,
+} from "@paperclipai/shared";
 
 const SECOND_MS = 1_000;
 const MINUTE_MS = 60 * SECOND_MS;
@@ -12,7 +17,10 @@ type MonitorDetails = {
   nextCheckAt?: MonitorDate | null;
   attemptCount?: number | null;
   serviceName?: string | null;
-  status?: "scheduled" | "suspended" | "triggered" | "cleared" | null;
+  // The enum, not a copy of it: a member added server-side and missed here
+  // would read as "no status" and quietly take the fallback path below.
+  status?: IssueExecutionMonitorStateStatus | null;
+  suspendedReason?: IssueExecutionMonitorSuspendedReason | null;
 };
 
 type MonitorPolicy = {
@@ -28,6 +36,8 @@ type ScheduledRetry = {
 
 export interface MonitorIssueLike {
   status?: string;
+  assigneeAgentId?: string | null;
+  assigneeUserId?: string | null;
   executionState?: { monitor?: MonitorDetails | null } | null;
   executionPolicy?: { monitor?: MonitorPolicy | null } | null;
   monitorNextCheckAt?: MonitorDate | null;
@@ -50,6 +60,13 @@ export interface DerivedMonitorState {
   nextCheckAt: MonitorDate | null;
   attemptCount: number;
   serviceName: string | null;
+  /**
+   * Why the watch cannot fire. Present only on `suspended`, and only ever
+   * carried through from the server's projection or derived from the same shared
+   * predicate the server uses — the board never names a cause it has not been
+   * told.
+   */
+  suspendedReason?: IssueExecutionMonitorSuspendedReason;
 }
 
 export interface MonitorDateTimeFormatOptions {
@@ -175,14 +192,41 @@ export function formatMonitorAbsoluteFull(
 }
 
 /**
- * The statuses a monitor can actually dispatch from, matching the server. An
- * absent status is treated as runnable: a read that did not project one is not
- * evidence that the watch is held, and wrongly suspending it would replace a
- * working countdown with a false alarm.
+ * The server is the only authority on whether a watch can fire, and it says so
+ * in the payload: `projectIssueMonitorSuspension` downgrades a stored `scheduled`
+ * to `suspended` when the host issue cannot dispatch it, and names the reason.
+ * That verdict is taken as given — a payload that says `suspended` is suspended,
+ * even if the row it arrived on looks runnable.
+ *
+ * The fallback below exists for the reads the projection does not cover — list
+ * rows, relation summaries, activity rows — where the stored value is all the
+ * client has. It is the same predicate the server uses, imported rather than
+ * re-spelled: a client-local copy that only checked `issue.status` was a strict
+ * subset of the server's answer and silently missed the whole `host_assignee`
+ * half, which is the case the reported bug was.
+ *
+ * A read that projects nothing is not evidence that the watch is held, so an
+ * absent issue status yields no suspension — wrongly pausing a working countdown
+ * would be its own false alarm.
  */
-function monitorCanRunFrom(status: MonitorIssueLike["status"]): boolean {
-  if (status == null) return true;
-  return status === "in_progress" || status === "in_review";
+function monitorIsSuspended(issue: MonitorIssueLike, runtimeMonitor: MonitorDetails | null): boolean {
+  if (runtimeMonitor?.status === "suspended") return true;
+  if (issue.status == null) return false;
+  return issueMonitorSuspensionReason(issue.status, issue.assigneeAgentId, issue.assigneeUserId) !== null;
+}
+
+/**
+ * Only ever the server's word, or the shared predicate's — never a third guess.
+ * A payload that reports `suspended` without a reason still gets the state, and
+ * the surface copy falls back to wording that names no cause.
+ */
+function suspensionReasonFor(
+  issue: MonitorIssueLike,
+  runtimeMonitor: MonitorDetails | null,
+): IssueExecutionMonitorSuspendedReason | undefined {
+  if (runtimeMonitor?.suspendedReason) return runtimeMonitor.suspendedReason;
+  if (issue.status == null) return undefined;
+  return issueMonitorSuspensionReason(issue.status, issue.assigneeAgentId, issue.assigneeUserId) ?? undefined;
 }
 
 export function deriveMonitorState(issue: MonitorIssueLike, now: MonitorDate = new Date()): DerivedMonitorState {
@@ -215,13 +259,16 @@ export function deriveMonitorState(issue: MonitorIssueLike, now: MonitorDate = n
     return { state: "cleared", source, nextCheckAt, attemptCount, serviceName };
   }
 
-  // An armed monitor cannot dispatch from `todo` or `blocked`, and the server
-  // refuses those statuses. Without this the banner counts an overdue watch on a
-  // held issue as healthy — a countdown to a check that will never fire, which
-  // reads as "nothing to report". The cadence is still intact, so this clears
-  // itself as soon as the issue returns to in_progress or in review.
-  if (issue.status != null && hasMonitor && !monitorCanRunFrom(issue.status)) {
-    return { state: "suspended", source, nextCheckAt, attemptCount, serviceName };
+  // An armed monitor cannot dispatch from a held issue, and the server says so
+  // rather than leaving the board to re-derive it. Without this the banner counts
+  // an overdue watch on a held issue as healthy — a countdown to a check that
+  // will never fire, which reads as "nothing to report". The cadence is still
+  // intact, so this clears itself as soon as the issue becomes runnable again.
+  if (hasMonitor && monitorIsSuspended(issue, runtimeMonitor)) {
+    const suspendedReason = suspensionReasonFor(issue, runtimeMonitor);
+    return suspendedReason
+      ? { state: "suspended", source, nextCheckAt, attemptCount, serviceName, suspendedReason }
+      : { state: "suspended", source, nextCheckAt, attemptCount, serviceName };
   }
 
   if (!hasMonitor && !retryIsScheduled) {

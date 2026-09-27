@@ -565,10 +565,14 @@ export type IssueExecutionStateStatus = (typeof ISSUE_EXECUTION_STATE_STATUSES)[
 /**
  * `suspended` is not a cleared monitor. A cleared monitor was torn down; a
  * suspended one is still armed (`monitorNextCheckAt` intact) but its host issue
- * is in a status no monitor can dispatch from, so the cadence is preserved and
+ * is in a state no monitor can dispatch from, so the cadence is preserved and
  * fires the moment the issue becomes runnable again. Without this state the
  * board reads `scheduled` for a watch that has stopped, and the absence of a
  * signal is indistinguishable from a healthy one.
+ *
+ * Only the read side produces `suspended` — it is derived from the host issue,
+ * not stored. The predicate behind it, and the set of stored statuses that mean
+ * "a live watch is here", live in `./issue-monitor-suspension.ts`.
  */
 export const ISSUE_EXECUTION_MONITOR_STATE_STATUSES = [
   "scheduled",

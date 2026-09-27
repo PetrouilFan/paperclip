@@ -68,6 +68,45 @@ function serviceLabelFor(derived: DerivedMonitorState): string | null {
 }
 
 /**
+ * Why a held watch is held, in the operator's terms.
+ *
+ * `issueMonitorSuspensionReason` gives the assignee precedence over the status,
+ * so the two causes have different unblocks and the copy must not collapse them.
+ * Telling someone to move the issue back to in progress when the real blocker is
+ * that nothing is assigned to run it sends them to the wrong control.
+ */
+function suspensionCopy(
+  reason: DerivedMonitorState["suspendedReason"],
+): { bannerTitle: string; stripTitle: string; bannerLine: string; stripLine: string } | null {
+  if (reason === "host_assignee") {
+    return {
+      bannerTitle: "Monitor paused — no agent is assigned to run it",
+      stripTitle: "Monitor paused",
+      bannerLine:
+        "The issue is not assigned to an agent, so the scheduled check has nobody to run it. Assign an agent and the check resumes on its own.",
+      stripLine: "The scheduled check has no agent to run it. Assign an agent to resume it.",
+    };
+  }
+  if (reason === "host_status") {
+    return {
+      bannerTitle: "Monitor paused — this issue is not runnable",
+      stripTitle: "Monitor paused",
+      bannerLine:
+        "The issue is blocked or not started, so the scheduled check cannot run. It starts again on its own once the issue is back in progress.",
+      stripLine: "The scheduled check cannot run while the issue is held.",
+    };
+  }
+  // No reason in hand — the payload said `suspended` without naming a cause. Say
+  // the watch is paused and stop there rather than guessing at the unblock.
+  return {
+    bannerTitle: "Monitor paused",
+    stripTitle: "Monitor paused",
+    bannerLine: "The scheduled check cannot run while the issue is held.",
+    stripLine: "The scheduled check cannot run while the issue is held.",
+  };
+}
+
+/**
  * Pure copy builder shared by the banner and the composer strip so both
  * surfaces render one consistent copy system (see wireframe 04). Kept free of
  * hooks/`Date.now()` so it is deterministic under test.
@@ -98,18 +137,20 @@ export function buildMonitorSurfaceCopy(
 
   if (derived.state === "suspended") {
     // A held issue cannot run its monitor, so every countdown here is a promise
-    // the server will not keep. Say that instead of naming a resume time.
+    // the server will not keep. Say that instead of naming a resume time — and
+    // name the actual blocker, which is not always the issue's status.
+    const copy = suspensionCopy(derived.suspendedReason)!;
     return {
-      bannerTitle: "Monitor paused — this issue is not runnable",
-      stripTitle: "Monitor paused",
+      bannerTitle: copy.bannerTitle,
+      stripTitle: copy.stripTitle,
       bannerMeta: [
-        "The issue is blocked or not started, so the scheduled check cannot run. It starts again on its own once the issue is back in progress.",
+        copy.bannerLine,
         `${absolute} (your time)`,
         attemptLabel,
         serviceLabel,
       ].filter((piece): piece is string => Boolean(piece)),
       stripMeta: [
-        "The scheduled check cannot run while the issue is held.",
+        copy.stripLine,
         absolute,
         attemptLabel,
         serviceLabel,

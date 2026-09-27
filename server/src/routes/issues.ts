@@ -298,7 +298,6 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
-  issueMonitorSuspensionReason,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   projectIssueMonitorSuspension,
@@ -2439,9 +2438,18 @@ async function assertCanManageIssueMonitor(
   );
 }
 
+/**
+ * Activity-log and staleness summary of an issue's monitor. `status` is
+ * required, not optional: the suspension predicate reads it, and a `?? ""`
+ * fallback reads as "held, no agent" for a watch that is perfectly healthy.
+ * There is deliberately no `status` / `suspendedReason` in the *result* — no
+ * caller reads them, and emitting a second copy of the projection invites a
+ * consumer to trust it as a second source of truth. The read projection for that
+ * is `projectIssueMonitorSuspension`.
+ */
 function summarizeIssueMonitor(
   issue: {
-    status?: string;
+    status: string;
     assigneeAgentId?: string | null;
     assigneeUserId?: string | null;
     monitorNextCheckAt?: Date | null;
@@ -2454,17 +2462,6 @@ function summarizeIssueMonitor(
   policy: NormalizedExecutionPolicy | null,
 ) {
   const state = parseIssueExecutionState(issue.executionState);
-  // A stored `scheduled` is a snapshot from arming time. If the issue has since
-  // been pinned to a status no monitor dispatches from, reporting it unchanged
-  // tells the board a healthy cadence for a watch that has stopped. Downgrade to
-  // `suspended` and keep the cadence, so the read is honest and the overdue
-  // slot still fires once the issue becomes runnable again.
-  const suspendedReason = issueMonitorSuspensionReason(
-    issue.status ?? "",
-    issue.assigneeAgentId ?? null,
-    issue.assigneeUserId ?? null,
-  );
-  const storedStatus = state?.monitor?.status ?? (policy?.monitor ? "scheduled" : null);
   return {
     nextCheckAt:
       issue.monitorNextCheckAt?.toISOString() ??
@@ -2497,10 +2494,7 @@ function summarizeIssueMonitor(
       policy?.monitor?.maxAttempts ?? state?.monitor?.maxAttempts ?? null,
     recoveryPolicy:
       policy?.monitor?.recoveryPolicy ?? state?.monitor?.recoveryPolicy ?? null,
-    status:
-      storedStatus === "scheduled" && suspendedReason ? "suspended" : storedStatus,
     clearReason: state?.monitor?.clearReason ?? null,
-    suspendedReason: storedStatus === "scheduled" ? suspendedReason : null,
   };
 }
 

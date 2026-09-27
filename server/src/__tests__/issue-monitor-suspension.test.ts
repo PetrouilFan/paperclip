@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { issueMonitorSuspensionReason } from "@paperclipai/shared";
 import {
-  issueMonitorSuspensionReason,
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   projectIssueMonitorSuspension,
 } from "../services/issue-execution-policy.ts";
@@ -160,5 +162,59 @@ describe("projectIssueMonitorSuspension", () => {
   it("passes through an issue with no monitor state at all", () => {
     const none = issue({ executionState: executionStateWith(null) });
     expect(projectIssueMonitorSuspension(none)).toBe(none.executionState);
+  });
+});
+
+/**
+ * PR #126 claimed "a read projection is used rather than a write, so no predicate
+ * that reads the stored column changes behaviour". That was false:
+ * `derivePersistedMonitorState` computed the same `suspended` value on a *write*
+ * path, and `applyMonitorTransition` persisted it whenever a stage transition
+ * happened to produce an `executionState` while neither the incoming nor the
+ * previous policy carried a monitor. The claim is what three readers of the
+ * stored column were entitled to believe, so it is worth a test rather than a
+ * commit message.
+ */
+describe("the stored monitor status", () => {
+  const reviewPolicy = normalizeIssueExecutionPolicy({
+    stages: [{ type: "review", participants: [{ type: "agent", agentId: "22222222-2222-4222-8222-222222222222" }] }],
+  })!;
+
+  /** A stage transition that yields an `executionState` patch, with no monitor in either policy. */
+  function stageTransitionOn(heldIssue: Record<string, unknown>) {
+    return applyIssueExecutionPolicyTransition({
+      issue: {
+        ...heldIssue,
+        executionPolicy: reviewPolicy,
+      } as Parameters<typeof applyIssueExecutionPolicyTransition>[0]["issue"],
+      policy: reviewPolicy,
+      previousPolicy: reviewPolicy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: agentId },
+      commentBody: "The external check came back clean",
+    });
+  }
+
+  it.each([
+    ["host_status", { status: "blocked" }],
+    ["host_assignee", { status: "in_progress", assigneeAgentId: null, assigneeUserId: userId }],
+  ])("stays `scheduled` for a held issue (%s) while the read projects `suspended`", (reason, held) => {
+    const heldIssue = issue(held);
+    const { patch } = stageTransitionOn(heldIssue as unknown as Record<string, unknown>);
+
+    // The write path records the cadence. It does not record a second,
+    // independently derived copy of the projection.
+    const stored = parseIssueExecutionState(patch.executionState as never);
+    expect(stored?.monitor?.status).toBe("scheduled");
+    expect(stored?.monitor?.suspendedReason).toBeNull();
+    // …and the cadence is intact, so the overdue slot still fires.
+    expect(stored?.monitor?.nextCheckAt).toBe(nextCheckAt);
+
+    const projected = parseIssueExecutionState(
+      projectIssueMonitorSuspension({ ...heldIssue, ...held } as Parameters<typeof projectIssueMonitorSuspension>[0]),
+    );
+    expect(projected?.monitor?.status).toBe("suspended");
+    expect(projected?.monitor?.suspendedReason).toBe(reason);
   });
 });

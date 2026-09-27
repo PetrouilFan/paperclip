@@ -1,5 +1,6 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { ISSUE_EXECUTION_MONITOR_LIVE_STATUSES } from "@paperclipai/shared";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 
 /** Both run finalization and provider publication can arrive first. Re-read
@@ -26,7 +27,7 @@ export async function settleSlackConversation(db: Db, companyId: string, issueId
       ["pending", "changes_requested"].includes(String(issue.executionState?.status))) return false;
     const monitor = issue.executionState?.monitor;
     if (monitor && typeof monitor === "object" && "status" in monitor &&
-      ["scheduled", "triggered"].includes(String(monitor.status))) return false;
+      (ISSUE_EXECUTION_MONITOR_LIVE_STATUSES as readonly unknown[]).includes(monitor.status)) return false;
     const [run] = await tx.select().from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId),
         sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId', ${heartbeatRuns.nativeIssueId}::text) = ${issueId}`))

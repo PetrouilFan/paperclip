@@ -4,14 +4,18 @@ import type {
   IssueExecutionMonitorClearReason,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorState,
-  IssueExecutionMonitorSuspendedReason,
   IssueExecutionPolicy,
   IssueExecutionStage,
   IssueExecutionStagePrincipal,
   IssueExecutionState,
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
-import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
+import {
+  issueAllowsMonitor,
+  issueExecutionPolicySchema,
+  issueExecutionStateSchema,
+  issueMonitorSuspensionReason,
+} from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 
 type AssigneeLike = {
@@ -178,18 +182,20 @@ function derivePersistedMonitorState(input: {
   const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
 
   if (nextCheckAt) {
-    // An armed monitor whose host issue cannot dispatch it reads `suspended`,
-    // not `scheduled`. Only the issue-transition path clears a monitor for an
-    // invalid status; a direct status write (execution-recovery settling a dead
-    // run) bypasses it and used to leave the cadence claiming `scheduled` while
-    // both `triggerIssueMonitor` and `tickDueIssueMonitors` refused to fire.
-    const suspendedReason = issueMonitorSuspensionReason(
-      input.issue.status,
-      input.issue.assigneeAgentId ?? null,
-      input.issue.assigneeUserId ?? null,
-    );
+    // The stored status records the *cadence*, not whether the host issue can
+    // currently dispatch it. An armed monitor is `scheduled` even when
+    // `issueMonitorSuspensionReason` has an answer, because suspension is a
+    // read projection — `projectIssueMonitorSuspension` owns the `suspended`
+    // vocabulary and derives it from the same predicate.
+    //
+    // Persisting it here instead was a second, independent implementation of
+    // that derivation on a write path, and it made the stored column a fourth
+    // thing for "is there a live watch?" readers to classify. Those readers
+    // (`externalConversationStateSql`, `hasLiveMonitoredWatch`,
+    // `settleSlackConversation`) all default to "no monitor", which is the
+    // unsafe direction for a row whose `monitor_next_check_at` is still armed.
     return {
-      status: suspendedReason ? "suspended" : "scheduled",
+      status: "scheduled",
       nextCheckAt,
       lastTriggeredAt,
       attemptCount,
@@ -198,7 +204,7 @@ function derivePersistedMonitorState(input: {
       ...metadata,
       clearedAt: null,
       clearReason: null,
-      suspendedReason,
+      suspendedReason: null,
     };
   }
 
@@ -287,10 +293,6 @@ function buildClearedMonitorState(input: {
   };
 }
 
-function issueAllowsMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
-  return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review");
-}
-
 function monitorClearReasonForIssue(
   status: string,
   assigneeAgentId: string | null,
@@ -303,26 +305,6 @@ function monitorClearReasonForIssue(
     return "invalid_status";
   }
   return null;
-}
-
-/**
- * Why an armed monitor cannot dispatch from the issue's current shape, or null
- * when it can.
- *
- * The set of statuses that qualify is exactly what `triggerIssueMonitor` and
- * `tickDueIssueMonitors` dispatch from. Terminal statuses are excluded because
- * they are a *cleared* monitor, not a suspended one — `monitorClearReasonForIssue`
- * already owns that vocabulary, and calling a torn-down watch "suspended" would
- * make the two indistinguishable.
- */
-export function issueMonitorSuspensionReason(
-  status: string,
-  assigneeAgentId: string | null,
-  assigneeUserId: string | null,
-): IssueExecutionMonitorSuspendedReason | null {
-  if (status === "done" || status === "cancelled") return null;
-  if (issueAllowsMonitor(status, assigneeAgentId, assigneeUserId)) return null;
-  return assigneeUserId || !assigneeAgentId ? "host_assignee" : "host_status";
 }
 
 function parseMonitorDate(value: string | null | undefined) {
@@ -1209,10 +1191,12 @@ export function buildInitialIssueMonitorFields(input: {
 }
 
 /**
- * Read-side projection for the client-facing issue payload.
+ * The only place `suspended` is produced. `suspended` is a read projection, not
+ * a stored value: the column records the cadence (`scheduled`), and whether that
+ * cadence can currently fire is a fact about the host issue, re-derived per read.
  *
  * A stored `monitor.status = "scheduled"` is a snapshot taken when the watch was
- * armed. Any write that moves the host issue into a status no monitor dispatches
+ * armed. Any write that moves the host issue into a state no monitor dispatches
  * from — most often `execution-recovery` settling a dead run and pinning
  * `executionBlocker` straight onto the row — leaves that snapshot untouched, and
  * every consumer then reads a healthy cadence for a watch that has stopped.
@@ -1245,7 +1229,8 @@ export function buildIssueMonitorTriggeredPatch(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
   triggeredAt: Date;
-}) {  const existingState = parseIssueExecutionState(input.issue.executionState);
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentMonitorState = derivePersistedMonitorState({
     issue: input.issue,
     state: existingState,
