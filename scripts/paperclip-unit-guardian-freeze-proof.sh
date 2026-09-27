@@ -145,6 +145,65 @@ grep -q "RefuseManualStop=yes does NOT block" "$PROBE_STATE/guardian.log" \
 systemctl --user kill --kill-whom=all --signal=SIGCONT "$U2" 2>/dev/null
 sleep 0.5
 rm -f "$D/$U2"; rmdir "$D/$U2.d" 2>/dev/null; systemctl --user daemon-reload
+
+# --- Leg 5: step 6b must actually fire. It did not, for its whole life.
+#     Found by PET-470 on 2026-09-27: the third test in the 6b condition was
+#     missing its closing bracket, so the `if` was a syntax error on every run,
+#     the branch was never taken, and the residual-gap ALERT had never once been
+#     printed. `bash -n` does not catch it -- a missing `]` inside a command
+#     substitution is a runtime error, not a parse error -- and nothing asserted
+#     the branch, so it shipped broken in ef372182b. A detector nobody has ever
+#     seen fire is not a detector.
+echo "== leg 5: step 6b fires on a freeze that spared the main PID =="
+U5=pet452-heal.service
+# 6b needs >= 8 processes in the cgroup with more than half of them stopped, so
+# the probe forks children rather than running a single process.
+cat > "$D/$U5" <<'UNIT'
+[Unit]
+Description=guardian 6b residual-gap probe
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash -c "for i in $(seq 1 9); do (while true; do sleep 30; done) & done; echo ready; while true; do sleep 0.2; done"
+Restart=always
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable "$U5" >/dev/null 2>&1
+# Leg 2 left a pet452-heal.service running, and `start` on a running unit is a
+# no-op -- so without this the probe below would keep serving leg 2's
+# single-process fixture and 6b could never reach its 8-process floor.
+systemctl --user kill --kill-whom=all --signal=SIGCONT "$U5" 2>/dev/null
+systemctl --user stop "$U5" 2>/dev/null
+systemctl --user start "$U5" >/dev/null
+sleep 0.5
+MP5=$(systemctl --user show "$U5" -p MainPID --value)
+CG5=$(systemctl --user show "$U5" -p ControlGroup --value)
+TOTAL5=$(cat "/sys/fs/cgroup$CG5/cgroup.procs" 2>/dev/null | wc -l)
+[ "$TOTAL5" -ge 8 ] || bad "the 6b probe needs >= 8 processes to be meaningful, got $TOTAL5"
+# Stop every process but the main PID: the exact shape 6b exists to catch.
+for cpid in $(cat "/sys/fs/cgroup$CG5/cgroup.procs" 2>/dev/null); do
+  [ "$cpid" = "$MP5" ] && continue
+  kill -STOP "$cpid" 2>/dev/null
+done
+sleep 0.3
+case "$(stat_of "$MP5")" in *T*) bad "the main PID should still be running for this leg" ;; esac
+: > "$PROBE_STATE/guardian.log"
+"$SCRATCH/guardian-probe.sh" >/dev/null 2>&1
+sleep 0.2
+grep -q 'are stopped while the main PID is not' "$PROBE_STATE/guardian.log" \
+  && ok "6b counted the freeze and told a human to finish it by hand" \
+  || bad "6b did NOT fire; this is the exact regression leg 5 exists to catch. log: $(cat "$PROBE_STATE/guardian.log")"
+grep -q 'systemctl --user kill --kill-whom=all --signal=SIGCONT' "$PROBE_STATE/guardian.log" \
+  && ok "the ALERT names the one-line recovery command" \
+  || bad "the 6b ALERT does not name a recovery command"
+# And the restraint must hold: 6b counts, it does not signal.
+grep -qE 'sending SIGCONT to main PID|RESUMED main PID' "$PROBE_STATE/guardian.log" \
+  && bad "6b swept the cgroup; its documented detection-only restraint did not hold" \
+  || ok "6b did not signal, as documented"
+systemctl --user kill --kill-whom=all --signal=SIGCONT "$U5" 2>/dev/null
+sleep 0.5
+rm -f "$D/$U5"; rmdir "$D/$U5.d" 2>/dev/null; systemctl --user daemon-reload
 echo
 [ "$fail" -eq 0 ] && echo "ALL LEGS PASS" || echo "SOME LEGS FAILED"
 exit "$fail"

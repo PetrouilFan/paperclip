@@ -238,3 +238,58 @@ test("the golden-copy alert fires once per change, not once a minute", () => {
   // ...and clears its marker once the gap is closed, so a recurrence alerts again.
   assert.match(script, /elif \[ -f "\$UNPROTECTED_SEEN" \]; then\n\s+rm -f "\$UNPROTECTED_SEEN"/);
 });
+
+test("every shell test in the guardian has balanced brackets", () => {
+  // Found by PET-470 on 2026-09-27, and it is the reason this test exists.
+  // Step 6b's condition was written as
+  //     [ "$stopped_total" -gt $(( total / 2 )); then
+  // -- the closing `]` is missing. `bash -n` accepts it, because an unterminated
+  // `[` is a runtime error and not a parse error, so it shipped in ef372182b
+  // and the branch was never taken on any host, ever. The residual-gap ALERT had
+  // never once been printed by a real guardian.
+  //
+  // It survived because the tests above are source-text assertions: step 6b's
+  // dead condition still contained the literal string `stopped_total`, so
+  // assert.match passed. A test that only asks whether the code mentions a
+  // variable cannot tell live code from dead code.
+  //
+  // Counted as whitespace-separated tokens after blanking quoted strings, which is
+  // exact for this script's `[`/`]` style: a test delimiter is always its own
+  // token, while `$((` and `))` never are. Counting raw characters would count the
+  // parens inside `$(( total / 2 ))` and every arithmetic expansion in the file.
+  const offenders = [];
+  for (const [i, line] of script.split("\n").entries()) {
+    const code = line.replace(/"[^"]*"/g, '""').split("#")[0];
+    const tokens = code.split(/\s+/).filter(Boolean);
+    // A `[` always starts its token; a `]` always ends one, so `]; then` is the
+    // token `];` and still counts as a close.
+    const opens = tokens.filter((t) => t.startsWith("[")).length;
+    if (opens === 0) continue; // not a test line
+    const closes = tokens.filter((t) => t.startsWith("]")).length;
+    if (opens !== closes) {
+      offenders.push(`line ${i + 1}: ${opens} '[' vs ${closes} ']' -- ${line.trim()}`);
+    }
+  }
+  assert.deepEqual(offenders, [], `unbalanced shell tests would silently never run:\n${offenders.join("\n")}`);
+});
+
+test("the residual-gap branch is reachable shell, not just present text", () => {
+  // The 6b condition, evaluated for real. Values clear every floor: 20 processes,
+  // 19 stopped, main PID running -- the shape the live incident had when only the
+  // postgres backends were frozen. This is the assertion the text match above
+  // could never make: it proves the branch fires, not that it is spelled.
+  const cond = /if \[ "\$total" -ge 8 \] && \[ "\$stopped_total" -ge 4 \] && \[ "\$stopped_total" -gt \$\(\( total \/ 2 \)\) \]; then/;
+  const m = script.match(cond);
+  assert.ok(m, "6b's condition is not the balanced form this test can execute");
+  const extracted = m[0].replace(/^if /, "").replace(/; then$/, "");
+  const fires = spawnSync("bash", ["-c", `total=20; stopped_total=19; if ${extracted}; then echo FIRES; fi`], {
+    encoding: "utf8",
+  });
+  assert.equal(fires.status, 0, `6b's condition does not even parse: ${fires.stderr}`);
+  assert.match(fires.stdout, /FIRES/, "6b's condition evaluates false on the exact shape it exists to catch");
+  // And the near-miss must stay quiet, or a lone test-owned child would alert.
+  const quiet = spawnSync("bash", ["-c", `total=8; stopped_total=3; if ${extracted}; then echo FIRES; fi`], {
+    encoding: "utf8",
+  });
+  assert.doesNotMatch(quiet.stdout, /FIRES/, "6b fires below its own floor");
+});
