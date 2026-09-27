@@ -2791,11 +2791,21 @@ describe("IssueProperties", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const root = createRoot(container);
     const monitorRowText = () => container.querySelector('[data-testid="monitor-row-trigger"]')?.textContent;
+    // The row now answers from the shared monitor predicate, which reports a
+    // watch on an issue that cannot dispatch as `Paused`. Every case below is
+    // about the countdown vocabulary, so the issue has to be a shape a watch can
+    // fire on: an agent assignee, no board user, and a dispatching status.
+    const runnable = (issue: Issue): Issue => ({
+      ...issue,
+      status: "in_progress" as const,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+    });
     const renderMonitor = (issue: Issue) => {
       act(() => {
         root.render(
           <QueryClientProvider client={queryClient}>
-            <IssueProperties issue={issue} childIssues={[]} onUpdate={vi.fn()} inline />
+            <IssueProperties issue={runnable(issue)} childIssues={[]} onUpdate={vi.fn()} inline />
           </QueryClientProvider>,
         );
       });
