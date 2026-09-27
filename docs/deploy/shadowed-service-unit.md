@@ -24,6 +24,12 @@ caught by diffing installed files against a published tarball. A shadowed **unit
 passes that diff perfectly — the files are fine — while the service runs something
 else entirely.
 
+A third thing in this document can be shadowed the same way, and it is the one
+that repairs the other two: the installed **guardian** the 60s timer runs
+(`~/.local/bin/paperclip-unit-guardian.sh`). It was a 4-line `exit 0` on
+2026-09-27, under a timer that was `active` at a correct cadence, with 1418 clean
+runs logged. See Check 4.
+
 ## Why the existing check cannot see this
 
 `paperclipai doctor` has a `Service definition` check, and it is the right check
@@ -340,6 +346,78 @@ Two ways a healthy-looking restart goes wrong here, both observed:
   direct tension; whichever one is in force, the outcome to look for is an absent
   report, not a clean one.
 
+## Check 4 — is the thing that repairs all of this the one you committed
+
+Checks 1–3 read the unit. This one reads the **guardian**: the 60-second timer
+that restores a deleted unit file or drop-in from the golden copy, re-enables the
+unit, starts it, and resumes a `SIGSTOP`ped main PID. Every check above is
+answered by the guardian being correct, and the guardian's own body is not checked
+by anything — it cannot check itself, because the body is the thing that gets
+replaced.
+
+```bash
+# the installed guardian vs the committed one, and the golden copy set vs what is in force
+pnpm check:guardian-install-drift          # or: node scripts/check-guardian-install-drift.mjs
+node scripts/check-guardian-install-drift.mjs --json
+```
+
+### What it caught, and why every other signal was green
+
+On 2026-09-27 the installed copy at `~/.local/bin/paperclip-unit-guardian.sh` was
+reduced to a 4-line `exit 0` stub — 177 bytes, executable, owned by the
+installing user. It ran under a timer that was `active` at a correct 60s cadence,
+and the journal held 1418 runs, all exiting 0, with zero repairs and zero alerts.
+
+None of those readings was wrong. They are facts about the timer, the unit file,
+the drop-ins, the wants symlink and the exit status, and every one of them is
+still true of a script whose entire body is `exit 0`. So the check asserts
+**content**, and specifically:
+
+- not presence — the stub was present, and executable;
+- not size — a legitimate one-character fix is a size change too;
+- not mtime or ownership — all of those were unremarkable.
+
+The check also asserts the marker set **in the source at HEAD**, the same
+two-part shape as `shadowed-server-install.md`'s sentinels. Without that half, a
+guardian gutted in the repository as well as on the host would make the two copies
+agree and the board go permanently green.
+
+### Three states, three remedies
+
+| state | meaning | remedy |
+|---|---|---|
+| `absent` | the install is gone, so nothing runs the heal at all | reinstall from the committed copy |
+| `stubbed` | present and executable, and missing the guard steps — the `exit 0` case | reinstall from the committed copy |
+| `altered` | implements every guard and still disagrees with HEAD | **decide which side is authoritative** |
+
+`altered` is deliberately not a tamper verdict. Measured the same day, the two
+copies also differed by **one character** on the step 6b threshold with the
+*installed* copy correct and the committed one carrying a dead detector — an
+unpushed host fix. A content comparison catches both directions for one reason:
+either way the two files disagree. Which one is authoritative is a decision the
+check refuses to make for you, and `stubbed` is decided on markers while
+`altered` is decided on bytes precisely so the two are not confused.
+
+### Exit codes, and why 2 exists
+
+`0` nothing diverged, `1` something did, `2` the check could not be evaluated —
+no repo, an unreadable source tree, an unreadable install, or a marker that is no
+longer in the source at HEAD. Every unevaluated path returns 2 and never 1, so a
+broken check cannot be read as a finding. The last case matters most: a marker
+missing from HEAD means the manifest has drifted or the guard has been deleted
+from the repo, and in either situation the honest output is "I cannot say", not a
+green line.
+
+### The golden copy set gets the same treatment
+
+Step 2b of the guardian alerts on a drop-in that is in force with **no golden
+copy**. A drop-in present in both places with **altered content** is invisible to
+it, and invisible to the guardian, whose header says it never rewrites a file that
+already exists. That is how the `RefuseManualStop` golden/live divergence stayed
+hidden: the guard under repair and the copy it would restore are two different
+files, and nothing compared them. When it diverges, a delete-and-restore cycle
+silently changes the unit — the check names that as the reason to act.
+
 ## What "patched" looks like versus "shadowed"
 
 The test is traceability, and it is the same test the sibling document applies to
@@ -491,3 +569,8 @@ which is the interpreter and says nothing about the target.
 7. **Back the unit up before any re-render, and re-read `systemctl --user show`
    after the reload.** The re-render fixes the file and leaves every drop-in
    standing.
+8. **An `active` guardian timer is not evidence that the guardian is installed.**
+   Run `pnpm check:guardian-install-drift` before trusting a healthy plane, for the
+   same reason a green `Service definition` is not evidence about the process: it
+   asserts content, because on 2026-09-27 a 177-byte `exit 0` stub satisfied every
+   other signal there was.
