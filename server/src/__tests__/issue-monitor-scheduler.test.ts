@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
@@ -225,6 +225,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
           timeoutAt: typeof monitor.timeoutAt === "string" ? monitor.timeoutAt : null,
           maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
           recoveryPolicy: typeof monitor.recoveryPolicy === "string" ? monitor.recoveryPolicy : null,
+          intervalMinutes: typeof monitor.intervalMinutes === "number" ? monitor.intervalMinutes : null,
           clearedAt: null,
           clearReason: null,
         },
@@ -566,5 +567,221 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId));
     expect(JSON.stringify(activity.map((row) => row.details))).not.toContain("provider.example");
     expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).not.toHaveProperty("externalRef");
+  });
+
+  // A trigger clears monitorNextCheckAt on purpose, so the due-monitor sweep
+  // cannot see the monitor again. Only the handling run restores it, and on this
+  // instance run death is continuous. These cover the reconciliation branch that
+  // makes the triggered-but-unscheduled state visible to the sweep again.
+  describe("orphaned monitor reconciliation", () => {
+    const triggerAt = new Date("2026-04-11T12:31:00.000Z");
+    const pastGraceAt = new Date("2026-04-11T12:47:00.000Z");
+    const insideGraceAt = new Date("2026-04-11T12:36:00.000Z");
+
+    async function triggerAndConfirmOrphan(issueId: string) {
+      await heartbeatService(db).tickTimers(triggerAt);
+      await waitForHeartbeatIdle();
+
+      // The trigger started a run, and that run is the only actor that can
+      // restore the schedule. Whatever became of it, the platform must not be
+      // left with a triggered monitor and no schedule — the dead state the
+      // reconciliation branch exists to end. The run that should have re-armed
+      // it is not live.
+      const live = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issueId}`,
+            inArray(heartbeatRuns.status, [
+              "scheduled_retry",
+              "queued",
+              "running",
+            ]),
+          ),
+        );
+      expect(live).toHaveLength(0);
+
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(issue.monitorLastTriggeredAt?.toISOString()).toBe(triggerAt.toISOString());
+      return issue;
+    }
+
+    it("re-arms a triggered monitor whose handling run never came back", async () => {
+      const { issueId } = await seedFixture({ monitor: { intervalMinutes: 30 } });
+      const orphaned = await triggerAndConfirmOrphan(issueId);
+
+      const result = await heartbeatService(db).tickTimers(pastGraceAt);
+
+      expect(result.rearmed).toBe(1);
+
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+      // The cadence comes from the persisted monitor state, not a re-derived
+      // guess: 30 minutes after the reconciliation tick.
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T13:17:00.000Z");
+      // The re-arm restores the schedule the dead run owed. It is not a new
+      // attempt, so the trigger evidence survives.
+      expect(issue.monitorAttemptCount).toBe(1);
+      expect(issue.monitorLastTriggeredAt?.toISOString()).toBe(orphaned.monitorLastTriggeredAt!.toISOString());
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "scheduled",
+        nextCheckAt: "2026-04-11T13:17:00.000Z",
+        lastTriggeredAt: triggerAt.toISOString(),
+        attemptCount: 1,
+        intervalMinutes: 30,
+      });
+
+      const activity = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId))
+        .then((rows) => rows.map((row) => row.action));
+      expect(activity).toContain("issue.monitor_rearmed");
+    });
+
+    it("re-arms at the platform default cadence when the state names none", async () => {
+      const { issueId } = await seedFixture();
+      await triggerAndConfirmOrphan(issueId);
+
+      await heartbeatService(db).tickTimers(pastGraceAt);
+
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T13:47:00.000Z");
+    });
+
+    it("leaves a triggered monitor alone inside the grace period", async () => {
+      const { issueId } = await seedFixture();
+      await triggerAndConfirmOrphan(issueId);
+
+      // 5 minutes after the trigger: the handling run could still be starting,
+      // so re-arming here would race the work it is meant to protect.
+      const result = await heartbeatService(db).tickTimers(insideGraceAt);
+
+      expect(result.rearmed).toBe(0);
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).toBeNull();
+    });
+
+    it("leaves a triggered monitor alone while a run still owns the issue", async () => {
+      const { companyId, issueId, agentId } = await seedFixture();
+      await triggerAndConfirmOrphan(issueId);
+      const liveRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: liveRunId,
+        companyId,
+        agentId,
+        status: "running",
+        startedAt: pastGraceAt,
+        contextSnapshot: { issueId },
+      });
+
+      try {
+        const result = await heartbeatService(db).tickTimers(pastGraceAt);
+
+        expect(result.rearmed).toBe(0);
+        const issue = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0]!);
+        expect(issue.monitorNextCheckAt).toBeNull();
+        const activity = await db
+          .select()
+          .from(activityLog)
+          .where(eq(activityLog.entityId, issueId))
+          .then((rows) => rows.map((row) => row.action));
+        expect(activity).not.toContain("issue.monitor_rearmed");
+      } finally {
+        // The row under test must not outlive the test: cleanup waits for runs
+        // to settle and this one never will on its own.
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, liveRunId));
+      }
+    });
+
+    it("clears and recovers an orphaned monitor whose attempt budget is spent", async () => {
+      const { issueId, agentId } = await seedFixture({
+        monitor: { maxAttempts: 1, recoveryPolicy: "wake_owner" },
+      });
+      await triggerAndConfirmOrphan(issueId);
+
+      const result = await heartbeatService(db).tickTimers(pastGraceAt);
+
+      expect(result.rearmed).toBe(0);
+      expect(result.monitorCleared).toBe(1);
+
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "cleared",
+        clearReason: "max_attempts_exhausted",
+      });
+
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows[rows.length - 1] ?? null);
+      expect(wakeup?.reason).toBe("issue_monitor_recovery");
+      expect(wakeup?.payload).toMatchObject({
+        issueId,
+        clearReason: "max_attempts_exhausted",
+        maxAttempts: 1,
+      });
+
+      const activity = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId))
+        .then((rows) => rows.map((row) => row.action));
+      expect(activity).toContain("issue.monitor_exhausted");
+      expect(activity).not.toContain("issue.monitor_rearmed");
+    });
+
+    it("clears and recovers an orphaned monitor whose timeout elapsed while it was orphaned", async () => {
+      const { issueId } = await seedFixture({
+        monitor: {
+          intervalMinutes: 30,
+          timeoutAt: "2026-04-11T12:40:00.000Z",
+          recoveryPolicy: "wake_owner",
+        },
+      });
+      await triggerAndConfirmOrphan(issueId);
+
+      const result = await heartbeatService(db).tickTimers(pastGraceAt);
+
+      expect(result.rearmed).toBe(0);
+      expect(result.monitorCleared).toBe(1);
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "cleared",
+        clearReason: "timeout_exceeded",
+      });
+    });
   });
 });

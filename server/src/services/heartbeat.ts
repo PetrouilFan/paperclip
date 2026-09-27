@@ -408,9 +408,15 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorRearmedPatch,
   buildIssueMonitorTriggeredPatch,
+  exhaustedPersistedMonitorClearReason,
+  ISSUE_MONITOR_REARM_GRACE_MS,
+  issueMonitorRearmIntervalMinutes,
+  monitorPolicyFromPersistedState,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
+  readPersistedIssueMonitorState,
 } from "./issue-execution-policy.js";
 import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -12067,6 +12073,200 @@ export function heartbeatService(
     return {
       checked: dueMonitors.length,
       triggered,
+      skipped,
+    };
+  }
+
+  /**
+   * Run statuses that still own the issue. A monitor whose trigger produced one
+   * of these must not be re-armed: the run is alive and will re-arm it itself.
+   */
+  const ISSUE_MONITOR_OWNING_RUN_STATUSES = [
+    "scheduled_retry",
+    "queued",
+    "running",
+  ] as const;
+
+  async function issueHasLiveOwningRun(
+    claimed: IssueMonitorDispatchRow,
+    executionRunId: string | null,
+  ) {
+    const issueIdFromContext = sql<string>`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot} ->> 'issueId')`;
+    const [live] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, claimed.companyId),
+          inArray(heartbeatRuns.status, [...ISSUE_MONITOR_OWNING_RUN_STATUSES]),
+          or(
+            eq(issueIdFromContext, claimed.id),
+            executionRunId ? eq(heartbeatRuns.id, executionRunId) : undefined,
+          ),
+        ),
+      )
+      .limit(1);
+    return Boolean(live);
+  }
+
+  /**
+   * Reconcile monitors that triggered and were never re-armed.
+   *
+   * The due-monitor sweep only selects `monitorNextCheckAt IS NOT NULL`, and a
+   * trigger clears that column on purpose, so a monitor whose handling run died
+   * is structurally invisible to it: `monitorLastTriggeredAt IS NOT NULL AND
+   * monitorNextCheckAt IS NULL` matched no predicate anywhere. This branch is
+   * that predicate. Two guards keep it from firing under live work: a grace
+   * period, because a trigger's run may still be starting, and a no-live-run
+   * check, because a run that survived will re-arm the monitor itself.
+   */
+  async function reconcileOrphanedIssueMonitors(now = new Date()) {
+    const graceThreshold = new Date(now.getTime() - ISSUE_MONITOR_REARM_GRACE_MS);
+    const orphaned = await db
+      .select({
+        ...issueMonitorDispatchColumns,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(companies.status, "active"),
+          sql`${issues.monitorNextCheckAt} is null`,
+          sql`${issues.monitorLastTriggeredAt} is not null`,
+          lte(issues.monitorLastTriggeredAt, graceThreshold),
+          isNull(issues.assigneeUserId),
+          sql`${issues.assigneeAgentId} is not null`,
+          inArray(issues.status, ["in_progress", "in_review"]),
+        ),
+      )
+      .orderBy(asc(issues.monitorLastTriggeredAt), asc(issues.updatedAt))
+      .limit(50);
+
+    let rearmed = 0;
+    let cleared = 0;
+    let skipped = 0;
+
+    for (const orphan of orphaned) {
+      try {
+        if (await issueHasLiveOwningRun(orphan, orphan.executionRunId)) {
+          skipped += 1;
+          continue;
+        }
+
+        const policy = normalizeIssueExecutionPolicy(orphan.executionPolicy ?? null);
+        const monitorState = readPersistedIssueMonitorState({
+          issue: orphan,
+          policy,
+        });
+        if (!monitorState) {
+          skipped += 1;
+          continue;
+        }
+
+        const intervalMinutes = issueMonitorRearmIntervalMinutes(monitorState);
+        const nextCheckAt = new Date(
+          now.getTime() + intervalMinutes * 60 * 1000,
+        );
+        const exhaustedReason = exhaustedPersistedMonitorClearReason({
+          state: monitorState,
+          now,
+        });
+        const monitor = monitorPolicyFromPersistedState({
+          state: monitorState,
+          nextCheckAt: nextCheckAt.toISOString(),
+        });
+
+        if (exhaustedReason) {
+          const recovered = await clearIssueMonitorAndRecover({
+            claimed: orphan,
+            policy,
+            scheduledAtIso: nextCheckAt.toISOString(),
+            nextAttemptCount: monitorState.attemptCount,
+            clearReason: exhaustedReason,
+            recoveryPolicy: monitorRecoveryPolicy(monitor),
+            monitor,
+            now,
+            actorType: "system",
+            actorId: "heartbeat_scheduler",
+            agentId: null,
+            runId: null,
+            activitySource: "scheduled",
+          });
+          if (recovered.outcome === "skipped") cleared += 1;
+          continue;
+        }
+
+        const claimed = await db.transaction(async (tx) => {
+          const [updated] = await tx
+            .update(issues)
+            .set({
+              ...buildIssueMonitorRearmedPatch({
+                issue: orphan,
+                policy,
+                rearmedAt: nextCheckAt,
+                intervalMinutes,
+              }),
+              monitorLastTriggeredAt: orphan.monitorLastTriggeredAt,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(issues.id, orphan.id),
+                sql`${issues.monitorNextCheckAt} is null`,
+                sql`${issues.monitorLastTriggeredAt} is not null`,
+                lte(issues.monitorLastTriggeredAt, graceThreshold),
+                isNull(issues.assigneeUserId),
+                sql`${issues.assigneeAgentId} is not null`,
+                inArray(issues.status, ["in_progress", "in_review"]),
+              ),
+            )
+            .returning({ id: issues.id });
+          return (updated ?? null) as { id: string } | null;
+        });
+
+        if (!claimed) {
+          skipped += 1;
+          continue;
+        }
+
+        rearmed += 1;
+        await logActivity(db, {
+          companyId: orphan.companyId,
+          actorType: "system",
+          actorId: "heartbeat_scheduler",
+          agentId: null,
+          runId: null,
+          action: "issue.monitor_rearmed",
+          entityType: "issue",
+          entityId: orphan.id,
+          details: {
+            identifier: orphan.identifier,
+            nextCheckAt: nextCheckAt.toISOString(),
+            lastTriggeredAt: orphan.monitorLastTriggeredAt?.toISOString() ?? null,
+            attemptCount: monitorState.attemptCount,
+            intervalMinutes,
+            notes: orphan.monitorNotes ?? null,
+            serviceName: monitorState.serviceName ?? null,
+            timeoutAt: monitorState.timeoutAt ?? null,
+            maxAttempts: monitorState.maxAttempts ?? null,
+            recoveryPolicy: monitorState.recoveryPolicy ?? null,
+            source: "scheduled",
+          },
+        });
+      } catch (err) {
+        skipped += 1;
+        logger.error(
+          { err, issueId: orphan.id },
+          "issue monitor reconcile failed",
+        );
+      }
+    }
+
+    return {
+      checked: orphaned.length,
+      rearmed,
+      cleared,
       skipped,
     };
   }
@@ -30004,12 +30204,16 @@ export function heartbeatService(
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+      const reconciledMonitors = await reconcileOrphanedIssueMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
+        checked:
+          checked + issueMonitors.checked + reconciledMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
+        skipped: skipped + issueMonitors.skipped + reconciledMonitors.skipped,
         standingWatchUnresolved,
+        rearmed: reconciledMonitors.rearmed,
+        monitorCleared: reconciledMonitors.cleared,
       };
     },
 
