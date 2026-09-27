@@ -8870,6 +8870,37 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
+// A pid-only check cannot tell a live child from a recycled PID, and every
+// recovery site below reads `processPidAlive || processGroupAlive`. That
+// disjunction is not a second opinion: processGroupId is the child's own pid
+// (measured 914/914 on a live instance), so it probes the same pid twice and a
+// recycled non-leader process satisfies the first disjunct on its own. A false
+// positive therefore suppresses recovery rather than causing it, which strands
+// the run in `running` and leaves it holding its issue's executionRunId.
+//
+// processStartedAt is present on every run that carries a pid and matches
+// /proc/<pid> to sub-10ms, so it discriminates for free. This downgrades a
+// positive to false on a confirmed mismatch only; an unreadable identity stays
+// conservative, because the original process may still own execution. Mirrors
+// the check in conversation-continuation.ts.
+//
+// Exported for the recycling regression test; not part of the module contract.
+export async function isProcessIdentityAlive(
+  pid: number | null | undefined,
+  processStartedAt: Date | string | null | undefined,
+  readStartedAt: (pid: number) => Promise<string | null> = readProcessStartedAt,
+) {
+  if (!isProcessAlive(pid)) return false;
+  if (pid == null || !processStartedAt) return true;
+  const recorded = new Date(processStartedAt);
+  if (Number.isNaN(recorded.getTime())) return true;
+  const observed = await readStartedAt(pid).catch(() => null);
+  if (!observed) return true;
+  const observedMs = new Date(observed).getTime();
+  if (Number.isNaN(observedMs)) return true;
+  return observedMs === recorded.getTime();
+}
+
 export async function persistHeartbeatRunProcessMetadata(
   db: Db,
   runId: string,
@@ -15063,7 +15094,10 @@ export function heartbeatService(
 
       const processPid = run.processPid ?? candidate.processPid;
       const processGroupId = run.processGroupId ?? candidate.processGroupId;
-      const processPidAlive = isProcessAlive(processPid);
+      const processPidAlive = await isProcessIdentityAlive(
+        processPid,
+        run.processStartedAt ?? candidate.processStartedAt,
+      );
       const processGroupAlive = isProcessGroupAlive(processGroupId);
       if (!processPid && !processGroupId) {
         classify(candidate, "lost", "missing_process_metadata", patch);
@@ -19298,7 +19332,8 @@ export function heartbeatService(
         continue;
       }
       const processPidAlive =
-        !!run.processPid && isProcessAlive(run.processPid);
+        !!run.processPid &&
+        (await isProcessIdentityAlive(run.processPid, run.processStartedAt));
       const processGroupAlive =
         !!run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive || processGroupAlive) {
@@ -19506,7 +19541,9 @@ export function heartbeatService(
       if (isNativeRunnerOwnershipHeld(run)) continue;
       const nativeRun = run.runtimeMode === "native";
       const nativeProcessPidAlive =
-        nativeRun && !!run.processPid && isProcessAlive(run.processPid);
+        nativeRun &&
+        !!run.processPid &&
+        (await isProcessIdentityAlive(run.processPid, run.processStartedAt));
       const nativeProcessGroupAlive =
         nativeRun &&
         !!run.processGroupId &&
@@ -19588,7 +19625,7 @@ export function heartbeatService(
       const processPidAlive =
         checksPersistedChildLiveness &&
         run.processPid &&
-        isProcessAlive(run.processPid);
+        (await isProcessIdentityAlive(run.processPid, run.processStartedAt));
       const processGroupAlive =
         checksPersistedChildLiveness &&
         run.processGroupId &&
@@ -20528,8 +20565,12 @@ export function heartbeatService(
       const trackedProcessGroupAlive = trackedProcessGroupId
         ? isProcessGroupAlive(trackedProcessGroupId)
         : false;
+      // The tracked child is an in-memory handle, so its identity cannot drift.
+      // The persisted pid can: a recycled PID reads as alive forever and would
+      // keep native ownership held. Only the persisted branch is identity-checked.
       const persistedPidAlive =
-        !!run.processPid && isProcessAlive(run.processPid);
+        !!run.processPid &&
+        (await isProcessIdentityAlive(run.processPid, run.processStartedAt));
       const persistedProcessGroupAlive =
         !!run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (
