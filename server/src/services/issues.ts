@@ -11481,6 +11481,19 @@ export function issueService(db: Db) {
           checkoutRunId,
           executionRunId: checkoutRunId,
           status: "in_progress",
+          // This update writes `in_progress` unconditionally, so it always
+          // leaves any terminal status the row happened to be in. `expectedStatuses`
+          // is caller-supplied and a caller can name `done` or `cancelled` in it,
+          // which makes reopening a closed issue a legitimate outcome of this
+          // statement. The PATCH path already upholds the invariant this restates
+          // (`if (issueData.status && issueData.status !== "done") patch.completedAt = null`),
+          // so without these two the row ends up with `status: "in_progress"` and a
+          // non-null `completedAt` at the same time, and every consumer that reads
+          // one of those fields disagrees with every consumer that reads the other.
+          // Clearing unconditionally is also the self-heal for rows already left
+          // inconsistent by an earlier checkout.
+          completedAt: null,
+          cancelledAt: null,
           startedAt: now,
           updatedAt: now,
         })
@@ -11592,6 +11605,12 @@ export function issueService(db: Db) {
             executionAgentNameKey: null,
             executionLockedAt: now,
             status: "in_progress",
+            // Same invariant as the main checkout update above: this statement
+            // writes `in_progress` regardless of the status it is leaving, so a
+            // caller that names a terminal status in `expectedStatuses` must not
+            // be able to strand `completedAt` / `cancelledAt` on the reopened row.
+            completedAt: null,
+            cancelledAt: null,
             updatedAt: now,
           };
           if (current.status !== "in_progress") {
