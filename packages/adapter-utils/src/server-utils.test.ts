@@ -3418,6 +3418,55 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     expect(prompt).toContain("Be skeptical of QA done-claims.");
   });
 
+  it("reports no blocker scope when the server does not claim it", () => {
+    const serialized = stringifyPaperclipWakePayload({
+      ...baseWatchdogPayload,
+      taskWatchdog: {
+        watchedIssueId: "watched-issue-1",
+        watchedIssueIdentifier: "PAP-8000",
+        stopFingerprint: "stop:abc",
+        capabilities: {
+          targetScope: {
+            watchedIssueId: "watched-issue-1",
+            includeNonWatchdogDescendants: true,
+            excludedOriginKinds: ["task_watchdog"],
+          },
+          operations: ["update_reusable_watchdog_issue"],
+          deniedOperations: [],
+        },
+      },
+    });
+    const parsed = JSON.parse(serialized ?? "{}");
+    expect(
+      parsed.taskWatchdog.capabilities.targetScope.includeBlockersOfWatchedSubtree,
+    ).toBe(false);
+    expect(renderPaperclipWakePrompt(parsed)).toContain("Blocker scope: none");
+  });
+
+  it("states the one-hop blocker scope when the server grants it", () => {
+    const serialized = stringifyPaperclipWakePayload({
+      ...baseWatchdogPayload,
+      taskWatchdog: {
+        watchedIssueId: "watched-issue-1",
+        watchedIssueIdentifier: "PAP-8000",
+        stopFingerprint: "stop:abc",
+        capabilities: {
+          targetScope: {
+            watchedIssueId: "watched-issue-1",
+            includeNonWatchdogDescendants: true,
+            includeBlockersOfWatchedSubtree: true,
+            excludedOriginKinds: ["task_watchdog"],
+          },
+          operations: ["update_reusable_watchdog_issue"],
+          deniedOperations: [],
+        },
+      },
+    });
+    const prompt = renderPaperclipWakePrompt(JSON.parse(serialized ?? "{}"));
+    expect(prompt).toContain("Blocker scope:");
+    expect(prompt).toContain("One hop only");
+  });
+
   it("truncates oversized custom instructions and caps terminal leaf summaries", () => {
     const longInstructions = "x".repeat(8_000);
     const manyLeaves = Array.from({ length: 50 }, (_, idx) => ({
