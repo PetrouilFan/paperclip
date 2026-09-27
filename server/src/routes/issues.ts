@@ -1557,7 +1557,6 @@ function buildIssueBlockerDiagnosticsResponse(input: {
           reason: input.attention.reason,
           sampleBlockerIdentifier,
         };
-  const hasUnprojectedHold = unprojectedHold !== null && unprojectedHold.count > 0;
 
   const blockers: IssueBlockerDiagnosticNode[] = input.visibleBlockers.map(
     (blockerRow) => {
@@ -1581,23 +1580,34 @@ function buildIssueBlockerDiagnosticsResponse(input: {
     },
   );
 
-  // An unprojected hold makes the readiness answer partial, exactly as a
-  // truncated set or an authorization boundary does. Reporting
-  // `isDependencyReady: true` here is the specific defect: the write path
-  // refuses the move on the strength of a hold this object says does not
-  // exist, so the route is telling a reader to attempt something the server
-  // will reject.
-  const readiness: IssueBlockerDiagnosticsReadiness | null =
-    completeVisibleSet && !hasUnprojectedHold
-      ? {
-          allBlockersDone: input.readiness.allBlockersDone,
-          isDependencyReady: input.readiness.isDependencyReady,
-          unresolvedBlockerCount:
-            input.readiness.unresolvedBlockerIssueIds.length,
-          pendingFinalizeBlockerCount:
-            input.readiness.pendingFinalizeBlockerIssueIds.length,
-        }
-      : null;
+  // `readiness` answers one question: will the server refuse this status
+  // transition on the strength of a dependency blocker? The projection that
+  // answers it is complete for that question. Both gates that refuse the move
+  // read the same `blocks` edges this projection walks — the `in_progress`
+  // transition gate and the checkout gate both call
+  // `listIssueDependencyReadinessMap`, whose only edge query is
+  // `eq(issueRelations.type, "blocks")`. The one tree hold that does gate a
+  // write is the operator pause hold, and it gates checkout only.
+  //
+  // So an unprojected hold is not a reason to withhold this answer, and
+  // withholding it is the defect: the holds the aggregate counts beyond
+  // `blocks` (tree children, attention relations, approvals) are ones the gate
+  // never reads, so a reader asking the transition question got `null` where
+  // the answer was definitively "yes, accepted". The hold is reported next to
+  // the answer now, as an additional fact about the issue, instead of
+  // suppressing it. What still genuinely makes the answer partial — and so
+  // still nulls it — is a view the actor cannot see all of: truncation, or a
+  // blocker outside the authorization boundary.
+  const readiness: IssueBlockerDiagnosticsReadiness | null = completeVisibleSet
+    ? {
+        allBlockersDone: input.readiness.allBlockersDone,
+        isDependencyReady: input.readiness.isDependencyReady,
+        unresolvedBlockerCount:
+          input.readiness.unresolvedBlockerIssueIds.length,
+        pendingFinalizeBlockerCount:
+          input.readiness.pendingFinalizeBlockerIssueIds.length,
+      }
+    : null;
   const reportedOmittedUnauthorizedBlockerCount = input.truncated
     ? null
     : omittedUnauthorizedBlockerCount;
@@ -1647,7 +1657,11 @@ function buildIssueBlockerDiagnosis(input: {
   }
   // Checked before the empty-list sentence below, because that sentence is a
   // negative and this is the case that makes it false. `blockers` is empty
-  // here precisely because the hold is not a first-class dependency edge.
+  // here precisely because the hold is not a first-class dependency edge. The
+  // sentence stops there on purpose: it must not claim readiness is withheld,
+  // because the dependency gate does not read any of these holds and still
+  // reports it. Naming the projection's scope is what keeps this from reading
+  // as a refusal.
   if (input.unprojectedHold && input.unprojectedHold.count > 0) {
     const sample = input.unprojectedHold.sampleBlockerIdentifier
       ? ` One of them is ${input.unprojectedHold.sampleBlockerIdentifier}.`
@@ -1658,7 +1672,7 @@ function buildIssueBlockerDiagnosis(input: {
       input.unprojectedHold.count === 1 ? "" : "s"
     } that ${
       input.unprojectedHold.count === 1 ? "is" : "are"
-    } not first-class dependency edges, so they do not appear in the blocker list and readiness is not reported.${sample}`;
+    } not first-class dependency edges, so they do not appear in the blocker list. The reported readiness covers the first-class dependency edges only; the status transition gate reads no other hold.${sample}`;
   }
   if (input.blockers.length === 0) {
     return input.issue.status === "blocked"

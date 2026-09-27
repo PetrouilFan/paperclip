@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -19,6 +19,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -193,12 +194,15 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(issueRelations);
-    await db.delete(heartbeatRuns);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(projects);
-    await db.delete(companies);
+    // The write-path assertions in this file PATCH an issue into
+    // `in_progress`, which dispatches a heartbeat run fire-and-forget. Drain
+    // those in-flight writes first: a run that keeps writing after its company
+    // row is gone violates a foreign key and poisons every later test in the
+    // file. Then clear the whole company graph, since a dispatched run writes
+    // side tables (activity, run events, runtime state) that a per-table delete
+    // list has to keep growing to cover.
+    await heartbeatService(db).drainActiveRunExecutions();
+    await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
   });
 
   afterAll(async () => {
@@ -388,21 +392,25 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.diagnosis).toContain("truncated at 100 blockers");
     expect(res.body.caps).toEqual({ maxBlockers: 100 });
   });
-  it("does not report a tree-held issue as having no blockers, and withholds readiness", async () => {
-    // The measured defect: an issue held by a live child, with no first-class
-    // dependency edge, came back as `isDependencyReady: true` and the sentence
-    // "is blocked but has no first-class blocker relations" — while the write
-    // path refused the move. The sentence is a negative, and the aggregate the
-    // server enforces with contradicts it.
+  it("reports readiness and the write it invites for an issue held by a live child", async () => {
+    // The aggregate this route consults counts tree holds; the transition gate
+    // does not. Both gates that can refuse a status move read the same
+    // `blocks` edges this projection walks (the `in_progress` transition gate
+    // and the checkout gate both call listIssueDependencyReadinessMap, whose
+    // only edge query is eq(issueRelations.type, "blocks")), and the one tree
+    // hold that does gate a write — the operator pause hold — gates checkout
+    // only. So for an issue held by a live child the transition answer is a
+    // real one, and it is `true`. The hold is reported beside it.
     const company = await seedCompany(db, "TreeHold");
     const project = await seedProject(db, company.id, "Tree hold project");
+    const agent = await seedAgent(db, company.id);
     const root = await seedIssue(db, {
       companyId: company.id,
       projectId: project.id,
       title: "Root held by its child",
       status: "blocked",
     });
-    await seedIssue(db, {
+    const child = await seedIssue(db, {
       companyId: company.id,
       projectId: project.id,
       title: "Live child",
@@ -415,17 +423,44 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.blockers).toEqual([]);
-    // The negative sentence is gone.
+    // The negative sentence #96 removed stays removed: `blockers` really is
+    // empty, and the aggregate contradicts the negative.
     expect(res.body.diagnosis).not.toContain("no first-class blocker relations");
     expect(res.body.diagnosis).toContain("not first-class dependency edges");
-    // And the answer that invited the refused write is withheld.
-    expect(res.body.readiness).toBeNull();
-    expect(res.body.unprojectedHold.count).toBe(1);
+    // The hold is named, and it no longer suppresses the transition answer.
+    expect(res.body.unprojectedHold).toMatchObject({ count: 1 });
+    expect(res.body.readiness).toMatchObject({
+      allBlockersDone: true,
+      isDependencyReady: true,
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerCount: 0,
+    });
+
+    // The write-path half, and the reason the assertion above is falsifiable:
+    // if the gate ever starts reading this hold, this PATCH turns into a 422
+    // and `isDependencyReady: true` above becomes a promise the server breaks.
+    const patch = await request(createApp(db, boardActor(company)))
+      .patch(`/api/issues/${root.id}`)
+      .send({ status: "in_progress", assigneeAgentId: agent.id });
+
+    expect(patch.status, JSON.stringify(patch.body)).toBe(200);
+    expect(patch.body.status).toBe("in_progress");
+
+    // And the same claim still holds once the move is made: the readiness
+    // reported before the write is the readiness the server acted on.
+    const after = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/blockers`);
+    expect(after.status, JSON.stringify(after.body)).toBe(200);
+    expect(after.body.readiness).toMatchObject({ isDependencyReady: true });
+    expect(after.body.unprojectedHold).toMatchObject({ count: 0 });
+    expect(after.body.diagnosis).toBeNull();
+    expect(child.parentId).toBe(root.id);
   });
 
   it("keeps readiness for a correctly blocked issue whose blockers are all projected", async () => {
     // The negative control. Without this, "withhold readiness" would be
-    // indistinguishable from "never report readiness".
+    // indistinguishable from "never report readiness" — and the fix for the
+    // unprojected hold would be indistinguishable from reporting it always.
     const company = await seedCompany(db, "ProjectedHold");
     const project = await seedProject(db, company.id, "Projected project");
     const root = await seedIssue(db, {
@@ -449,7 +484,71 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.blockers).toHaveLength(1);
     expect(res.body.readiness).not.toBeNull();
     expect(res.body.readiness.isDependencyReady).toBe(false);
+    // The aggregate agrees with the projection, and says so as a real answer
+    // rather than by absence.
     expect(res.body.unprojectedHold.count).toBe(0);
+
+    // The other half of the control: a hold the gate really does read must
+    // still come back as a refusal. The `in_progress` transition gate reads
+    // `blocks` edges, so this PATCH is the 422 `isDependencyReady: false`
+    // above describes.
+    const agent = await seedAgent(db, company.id);
+    const patch = await request(createApp(db, boardActor(company)))
+      .patch(`/api/issues/${root.id}`)
+      .send({ status: "in_progress", assigneeAgentId: agent.id });
+
+    expect(patch.status).toBe(422);
+    expect(patch.body.error).toBe("Issue is blocked by unresolved blockers");
+  });
+
+  it("withholds readiness only for a genuinely partial view, hold or not", async () => {
+    // The control on the control. A truncated set is a real reason to withhold,
+    // and it withholds regardless of `unprojectedHold` — the two conditions
+    // are independent, which is the whole claim of the fix.
+    const company = await seedCompany(db, "TruncatedWithHold");
+    const project = await seedProject(db, company.id, "Truncated project");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Root held by many edges and a child",
+      status: "blocked",
+    });
+    await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live child",
+      status: "in_progress",
+      parentId: root.id,
+    });
+    const blockerRows = [];
+    for (let index = 0; index < 101; index += 1) {
+      blockerRows.push({
+        companyId: company.id,
+        projectId: project.id,
+        title: `Blocker ${String(index).padStart(3, "0")}`,
+        status: "in_progress",
+        priority: "medium",
+        responsibleUserId: "board-user",
+      });
+    }
+    const insertedBlockers = await db.insert(issues).values(blockerRows).returning();
+    await db.insert(issueRelations).values(insertedBlockers.map((blocker) => ({
+      companyId: company.id,
+      issueId: blocker.id,
+      relatedIssueId: root.id,
+      type: "blocks" as const,
+    })));
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.truncated).toBe(true);
+    // Withheld — and for the truncation, not because of the live child.
+    expect(res.body.readiness).toBeNull();
+    // The hold count is unknowable at this bound, so it is not guessed.
+    expect(res.body.unprojectedHold).toBeNull();
+    expect(res.body.diagnosis).toContain("truncated at 100 blockers");
   });
 
   it("never names an unprojected hold the actor cannot see", async () => {
