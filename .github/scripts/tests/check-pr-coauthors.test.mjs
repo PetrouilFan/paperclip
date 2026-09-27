@@ -341,18 +341,24 @@ test('checkCoauthors: does not call a real name on a matched account unverified'
 
 test('checkCoauthors: reports a worktree name attached to a real account', () => {
   // B3. The trailer links to the right account and is labelled with whatever
-  // configured the tree. `wt-pet211-ultron1-build` is the kind of name
+  // configured the tree. `wt-checkout-ultron1-build` is the kind of name
   // `git worktree` leaves behind, and the file header cites worktrees outliving
   // their task as the reason this defect exists — yet the name was read out of
   // that same config in the matched path too, where nothing flagged it.
+  //
+  // The slug is invented rather than copied off a live worktree. The first
+  // version of this fixture used a real one, and check-pr-internal-refs was
+  // right to reject it: a name read out of a working tree names that tree's
+  // task, and a comment in the permanent tree is not the place to keep it. See
+  // CONTRIBUTING.md, "No Internal Issue References".
   const result = checkCoauthors(
-    [commit('stubbi', 'wt-pet211-ultron1-build', 'build@box.local')],
+    [commit('stubbi', 'wt-checkout-ultron1-build', 'build@box.local')],
     'tonio-alucema'
   );
 
   assert.match(
     trailersNote(result),
-    /Co-Authored-By: wt-pet211-ultron1-build <stubbi@users\.noreply\.github\.com>/
+    /Co-Authored-By: wt-checkout-ultron1-build <stubbi@users\.noreply\.github\.com>/
   );
   const note = unverifiedNote(result);
   assert.ok(note, 'the name is reported as unverified');
