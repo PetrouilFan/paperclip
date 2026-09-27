@@ -43,12 +43,23 @@ import { join, resolve } from "node:path";
  */
 export function runningServerDistCandidates(env = process.env) {
   const home = env.HOME || homedir();
-  const cliRoot = env.PAPERCLIP_CLI_ROOT || join(home, ".npm-global", "lib", "node_modules", "paperclipai");
+  const cliRoot =
+    env.PAPERCLIP_CLI_ROOT ||
+    join(home, ".npm-global", "lib", "node_modules", "paperclipai");
   return [
     // What `require("@paperclipai/server")` resolves to from inside the CLI.
     join(cliRoot, "node_modules", "@paperclipai", "server", "dist"),
     // A pnpm/npm workspace install of the repo itself.
-    join(home, "Projects", "paperclipai", "paperclip", "node_modules", "@paperclipai", "server", "dist"),
+    join(
+      home,
+      "Projects",
+      "paperclipai",
+      "paperclip",
+      "node_modules",
+      "@paperclipai",
+      "server",
+      "dist",
+    ),
     // A repo checkout is a legitimate running build for a source install, but
     // it is listed last because it is the tree a developer edits, and an edited
     // tree is not the deployed one in either direction. Preferring it does not
@@ -59,7 +70,9 @@ export function runningServerDistCandidates(env = process.env) {
     // The ordering exists so the report means "what the server loads", and
     // blaming a healthy deploy on a developer's stale tree is the more dangerous
     // direction to get wrong.
-    resolve(join(home, "Projects", "paperclipai", "paperclip", "server", "dist")),
+    resolve(
+      join(home, "Projects", "paperclipai", "paperclip", "server", "dist"),
+    ),
   ];
 }
 
@@ -113,7 +126,73 @@ export const RUNNING_BUILD_SENTINELS = [
     sourcePath: "server/src/services/cross-issue-influence-limit.ts",
     distPath: "services/cross-issue-influence-limit.js",
     markers: ["boundSourceIssueId", "terminal_status"],
-    summary: "the run-bound fallback attributes a write to the bound issue and names a terminal run",
+    summary:
+      "the run-bound fallback attributes a write to the bound issue and names a terminal run",
+  },
+  {
+    // PET-497. The re-mint loop behind a family of "stranded" tickets: the
+    // recovery sweep minted a fresh `issue_recovery_actions` row every 30s for
+    // one dead run, because any dedup keyed on `recoveryActionId` is vacuous —
+    // the id is new on every comparison, so nothing is ever "already decided".
+    // The fix moves the identity to `(runId, issueId)`, which is durable.
+    //
+    // This sentinel is also the strongest in the manifest, because the fix is a
+    // *new module*. `execution-recovery-identity.ts` did not exist before
+    // 381f051f14a, so a build that predates it has no such `dist` file at all
+    // and `deployedExists` is false. There is no partial-credit variant to
+    // confuse it with, which is the point: the churn was previously invisible
+    // because the manifest guarded no file this loop touches.
+    //
+    // Three markers, all in the one module. `isExecutionRecoveryAlreadySettled`
+    // and `settledExecutionRecoveryActionCondition` are the two readers the
+    // sweeper calls on every pass, and `EXECUTION_RECOVERY_DISPOSITION_KEY` is
+    // the durable receipt key, so losing any one of the three re-opens the loop
+    // or drops the only durable record that closes it.
+    id: "settle-keyed-on-run-and-issue",
+    sinceCommit: "381f051f14a",
+    sourcePath: "server/src/services/execution-recovery-identity.ts",
+    distPath: "services/execution-recovery-identity.js",
+    markers: [
+      "EXECUTION_RECOVERY_DISPOSITION_KEY",
+      "isExecutionRecoveryAlreadySettled",
+      "settledExecutionRecoveryActionCondition",
+    ],
+    summary:
+      "execution-recovery settlement is keyed on (runId, issueId), not on the per-attempt action id",
+  },
+  {
+    // PET-497, d4ed244a6ae. The companion to the sentinel above: a settlement
+    // that blocks an issue must also name who releases it, or `blocked` is
+    // terminal in practice and the ticket reads as unfinished agent work. This
+    // is the descriptor PET-314 was chasing as "write the fix" while the fix
+    // was already merged.
+    id: "stranded-settle-names-its-exit",
+    sinceCommit: "d4ed244a6ae",
+    sourcePath: "server/src/services/routable-blocked.ts",
+    distPath: "services/routable-blocked.js",
+    markers: ["strandedRunUnblockDescriptor"],
+    summary:
+      "a stranded settle names an unblock owner and action instead of leaving a dead ticket",
+  },
+  {
+    // PET-497, 7f8c05af28c. `automaticRecovery.replay = "blocked"` used to mean
+    // two things: do not replay the dead run's actions (a safety property) and
+    // refuse to admit new execution. The second is wrong for an issue under an
+    // armed watchdog with a live monitor — the pin silently stops the watch
+    // that is supposed to report the failure, and PET-495 is a monitor-bearing
+    // issue that got skipped that way.
+    //
+    // Marked on `execution-blocker.ts` rather than only on the identity module
+    // so the carve-out is guarded where the *hold* is decided, not just where
+    // the condition is defined. A build that shipped the condition but not the
+    // `not(...)` guard at the hold still pins the watch.
+    id: "live-watch-exempt-from-recovery-pin",
+    sinceCommit: "7f8c05af28c",
+    sourcePath: "server/src/services/execution-blocker.ts",
+    distPath: "services/execution-blocker.js",
+    markers: ["liveWatchExemptCondition"],
+    summary:
+      "a live watch is exempt from the recovery hold while keeping the no-replay receipt",
   },
 ];
 
@@ -125,8 +204,8 @@ export function resolveRunningServerDist(candidates, exists = existsSync) {
   return null;
 }
 
-function readSourceAtHead(sourcePath, git) {
-  return git(["show", `HEAD:${sourcePath}`]);
+function readSourceAtRef(sourcePath, git, ref) {
+  return git(["show", `${ref}:${sourcePath}`]);
 }
 
 /**
@@ -134,11 +213,25 @@ function readSourceAtHead(sourcePath, git) {
  *
  * `git` is injected so the test can drive this without a repository, and so a
  * git failure is distinguishable from a missing marker.
+ *
+ * `ref` names the tree the "is this fix committed?" half is answered against.
+ * It defaults to `HEAD`, which is the wrong default for the question this file
+ * exists to answer and was measured to mislead on PET-497: the checkout the
+ * check was run from was 21 commits behind `origin/master`, so a sentinel whose
+ * fix had landed on master read as `manifest_mismatch` — indistinguishable from
+ * a manifest that is genuinely broken, and the reader's next move is to go edit
+ * the manifest. Both outcomes return `EXIT_UNEVALUATED`, so the code was safe,
+ * but the *diagnosis* was wrong. Pass `--ref origin/master` to compare the
+ * running artifact against what master actually contains.
  */
-export function evaluateSentinels(sentinels, { distRoot, git, exists = existsSync }) {
+export function evaluateSentinels(
+  sentinels,
+  { distRoot, git, exists = existsSync, ref = "HEAD" },
+) {
   return sentinels.map((sentinel) => {
     const sourceMissingFromHead = sentinel.markers.filter(
-      (marker) => !readSourceAtHead(sentinel.sourcePath, git).includes(marker),
+      (marker) =>
+        !readSourceAtRef(sentinel.sourcePath, git, ref).includes(marker),
     );
     const distFile = join(distRoot, sentinel.distPath);
     const deployedExists = exists(distFile);
@@ -171,21 +264,31 @@ export function summarize(results) {
     total: results.length,
     deployed: results.filter((r) => r.state === "deployed").length,
     drifted: results.filter((r) => r.state === "drifted").map((r) => r.id),
-    manifestMismatch: results.filter((r) => r.state === "manifest_mismatch").map((r) => r.id),
+    manifestMismatch: results
+      .filter((r) => r.state === "manifest_mismatch")
+      .map((r) => r.id),
   };
 }
 
 export function formatReport(report) {
-  const lines = [`running build: ${report.distRoot ?? "(not found)"}`];
+  const lines = [
+    `running build: ${report.distRoot ?? "(not found)"}`,
+    `compared against: ${report.ref ?? "HEAD"} (${report.refCommit ?? "unknown"})`,
+  ];
   for (const result of report.results) {
-    const mark = result.state === "deployed" ? "ok  " : result.state === "drifted" ? "DRIFT" : "BUG  ";
+    const mark =
+      result.state === "deployed"
+        ? "ok  "
+        : result.state === "drifted"
+          ? "DRIFT"
+          : "BUG  ";
     lines.push(
       `  ${mark} ${result.id} — ${result.summary}` +
         (result.state === "drifted"
           ? `\n         committed at ${result.sinceCommit} but absent from ${result.distFile}`
           : "") +
         (result.state === "manifest_mismatch"
-          ? `\n         marker not in ${result.sourcePath} at HEAD: ${result.sourceMissingFromHead.join(", ")}`
+          ? `\n         marker not in ${result.sourcePath} at ${report.ref ?? "HEAD"}: ${result.sourceMissingFromHead.join(", ")}`
           : ""),
     );
   }
@@ -193,7 +296,11 @@ export function formatReport(report) {
     lines.push(
       "",
       "This is a bug in check-running-build-drift.mjs: a sentinel no longer matches the",
-      "source it claims to guard. Fix the manifest before trusting any result here.",
+      `source it claims to guard, at ${report.ref ?? "HEAD"}. Two causes, and they need`,
+      "different fixes:",
+      `  - the checkout is behind the fix. Re-run with --ref origin/master, or fetch.`,
+      "  - the fix is gone, or the manifest names a marker it never had. Fix the manifest.",
+      "Both return a non-drift exit code, so neither can be read as a deploy finding.",
     );
   } else if (report.drifted.length > 0) {
     lines.push(
@@ -227,6 +334,7 @@ export function runCheck({
   distRoot,
   git,
   exists = existsSync,
+  ref = "HEAD",
   sentinels = RUNNING_BUILD_SENTINELS,
   write = (text) => process.stdout.write(text),
 } = {}) {
@@ -241,31 +349,63 @@ export function runCheck({
     return EXIT_UNEVALUATED;
   }
 
+  // Recorded so the report says which tree answered "is this committed?". A
+  // reader who cannot see the baseline cannot tell a stale checkout from a
+  // broken manifest, and those send the reader to opposite places.
+  let refCommit = null;
+  try {
+    refCommit = git(["rev-parse", "--short", ref]).trim();
+  } catch {
+    // Not fatal on its own: the sentinels below will fail to read the source and
+    // report EXIT_UNEVALUATED with a more specific reason.
+    refCommit = null;
+  }
+
   let results;
   try {
-    results = evaluateSentinels(sentinels, { distRoot, git, exists });
+    results = evaluateSentinels(sentinels, { distRoot, git, exists, ref });
   } catch (error) {
     // The source half could not be read. That is a broken check, not a deploy
     // state, and it must not borrow the drift code.
     const reason = error instanceof Error ? error.message : String(error);
     emit(
-      { error: `could not read the source tree at HEAD: ${reason}`, unevaluated: true },
-      `could not read the source tree at HEAD: ${reason}`,
+      {
+        error: `could not read the source tree at ${ref}: ${reason}`,
+        ref,
+        unevaluated: true,
+      },
+      `could not read the source tree at ${ref}: ${reason}`,
     );
     return EXIT_UNEVALUATED;
   }
 
-  const report = { distRoot, ...summarize(results), results };
-  write(asJson ? `${JSON.stringify(report, null, 2)}\n` : `${formatReport(report)}\n`);
+  const report = { distRoot, ref, refCommit, ...summarize(results), results };
+  write(
+    asJson
+      ? `${JSON.stringify(report, null, 2)}\n`
+      : `${formatReport(report)}\n`,
+  );
   if (report.manifestMismatch.length > 0) return EXIT_UNEVALUATED;
   return report.drifted.length > 0 ? EXIT_DRIFT : EXIT_OK;
 }
 
+/** Read `--ref <name>` out of argv, or fall back to `HEAD`. */
+export function refFromArgv(argv) {
+  const at = argv.indexOf("--ref");
+  const value = at >= 0 ? argv[at + 1] : undefined;
+  if (at >= 0 && !value) {
+    throw new Error("--ref needs a ref name, for example --ref origin/master");
+  }
+  return value || "HEAD";
+}
+
 function main(argv) {
   const asJson = argv.includes("--json");
+  const ref = refFromArgv(argv);
   const distRoot = resolveRunningServerDist(runningServerDistCandidates());
-  const git = (args) => execFileSync("git", args, { cwd: process.cwd(), encoding: "utf8" });
-  return runCheck({ asJson, distRoot, git });
+  const git = (args) =>
+    execFileSync("git", args, { cwd: process.cwd(), encoding: "utf8" });
+  return runCheck({ asJson, distRoot, git, ref });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
