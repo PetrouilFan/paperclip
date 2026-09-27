@@ -21,18 +21,26 @@
  * opposite error costs a contributor their attribution silently, which is the
  * failure this gate exists to prevent, so the bias runs towards over-crediting.
  *
- * Two ways of losing credit silently are reported rather than resolved, because
- * neither has a correct answer this gate can compute:
+ * Two things that cost a contributor their credit are reported rather than
+ * resolved, because neither has a correct answer this gate can compute:
  *
  * - A shared identity. When one address arrives under two different names, that
  *   is two people sharing a generic local identity as often as it is one person
  *   who changed their git config. De-duplicating is right; dropping the second
  *   name is still a lost attribution, so both spellings are named.
- * - An unverified local identity. A trailer built from an address that cannot be
- *   a real mail domain came from whatever `git config` the committing tree
- *   carried, and a per-agent worktree outlives the task that configured it. The
- *   trailer is still emitted — it is the best guess available — but the note
- *   says plainly that nothing verified it.
+ * - An unverified credit. A GitHub match proves an *address* belongs to an
+ *   account; it says nothing about `user.name`, and the name is read out of
+ *   whatever `git config` the committing tree carried either way. A per-agent
+ *   worktree outlives the task that configured it, so the name on a trailer can
+ *   be a different agent's. The trailer is still emitted — it is the best guess
+ *   available — but the note says plainly that nothing verified it, and which of
+ *   the two things was unverified.
+ *
+ * The two biases above govern different decisions and do not contradict each
+ * other. Over-crediting answers whether to emit a trailer at all, where the
+ * answer is yes even when unverified. Reporting a shared identity answers
+ * whether to de-duplicate an address that arrived under two names, where
+ * collapsing it is right and staying silent about the loser is not.
  *
  * Informational rather than a failure, on purpose. The squash message does not
  * exist while the PR is open, so this cannot be verified here and cannot be
@@ -73,10 +81,15 @@ function noReplyEmail(login) {
 /**
  * Domains that cannot carry someone's mail, so an address in one is a machine
  * default rather than an identity anything outside the machine has verified.
- * `.local` and `.localhost` are the mDNS names; the rest are the reserved
- * special-use names. A domain with no dot at all is the same story.
+ * `.local` is the mDNS name; `.localhost`, `.test` and `.invalid` are reserved
+ * together (RFC 6761 §6); `.example` is RFC 2606; `.internal` is ICANN's
+ * special-use list; `.home.arpa` is RFC 8375; `.lan` joined them in 2024; and
+ * `localdomain` is the hostname Debian ships by default. A domain with no dot
+ * at all is the same story. Longest alternatives first, so the anchored match
+ * does not have to backtrack out of a shorter prefix.
  */
-const LOCAL_ONLY_DOMAIN = /\.(local|localhost|internal|home\.arpa)$/i;
+const LOCAL_ONLY_DOMAIN =
+  /\.(localdomain|localhost|local|internal|home\.arpa|test|invalid|example|lan)$/i;
 
 function isLocalOnlyIdentity(email) {
   if (!email) return false;
@@ -88,6 +101,22 @@ function isLocalOnlyIdentity(email) {
   return LOCAL_ONLY_DOMAIN.test(domain);
 }
 
+/**
+ * Whether two spellings are one name. Every other identity comparison in this
+ * file is case-folded because GitHub logins and mail domains are; a name is no
+ * different, and a trailing space is not part of anyone's name.
+ */
+function sameName(a, b) {
+  return (a ?? '').trim().toLowerCase() === (b ?? '').trim().toLowerCase();
+}
+
+/** `a` and `b`, or `a`, `b`, and `c` — past two a bare `and` reads as pairs. */
+function listNames(names) {
+  const quoted = names.map(n => `\`${n}\``);
+  if (quoted.length === 2) return quoted.join(' and ');
+  return `${quoted.slice(0, -1).join(', ')}, and ${quoted[quoted.length - 1]}`;
+}
+
 export function checkCoauthors(commits, prAuthor) {
   const author = (prAuthor ?? '').toLowerCase();
   const contributors = new Map();
@@ -96,14 +125,20 @@ export function checkCoauthors(commits, prAuthor) {
   // their account, some authored with an email GitHub does not know — and keying
   // on login alone would then emit two trailers for them.
   const seenEmails = new Map();
-  // Addresses that arrived under more than one name, mapped to those names. Two
-  // people sharing one generic local identity is indistinguishable here from one
-  // person who edited their git config, so the names are reported rather than
-  // resolved: whoever the de-dup drops has still lost their credit.
+  // Addresses that arrived under more than one name, mapped to the name already
+  // credited for them plus every name seen. Two people sharing one generic
+  // local identity is indistinguishable here from one person who edited their
+  // git config, so the names are reported rather than resolved: whoever the
+  // de-dup drops has still lost their credit.
   const collisions = new Map();
-  // Trailers whose credit rests on a local git config rather than on anything
-  // GitHub verified, in the order first seen.
-  const unverified = new Set();
+  // Trailers whose credit rests on the committing tree's git config rather than
+  // on anything GitHub verified, in the order first seen. Two reasons, because
+  // they are two different failures: an address nothing can route means the
+  // whole identity is a machine default, while a matched address with a name
+  // from the tree means the account is right and the label on it may belong to a
+  // stale worktree.
+  const unverified = [];
+  const unverifiedIds = new Set();
 
   for (const entry of commits ?? []) {
     const login = entry?.author?.login ?? null;
@@ -134,8 +169,15 @@ export function checkCoauthors(commits, prAuthor) {
     if (!email) continue;
 
     // Resolved before the de-dup, because deciding whether a name is new is the
-    // question the de-dup is answering.
-    const displayName = gitName && login ? gitName : name;
+    // question the de-dup is answering. Trimmed first: surrounding whitespace is
+    // not part of an identity, and a trailer rendered with it is malformed. A
+    // name that is empty or only whitespace falls back to the address's local
+    // part — which for a matched account is the login, i.e. exactly right — and
+    // the commit is dropped if even that is empty, rather than emitting a
+    // trailer nobody can read.
+    const rawDisplayName = gitName && login ? gitName : name;
+    const displayName = (rawDisplayName ?? '').trim() || email.split('@')[0].trim() || null;
+    if (!displayName) continue;
 
     // Keyed on identity, not on the rendered line. One person whose git config
     // name changed across commits is still one person, and emitting them twice
@@ -147,23 +189,56 @@ export function checkCoauthors(commits, prAuthor) {
     // of the de-dup so it also fires when the `key` de-dup is what would drop
     // this commit — which is the whole case when neither commit was matched to
     // an account, since then `key` is the address itself.
-    if (emailKey && seenEmails.has(emailKey) && displayName && seenEmails.get(emailKey) !== displayName) {
+    //
+    // Except when the de-dup about to run is an *account* de-dup: this commit
+    // resolves to a login already credited, so one person wrote both under two
+    // git names. That is a config edit, not a shared identity, and calling it a
+    // collision would tell the merger to hand-paste a second trailer for a
+    // contributor who already has one — the exact thing the de-dup below exists
+    // to prevent, with two notes in one function contradicting each other.
+    // Gating on the login, not on `contributors.has(key)`: for an unmatched
+    // commit the key *is* the address, so keying on it would silence the
+    // shared-identity case this note exists for.
+    const droppedByAccountDedup = Boolean(login) && contributors.has(key);
+    if (
+      !droppedByAccountDedup &&
+      emailKey &&
+      seenEmails.has(emailKey) &&
+      !sameName(seenEmails.get(emailKey), displayName)
+    ) {
       // Seeded with the name already credited, so the note names both parties:
       // the one whose trailer was emitted and the one whose credit is now in
       // question.
-      if (!collisions.has(emailKey)) collisions.set(emailKey, new Set([seenEmails.get(emailKey)]));
-      collisions.get(emailKey).add(displayName);
+      if (!collisions.has(emailKey)) {
+        const carried = seenEmails.get(emailKey) || displayName;
+        collisions.set(emailKey, { carried, names: new Set([carried]) });
+      }
+      collisions.get(emailKey).names.add(displayName);
     }
 
     if (contributors.has(key)) continue;
     if (emailKey && seenEmails.has(emailKey)) continue;
-    if (emailKey) seenEmails.set(emailKey, displayName ?? '');
+    if (emailKey) seenEmails.set(emailKey, displayName);
 
-    // Only a trailer built from the raw git author can be unverified: a matched
-    // login means GitHub resolved this person to an account regardless of what
-    // the commit's own email field says.
-    if (!login && isLocalOnlyIdentity(gitEmail)) {
-      unverified.add(`${displayName} <${gitEmail}>`);
+    // Nothing verified this trailer. A GitHub match proves the address belongs
+    // to an account and says nothing about the name, which is read out of the
+    // committing tree in both branches above — so the note is about the name,
+    // and the two reasons are recorded apart because they read differently to
+    // whoever is fixing them.
+    if (login) {
+      if (!sameName(displayName, login)) {
+        const id = `${displayName} <${email}>`;
+        if (!unverifiedIds.has(id)) {
+          unverifiedIds.add(id);
+          unverified.push({ id, reason: 'unverified-name' });
+        }
+      }
+    } else if (isLocalOnlyIdentity(gitEmail)) {
+      const id = `${displayName} <${gitEmail}>`;
+      if (!unverifiedIds.has(id)) {
+        unverifiedIds.add(id);
+        unverified.push({ id, reason: 'unroutable-address' });
+      }
     }
 
     contributors.set(key, {
@@ -187,26 +262,34 @@ export function checkCoauthors(commits, prAuthor) {
     );
   }
 
-  for (const [address, names] of collisions) {
+  for (const [address, { carried, names }] of collisions) {
     const named = [...names].filter(Boolean).sort();
     if (named.length < 2) continue;
+    // The carried party is named rather than called "the first": the trailer
+    // block above is sorted, so "first" does not mean what a reader scanning
+    // that list top-down takes it to mean.
+    const carriedName = carried ? `\`${carried}\`` : `\`${named[0]}\``;
     informational.push(
-      `\`${address}\` is credited to ${named.map(n => `\`${n}\``).join(' and ')}, so only ` +
-      'the first is carried above. One address under two names is two people sharing a local ' +
-      'git identity as often as it is one person who edited their config, and this cannot tell ' +
-      'them apart — credit the second by hand, or set a distinct `user.email` per contributor.'
+      `\`${address}\` is credited to ${listNames(named)}, so only ${carriedName} is carried above. ` +
+      `One address under ${named.length} names is one person who edited their config at least as ` +
+      'often as it is two people sharing a generic identity, and this cannot tell them apart — ' +
+      'credit the others by hand, or set a distinct `user.email` per contributor.'
     );
   }
 
-  if (unverified.size > 0) {
-    const one = unverified.size === 1;
+  if (unverified.length > 0) {
+    const one = unverified.length === 1;
+    const reasons = unverified.map(({ id, reason }) =>
+      reason === 'unroutable-address'
+        ? `\`${id}\` has no routable address, so nothing outside the machine has ever seen this identity`
+        : `\`${id}\` is a GitHub account's own address, but the name on it is unverified`
+    );
     informational.push(
-      `Nothing verified ${one ? 'this trailer' : 'these trailers'}: ` +
-      `${[...unverified].map(id => `\`${id}\``).join(', ')} ` +
-      `${one ? 'is not a routable address' : 'are not routable addresses'}, so the name came from ` +
-      '`git config` in the tree the commit was made in rather than from a GitHub account. A ' +
-      'worktree keeps its config across tasks, so this credits whoever configured it. Re-author ' +
-      'with `git -c user.name=... -c user.email=...` and force-push if the name is wrong.'
+      `Nothing verified ${one ? 'this trailer' : 'these trailers'}: ${reasons.join('; ')}. ` +
+      'A GitHub match proves an address belongs to an account and says nothing about `user.name`, ' +
+      'and a worktree keeps its config across tasks — so an unverified name can credit whichever ' +
+      'agent configured the tree rather than the one who wrote the commit. Re-author with ' +
+      '`git -c user.name=... -c user.email=...` and force-push if a name is wrong.'
     );
   }
 

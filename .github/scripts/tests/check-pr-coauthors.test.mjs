@@ -22,18 +22,18 @@ test('checkCoauthors: says nothing when every commit is the PR author\'s own', (
 test('checkCoauthors: hands over the trailer when the branch carries someone else\'s commit', () => {
   // The case this exists for: a stale contributor PR rebased and landed by a
   // maintainer. Squash-merging drops the contributor unless the squash body
-  // carries their trailer.
+  // carries their trailer. Asserted on the trailers note specifically: a matched
+  // account whose git name is its human name also gets the unverified-name note
+  // below, and that is a separate claim with its own tests.
   const result = checkCoauthors(
     [commit('stubbi', 'Jannes Stubbemann'), commit('tonio-alucema')],
     'tonio-alucema'
   );
 
-  assert.equal(result.informational.length, 1);
-  assert.match(result.informational[0], /Jannes Stubbemann/);
-  assert.match(
-    result.informational[0],
-    /Co-Authored-By: Jannes Stubbemann <stubbi@users\.noreply\.github\.com>/
-  );
+  const note = trailersNote(result);
+  assert.ok(note, 'the trailer is handed over');
+  assert.match(note, /Jannes Stubbemann/);
+  assert.match(note, /Co-Authored-By: Jannes Stubbemann <stubbi@users\.noreply\.github\.com>/);
 });
 
 test('checkCoauthors: never fails the PR, because the squash message does not exist yet', () => {
@@ -191,6 +191,15 @@ function unverifiedNote(result) {
   return result.informational.find(line => line.includes('Nothing verified'));
 }
 
+/** The trailer hand-over specifically — the other notes quote its lines. */
+function trailersNote(result) {
+  return result.informational.find(line => line.includes('Squash-merging drops that authorship'));
+}
+
+function unverifiedIdentities(result) {
+  return [...(unverifiedNote(result) ?? '').matchAll(/`([^`]+ <[^`]+>)`/g)].map(m => m[1]);
+}
+
 test('checkCoauthors: names both parties when two people share one local identity', () => {
   // The failure this gate exists to prevent, reached through its own de-dup. Two
   // distinct agents configured with the same generic fleet identity: the second
@@ -207,7 +216,7 @@ test('checkCoauthors: names both parties when two people share one local identit
   assert.match(note, /`agent@paperclip\.local`/);
   assert.match(note, /`Agent A`/);
   assert.match(note, /`Agent B`/);
-  assert.match(note, /credit the second by hand/);
+  assert.match(note, /credit the others by hand/);
 });
 
 test('checkCoauthors: says nothing about a collision when the shared identity is one person', () => {
@@ -288,19 +297,257 @@ test('checkCoauthors: does not warn about a routable address GitHub could not ma
   assert.match(result.informational[0], /Co-Authored-By: Ada Lovelace <ada@example\.com>/);
 });
 
-test('checkCoauthors: does not warn about a local address GitHub matched to an account', () => {
-  // GitHub resolved this person, so the credit does not rest on the tree's
-  // config whatever the commit's own email field happens to say.
+test('checkCoauthors: says the ADDRESS is verified when GitHub matched it, and the name is not', () => {
+  // The address here is GitHub's own, and that part is verified. The name is
+  // still `user.name` out of the committing tree, and a per-agent worktree
+  // outlives the task that configured it — so the note now fires, and fires on
+  // the name rather than on the address.
+  //
+  // This test previously asserted the opposite, on the reasoning that a resolved
+  // account settles the credit. That is true of the address and false of the
+  // name, which is the same unverified-name shape as the worktree case below.
+  // Accepted cost: a human co-author whose real name differs from their handle
+  // now gets this line too. The gate cannot tell a real name from a leaked
+  // worktree name without a heuristic, and this file's stated bias is to say so
+  // rather than stay silent. `passed` is unaffected either way, so it cannot
+  // block the PR.
   const result = checkCoauthors(
     [commit('stubbi', 'Jannes Stubbemann', 'jannes@paperclip.local')],
     'tonio-alucema'
   );
 
-  assert.equal(unverifiedNote(result), undefined);
+  const note = unverifiedNote(result);
+  assert.ok(note, 'the unverified name is reported');
+  assert.match(note, /Jannes Stubbemann <stubbi@users\.noreply\.github\.com>/);
+  assert.match(note, /name on it is unverified/);
+  // Still emitted, and still pointing at the account GitHub resolved.
   assert.match(
-    result.informational[0],
+    trailersNote(result),
     /Co-Authored-By: Jannes Stubbemann <stubbi@users\.noreply\.github\.com>/
   );
+});
+
+test('checkCoauthors: does not call a real name on a matched account unverified', () => {
+  // The control for the test above, and the one that keeps the note affordable.
+  // When the git name IS the login there is no unverified name to report, so the
+  // ordinary matched commit stays a single note.
+  const result = checkCoauthors(
+    [commit('stubbi', 'stubbi', 'jannes@paperclip.local')],
+    'tonio-alucema'
+  );
+
+  assert.equal(unverifiedNote(result), undefined);
+});
+
+test('checkCoauthors: reports a worktree name attached to a real account', () => {
+  // B3. The trailer links to the right account and is labelled with whatever
+  // configured the tree. `wt-pet211-ultron1-build` is the kind of name
+  // `git worktree` leaves behind, and the file header cites worktrees outliving
+  // their task as the reason this defect exists — yet the name was read out of
+  // that same config in the matched path too, where nothing flagged it.
+  const result = checkCoauthors(
+    [commit('stubbi', 'wt-pet211-ultron1-build', 'build@box.local')],
+    'tonio-alucema'
+  );
+
+  assert.match(
+    trailersNote(result),
+    /Co-Authored-By: wt-pet211-ultron1-build <stubbi@users\.noreply\.github\.com>/
+  );
+  const note = unverifiedNote(result);
+  assert.ok(note, 'the name is reported as unverified');
+  assert.match(note, /name on it is unverified/);
+  assert.match(note, /worktree keeps its config across tasks/);
+});
+
+test('checkCoauthors: falls back to the address when a commit carries no usable name', () => {
+  // A name that is only whitespace is not a name. Rendering it produces a
+  // trailer nobody can read, and for a matched account the address's local part
+  // is the login, which is the identity exactly.
+  const matched = checkCoauthors(
+    [commit('stubbi', '   ', 'jannes@paperclip.local')],
+    'tonio-alucema'
+  );
+
+  assert.match(trailersNote(matched), /Co-Authored-By: stubbi <stubbi@users\.noreply\.github\.com>/);
+  assert.equal(unverifiedNote(matched), undefined);
+});
+
+test('checkCoauthors: does not call one account\'s git rename a shared identity', () => {
+  // B1. One person, one account, one address, two git names — a config edit.
+  // The account de-dup is what collapses them, and it is right to: the note's
+  // remedy is to hand-paste the second name, which for a matched account means
+  // a second trailer for a contributor who already has one, the exact thing the
+  // de-dup exists to prevent.
+  const localAddress = checkCoauthors(
+    [
+      commit('stubbi', 'Jannes Stubbemann', 'build@box.local'),
+      commit('stubbi', 'J. Stubbemann', 'build@box.local'),
+    ],
+    'tonio-alucema'
+  );
+  const routableAddress = checkCoauthors(
+    [
+      commit('stubbi', 'Jannes Stubbemann', 'jannes@example.com'),
+      commit('stubbi', 'J. Stubbemann', 'jannes@example.com'),
+    ],
+    'tonio-alucema'
+  );
+
+  assert.equal(collisionNote(localAddress), undefined);
+  assert.equal(collisionNote(routableAddress), undefined);
+  assert.equal(
+    (trailersNote(localAddress).match(/Co-Authored-By:/g) ?? []).length,
+    1
+  );
+});
+
+test('checkCoauthors: still reports two unmatched agents on one address after the account guard', () => {
+  // The regression the account guard must not introduce. Gating the collision on
+  // `!contributors.has(key)` — the obvious form — silences THIS case, because an
+  // unmatched commit's key falls back to the address, so the second agent
+  // collides with the first on the key and the note never fires. That is the
+  // exact loss this issue was filed for, so the guard is on the login instead.
+  const result = checkCoauthors(
+    [unmatched('Agent A', 'agent@paperclip.local'), unmatched('Agent B', 'agent@paperclip.local')],
+    'tonio-alucema'
+  );
+
+  const note = collisionNote(result);
+  assert.ok(note, 'the second agent is still reported');
+  assert.match(note, /`Agent B`/);
+});
+
+test('checkCoauthors: does not call names that differ only in case two people', () => {
+  // B2. Every other identity comparison in the file is case-folded; this one
+  // was not, so a person whose name is capitalised differently on one commit
+  // read as two contributors sharing an address.
+  const caseOnly = checkCoauthors(
+    [unmatched('Agent A', 'agent@paperclip.local'), unmatched('agent a', 'agent@paperclip.local')],
+    'tonio-alucema'
+  );
+  const trailingSpace = checkCoauthors(
+    [unmatched('Agent A', 'agent@paperclip.local'), unmatched('Agent A ', 'agent@paperclip.local')],
+    'tonio-alucema'
+  );
+
+  assert.equal(collisionNote(caseOnly), undefined);
+  assert.equal(collisionNote(trailingSpace), undefined);
+});
+
+test('checkCoauthors: does not call a matched-then-unmatched pair two people', () => {
+  // B2 again, on the case the `seenEmails` map exists for: one commit matched to
+  // the account, the next authored with an address GitHub does not know, same
+  // address, same name. The email de-dup drops the second, which is correct —
+  // it is one person — so calling it a collision sends the merger to paste a
+  // duplicate trailer.
+  const result = checkCoauthors(
+    [
+      commit('alice', 'Alice', 'a@box.local'),
+      unmatched('alice', 'a@box.local'),
+    ],
+    'tonio-alucema'
+  );
+
+  assert.equal(collisionNote(result), undefined);
+  assert.equal((trailersNote(result).match(/Co-Authored-By:/g) ?? []).length, 1);
+});
+
+test('checkCoauthors: renders a name without the whitespace it was authored with', () => {
+  // The comparison fix has to reach the rendered line too, or the squash body
+  // carries a trailer git will not parse as a name.
+  const result = checkCoauthors(
+    [unmatched('  Agent A  ', 'agent@paperclip.local')],
+    'tonio-alucema'
+  );
+
+  assert.match(trailersNote(result), /Co-Authored-By: Agent A <agent@paperclip\.local>$/m);
+});
+
+test('checkCoauthors: lists three names on one address as a list, and says how many', () => {
+  // N1. `a` and `b` and `c` reads as a chain of pairs, and the sentence claimed
+  // "two names" whatever the count was.
+  const result = checkCoauthors(
+    [
+      unmatched('Alice', 'shared@paperclip.local'),
+      unmatched('Bob', 'shared@paperclip.local'),
+      unmatched('Carol', 'shared@paperclip.local'),
+    ],
+    'tonio-alucema'
+  );
+
+  const note = collisionNote(result);
+  assert.match(note, /`Alice`, `Bob`, and `Carol`/);
+  assert.match(note, /One address under 3 names/);
+});
+
+test('checkCoauthors: does not name the premise as a local identity when one side is an account', () => {
+  // One commit matched to an account, the next not, same address, genuinely
+  // different names. This fires, and it should: the second name is a lost
+  // credit. But the note must not claim both are "sharing a local git
+  // identity" — one of them is a GitHub account — and its remedy must be the
+  // one that adds a line, not the one that replaces one.
+  const result = checkCoauthors(
+    [commit('alice', 'Alice', 'a@box.local'), unmatched('Bob', 'a@box.local')],
+    'tonio-alucema'
+  );
+
+  const note = collisionNote(result);
+  assert.ok(note, 'the lost name is reported');
+  assert.doesNotMatch(note, /sharing a local git identity/);
+  assert.match(note, /so only `Alice` is carried above/);
+  // The carried trailer is the matched account's, so following the remedy adds
+  // Bob's raw address rather than a second line for Alice.
+  assert.match(trailersNote(result), /Co-Authored-By: Alice <alice@users\.noreply\.github\.com>$/m);
+});
+
+test('checkCoauthors: names the party it carried rather than calling it the first', () => {
+  // N2. "the first" meant first in commit order; the trailer block above is
+  // sorted, so a reader scanning it top-down reads the note backwards.
+  const result = checkCoauthors(
+    [unmatched('Zeta', 'z@x.local'), unmatched('Alpha', 'z@x.local')],
+    'tonio-alucema'
+  );
+
+  const note = collisionNote(result);
+  assert.match(note, /so only `Zeta` is carried above/);
+  assert.doesNotMatch(note, /only the first/);
+});
+
+test('checkCoauthors: treats the reserved special-use domains as local identities', () => {
+  // B4. The docstring claimed these were covered; `.localhost` was the only one
+  // listed. `example.com` and `@users.noreply.github.com` must stay quiet.
+  for (const domain of ['example.test', 'example.invalid', 'example.example', 'box.lan', 'host.localdomain']) {
+    const result = checkCoauthors([unmatched('H', `e@${domain}`)], 'tonio-alucema');
+
+    assert.ok(
+      unverifiedNote(result),
+      `${domain} cannot carry mail, so nothing outside the machine has seen it`
+    );
+  }
+
+  assert.equal(unverifiedNote(checkCoauthors([unmatched('H', 'e@example.com')], 'tonio-alucema')), undefined);
+  assert.equal(
+    unverifiedNote(checkCoauthors([commit('stubbi', 'stubbi', 'e@users.noreply.github.com')], 'tonio-alucema')),
+    undefined
+  );
+});
+
+test('checkCoauthors: reports each unverified trailer once, and says which part is unverified', () => {
+  // Two commits by two agents on two unroutable addresses, one of which GitHub
+  // matched. The reasons differ, so they are stated apart rather than flattened
+  // into a claim that both are unroutable.
+  const result = checkCoauthors(
+    [
+      unmatched('Hephaestus', 'hephaestus@paperclip.local'),
+      commit('stubbi', 'Hephaestus Renamed', 'other@paperclip.local'),
+    ],
+    'tonio-alucema'
+  );
+
+  const identities = unverifiedIdentities(result);
+  assert.equal(new Set(identities).size, identities.length);
+  assert.equal(identities.length, 2);
 });
 
 test('checkCoauthors: treats a bare domain as a local identity', () => {
