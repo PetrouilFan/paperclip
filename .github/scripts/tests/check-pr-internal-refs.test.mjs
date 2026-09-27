@@ -843,8 +843,13 @@ test('NEGATIVE CONTROL: masking a quoted shape does not become a general escape 
 test('the three real leaks the quoted-shape rule was measured against all still fail', () => {
   // A narrowing that drops false positives by dropping coverage is not a fix.
   // These are the three bodies that the same replay showed to be genuine, and
-  // each is named with the rule that carries it: a Markdown link destination,
-  // and two verb positions that the masking never touched.
+  // each exercises a different rule: a Markdown link destination, and two verb
+  // positions that the masking never touched.
+  //
+  // The assertion is that each is still caught and that no finding echoes the
+  // identifier. `result.passed === false` is the coverage half; the echo check is
+  // what keeps the finding safe to post as a comment, which is the whole point
+  // of redacting it.
   const mustFail = [
     ['5320a440', 'Paperclip work item: [ZOL-5477](/ZOL/issues/ZOL-5477).'],
     ['bb6e7215', 'Closes RUS-56'],
@@ -853,7 +858,8 @@ test('the three real leaks the quoted-shape rule was measured against all still 
   for (const [sha, body] of mustFail) {
     const result = checkInternalRefs({ ...CLEAN, commits: [{ sha, commit: { message: `fix: x\n\n${body}` } }] });
     assert.equal(result.passed, false, `expected ${sha} to still fail: ${JSON.stringify(result.failures)}`);
-    assert.match(result.failures.join('\n'), /ZOL-5477|RUS-56|LAS-101/);
+    const joined = assertNoEcho(result, ['ZOL-5477', 'RUS-56', 'LAS-101']);
+    assert.match(joined, /A commit message body refers to 1 issue identifier/);
   }
 });
 
@@ -869,7 +875,8 @@ test('the fourth body, kept deliberately, and the cost of keeping it', () => {
     commits: [{ commit: { message: 'fix: x\n\nAfter onboarding the wizard navigated to the newly created issue\n(e.g. /JAR/issues/JAR-1). useCompanyPageMemory then saved this path,' } }],
   });
   assert.equal(result.passed, false);
-  assert.match(result.failures.join('\n'), /JAR-1/);
+  const joined = assertNoEcho(result, ['JAR-1']);
+  assert.match(joined, /A commit message body refers to 1 issue identifier/);
 });
 
 test('only the commit body masks: every other authored surface still reads a quoted path', () => {
@@ -886,7 +893,8 @@ test('only the commit body masks: every other authored surface still reads a quo
   for (const [surface, override] of bodies) {
     const result = checkInternalRefs({ ...CLEAN, ...override });
     assert.equal(result.passed, false, `expected the ${surface} surface to still fail`);
-    assert.match(result.failures.join('\n'), /TASK-482/);
+    const joined = assertNoEcho(result, ['TASK-482']);
+    assert.match(joined, /refers to 1 issue identifier/);
   }
 });
 
