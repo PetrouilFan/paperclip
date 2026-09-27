@@ -237,7 +237,7 @@ else
     done < "/sys/fs/cgroup$CG/cgroup.procs"
     # Require both an absolute floor and a majority, so a lone test-owned child
     # never trips this.
-    if [ "$total" -ge 8 ] && [ "$stopped_total" -ge 4 ] && [ "$stopped_total" -gt $(( total / 2 )); then
+    if [ "$total" -ge 8 ] && [ "$stopped_total" -ge 4 ] && [ "$stopped_total" -gt $(( total / 2 )) ]; then
       log "ALERT $stopped_total of $total processes in $CG are stopped while the main PID is not. This is the known residual gap: the guardian will not sweep the cgroup with SIGCONT because this repo's tests SIGSTOP their own children here, so this needs a human: systemctl --user kill --kill-whom=all --signal=SIGCONT $UNIT"
     fi
   fi
