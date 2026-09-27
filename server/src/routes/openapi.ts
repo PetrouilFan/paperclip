@@ -6,6 +6,10 @@ import {
 import { Router } from "express";
 import { z } from "zod";
 import {
+  issueListKnownQueryKeys,
+  issueCountKnownQueryKeys,
+} from "../services/issue-list-query-keys.js";
+import {
   createAiConnectionSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
@@ -1210,6 +1214,7 @@ function registerCurrentRoute(input: {
   path: string;
   tags: string[];
   summary: string;
+  description?: string;
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
@@ -1228,6 +1233,7 @@ function registerCurrentRoute(input: {
     path: input.path,
     tags: input.tags,
     summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
     ...(request ? { request } : {}),
     responses: input.responses ?? {
       200: r.ok(),
@@ -3799,20 +3805,66 @@ registry.registerPath({
 
 // ─── Issues ──────────────────────────────────────────────────────────────────
 
+/**
+ * Builds the documented query schema of a collection route from the keys that
+ * route actually accepts, which the route supplies as a single literal shared
+ * with its unknown-key guard.
+ *
+ * The point is discoverability, not validation. This schema is documentation:
+ * `buildPaths()` converts it to JSON Schema and nothing ever parses a request
+ * with it, so listing a key here cannot change what the server does. That
+ * matters because the two collections that need this reject unknown keys with
+ * a 400 naming what they accept — and a spec that documents almost none of
+ * those keys leaves that error as the only way to learn the real name. A
+ * caller reading the contract must be able to see that the filter is called
+ * `assigneeAgentId`.
+ *
+ * Keys are left untyped unless `typed` supplies a schema the handler actually
+ * enforces, so documenting a key never promises a constraint that would then be
+ * wrong in production.
+ */
+function documentedQuerySchema(
+  keys: readonly string[],
+  typed: Record<string, z.ZodTypeAny> = {},
+) {
+  return z.object(
+    Object.fromEntries(
+      keys.map((key) => [key, typed[key] ?? z.unknown().optional()]),
+    ),
+  );
+}
+
 registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "List issues in a company",
   description:
-    "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract.",
+    "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract. " +
+    "The agent assignee filter is `assigneeAgentId`; there is no `assigneeId`. " +
+    "An unrecognised query parameter is rejected with 400 rather than ignored. " +
+    "Results are ordered by `updatedAt` descending and are capped at " +
+    "`ISSUE_LIST_DEFAULT_LIMIT` rows when `limit` is omitted, so a company with " +
+    "more issues than that needs `limit` with `offset` to page through them; " +
+    "the `X-Paperclip-Result-Truncated` response header says whether a page may " +
+    "have more rows behind it.",
   request: {
     params: z.object({ companyId: z.string() }),
-    query: z.object({ view: z.enum(["compact"]).optional() }).passthrough(),
+    query: documentedQuerySchema(issueListKnownQueryKeys(), {
+      limit: z.coerce.number().optional(),
+      offset: z.coerce.number().optional(),
+      view: z.enum(["compact"]).optional(),
+      sortDir: z.enum(["asc", "desc"]).optional(),
+      sortField: z.string().optional(),
+      assigneeAgentId: z.string().optional(),
+      status: z.string().optional(),
+      q: z.string().optional(),
+    }),
   },
   responses: {
     200: r.ok(),
     304: { description: "Not Modified" },
+    400: r.badRequest,
     401: r.unauthorized,
   },
 });
@@ -9475,11 +9527,6 @@ for (const route of [
     "/api/companies/{companyId}/search/extract",
     "Extract company search matches",
   ],
-  [
-    "get",
-    "/api/companies/{companyId}/issues/count",
-    "Count issues in a company",
-  ],
 ] as const) {
   registerCurrentRoute({
     method: route[0],
@@ -9488,6 +9535,22 @@ for (const route of [
     summary: route[2],
   });
 }
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/issues/count",
+  tags: ["companies"],
+  summary: "Count issues in a company",
+  description:
+    "Requires `attention=blocked`. Counts are not paginated: `limit` and `offset` are accepted only so they can be rejected with a 400 explaining that they mean nothing here. " +
+    "An unrecognised query parameter is rejected with 400 rather than ignored.",
+  query: documentedQuerySchema(issueCountKnownQueryKeys(), {
+    attention: z.string().optional(),
+    assigneeAgentId: z.string().optional(),
+    status: z.string().optional(),
+    q: z.string().optional(),
+  }),
+});
 
 registerCurrentRoute({
   method: "get",

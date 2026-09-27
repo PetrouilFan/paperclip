@@ -353,119 +353,18 @@ import {
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 
 /**
- * Every query key `GET /companies/:companyId/issues` actually reads.
- *
- * The handler never used to inspect the key set, so an unread key was dropped
- * silently and the caller received the *unfiltered* board — a typo like
- * `?assigneeId=` (the real key is `assigneeAgentId`) returned every issue in
- * the company instead of an error. Rejecting unknown keys turns that
- * maximally-wrong silent answer into a loud, self-describing 400.
- *
- * Two rules keep this set honest:
- *
- * 1. **Aliases are keys, not rewrites.** `parentIssueId` is a supported synonym
- *    for `parentId`, so it belongs here as its own entry.
- * 2. **Value spellings are not keys.** Every `include*` flag accepts both
- *    `"true"` and `"1"`, and `assigneeAgentId` accepts the sentinel `"null"`.
- *    Those are validated below and do not widen the key set.
- *
- * `server/src/__tests__/issues-unknown-query-key.test.ts` asserts this set
- * stays exactly in sync with the handler's `req.query.*` reads, so adding a
- * filter without registering it here fails the suite instead of 400ing a
- * legitimate caller in production.
+ * The accepted query keys live in `services/issue-list-query-keys.ts` so the
+ * guard below and the OpenAPI spec in `routes/openapi.ts` can share one
+ * literal. See that module for why the two must not be written separately.
  */
-const ISSUE_LIST_KNOWN_QUERY_KEYS = new Set([
-  "afterId",
-  "assigneeAgentId",
-  "assigneeUserId",
-  "attention",
-  "createdFromIssueId",
-  "descendantOf",
-  "excludeRoutineExecutions",
-  "executionWorkspaceId",
-  "hasPlanDocument",
-  "inboxArchivedByUserId",
-  "includeBlockedBy",
-  "includeBlockedInboxAttention",
-  "includeLiveDescendantSummary",
-  "includePluginOperations",
-  "includeRoutineExecutions",
-  "labelId",
-  "limit",
-  "offset",
-  "originId",
-  "originKind",
-  "originKindPrefix",
-  "parentId",
-  "parentIssueId", // documented alias for `parentId`
-  "participantAgentId",
-  "projectId",
-  "q",
-  "sortDir",
-  "sortField",
-  "status",
-  "touchedByUserId",
-  "unreadForUserId",
-  "updatedSince",
-  "view",
-  "workspaceId",
-]);
-
-/** @internal exported for the allowlist-drift regression test. */
-export const issueListKnownQueryKeys = (): readonly string[] =>
-  [...ISSUE_LIST_KNOWN_QUERY_KEYS].sort();
-
-/**
- * Query keys `GET /companies/:companyId/issues/count` reads.
- *
- * Deliberately *narrower* than `ISSUE_LIST_KNOWN_QUERY_KEYS`, and that
- * difference is the whole point. The count route is not a list route with a
- * smaller page size: it accepts a different set of filters, forces
- * `includeBlockedBy` and `includeBlockedInboxAttention` to true whatever the
- * caller sent, and ignores pagination and sorting because neither means
- * anything for a count. Reusing the list superset here would let precisely the
- * keys this change exists to catch -- `view`, `sortField`, `offset` and the
- * rest -- clear the guard and then be dropped in silence, which is the defect
- * rather than a fix for it.
- *
- * `limit` and `offset` are listed because the handler *reads* them in order to
- * reject them with a specific 400. Keeping them here is what leaves that
- * rejection reachable, with its own message, instead of being shadowed by a
- * generic unknown-key error.
- *
- * As on the list route, `parentIssueId` is a supported synonym for `parentId`
- * and so is its own entry, and value spellings (`"1"`, the `"null"` sentinel)
- * are validated below rather than widening the key set.
- */
-const ISSUE_COUNT_KNOWN_QUERY_KEYS = new Set([
-  "assigneeAgentId",
-  "assigneeUserId",
-  "attention",
-  "createdFromIssueId",
-  "descendantOf",
-  "excludeRoutineExecutions",
-  "executionWorkspaceId",
-  "hasPlanDocument",
-  "includePluginOperations",
-  "includeRoutineExecutions",
-  "labelId",
-  "limit",
-  "offset",
-  "originId",
-  "originKind",
-  "originKindPrefix",
-  "parentId",
-  "parentIssueId", // documented alias for `parentId`
-  "participantAgentId",
-  "projectId",
-  "q",
-  "status",
-  "workspaceId",
-]);
-
-/** @internal exported for the allowlist-drift regression test. */
-export const issueCountKnownQueryKeys = (): readonly string[] =>
-  [...ISSUE_COUNT_KNOWN_QUERY_KEYS].sort();
+export {
+  issueListKnownQueryKeys,
+  issueCountKnownQueryKeys,
+} from "../services/issue-list-query-keys.js";
+import {
+  ISSUE_LIST_KNOWN_QUERY_KEYS,
+  ISSUE_COUNT_KNOWN_QUERY_KEYS,
+} from "../services/issue-list-query-keys.js";
 
 /**
  * Answers `false` when every key is known, and `true` once it has written the
@@ -3391,16 +3290,28 @@ const ISSUE_LIST_STORM_WINDOW_MS = 500;
 const ISSUE_LIST_STORM_THRESHOLD = 4;
 const ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT = 8;
 
+/**
+ * `truncated` is computed inside `compute` from the row count the *query*
+ * returned, not from the body that is finally sent, and travels with the
+ * prepared response so it stays correct on a cache hit, a coalesced waiter, and
+ * a stale revalidation. `filterIssuesForActor` runs after `limit` has already
+ * been applied, so a non-board caller can receive a body shorter than the page
+ * it asked for even though the query stopped at the cap -- deriving the flag
+ * from `body.length` would report "complete" in exactly the case where rows
+ * are missing.
+ */
 type IssueListPreparedResponse =
   | {
       kind: "compact";
       body: CompactIssue[];
       etag: string;
       cacheControl: string;
+      truncated: boolean;
     }
   | {
       kind: "full";
       body: unknown[];
+      truncated: boolean;
     };
 
 type IssueListCacheStatus = "miss" | "hit" | "coalesced" | "stale" | "retry";
@@ -8493,6 +8404,9 @@ export function issueRoutes(
       diagnostics: opts.issueListDiagnostics,
       compute: async () => {
         const rawResult = await svc.list(companyId, listFilters);
+        // A full page is the only evidence available that more rows exist, so
+        // this is read from the query's own output rather than the filtered body.
+        const truncated = rawResult.length >= limit;
         const result = (await actorCanReadCompanyScope(req, companyId))
           ? rawResult
           : await filterIssuesForActor(req, rawResult);
@@ -8530,6 +8444,7 @@ export function issueRoutes(
             body: compactResult,
             etag: compactIssueListEtag(compactResult),
             cacheControl: "private, must-revalidate",
+            truncated,
           };
         }
         const [handoffStates, recoveryActionByIssue] = await Promise.all([
@@ -8554,6 +8469,7 @@ export function issueRoutes(
         );
         return {
           kind: "full",
+          truncated,
           body: result.map((issue) => ({
             ...issue,
             successfulRunHandoff: handoffStates.get(issue.id) ?? null,
@@ -8584,6 +8500,22 @@ export function issueRoutes(
       res.status(429).json(body);
       return;
     }
+
+    // Both response kinds answer with a bare array, so a page that hit `limit`
+    // is indistinguishable from a complete result: the caller's own issues
+    // simply are not in the list. That silence is what made an ignored filter
+    // hard to notice -- a 200 with a plausible, entirely wrong number of rows.
+    // A header keeps the signal without changing the body, so no existing
+    // client sees a different shape. "true" means the query returned a full page
+    // and more rows may exist behind it; page with `offset` to reach them.
+    res.setHeader(
+      "X-Paperclip-Result-Count",
+      String(coordinated.response.body.length),
+    );
+    res.setHeader(
+      "X-Paperclip-Result-Truncated",
+      coordinated.response.truncated ? "true" : "false",
+    );
 
     if (coordinated.response.kind === "compact") {
       res.setHeader("Cache-Control", coordinated.response.cacheControl);
