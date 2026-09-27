@@ -429,6 +429,14 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+  intervalMinutes: z
+    .number()
+    .int()
+    .positive()
+    .max(7 * 24 * 60)
+    .optional()
+    .nullable()
+    .default(null),
 });
 
 export const issueExecutionPolicySchema = z.object({
@@ -487,6 +495,14 @@ export const issueExecutionMonitorStateSchema = z.object({
     .default(null),
   recoveryPolicy: z
     .enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES)
+    .nullable()
+    .optional()
+    .default(null),
+  intervalMinutes: z
+    .number()
+    .int()
+    .positive()
+    .max(7 * 24 * 60)
     .nullable()
     .optional()
     .default(null),

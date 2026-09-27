@@ -88,6 +88,12 @@ function normalizeMonitorText(value: string | null | undefined) {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function normalizeMonitorIntervalMinutes(value: number | null | undefined) {
+  if (typeof value !== "number") return null;
+  if (!Number.isInteger(value) || value <= 0) return null;
+  return value;
+}
+
 export function redactIssueMonitorExternalRef(value: string | null | undefined) {
   return normalizeMonitorText(value) ? REDACTED_ISSUE_MONITOR_EXTERNAL_REF : null;
 }
@@ -100,6 +106,7 @@ function monitorMetadataFromPolicy(monitor: IssueExecutionMonitorPolicy) {
     timeoutAt: monitor.timeoutAt ?? null,
     maxAttempts: monitor.maxAttempts ?? null,
     recoveryPolicy: monitor.recoveryPolicy ?? null,
+    intervalMinutes: normalizeMonitorIntervalMinutes(monitor.intervalMinutes),
   };
 }
 
@@ -111,6 +118,7 @@ function monitorMetadataFromState(state: IssueExecutionMonitorState | null | und
     timeoutAt: state?.timeoutAt ?? null,
     maxAttempts: state?.maxAttempts ?? null,
     recoveryPolicy: state?.recoveryPolicy ?? null,
+    intervalMinutes: normalizeMonitorIntervalMinutes(state?.intervalMinutes),
   };
 }
 
@@ -395,6 +403,9 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,
+      intervalMinutes: normalizeMonitorIntervalMinutes(
+        parsed.data.monitor.intervalMinutes,
+      ),
     }
     : null;
 
@@ -1223,4 +1234,151 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
 
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
   return { patch: applyMonitorTransition(input, {}) };
+}
+
+/**
+ * Re-arm cadence used when a triggered monitor's persisted state does not name
+ * one. Monitors scheduled before `intervalMinutes` existed only pinned an
+ * absolute `nextCheckAt`, so the period is unrecoverable for them; an hour
+ * matches the platform's own default monitor cadence.
+ */
+export const ISSUE_MONITOR_REARM_DEFAULT_INTERVAL_MINUTES = 60;
+
+/**
+ * How long after `monitorLastTriggeredAt` a triggered monitor with no schedule
+ * counts as orphaned rather than merely starting.
+ *
+ * A trigger clears `monitorNextCheckAt` on purpose: only the handling run can
+ * restore it, by re-arming from the wake payload. That is fine while the run
+ * survives and fatal when it dies — the monitor is then invisible to the
+ * due-monitor sweep, which only selects `monitorNextCheckAt IS NOT NULL`.
+ *
+ * The grace period must exceed the slowest observed monitor start, so a run
+ * that is merely still coming up is never re-armed underneath itself. Observed
+ * monitor starts are seconds to low minutes; fifteen minutes leaves an order of
+ * magnitude of headroom over the slowest while still recovering well inside one
+ * monitor period.
+ */
+export const ISSUE_MONITOR_REARM_GRACE_MS = 15 * 60 * 1000;
+
+/**
+ * The persisted monitor state, which is the only record that survives the
+ * one-shot trigger clear: the trigger strips `monitor` from the policy column
+ * and leaves the cadence and bounds in `executionState`.
+ */
+export function readPersistedIssueMonitorState(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+}): IssueExecutionMonitorState | null {
+  return derivePersistedMonitorState({
+    issue: input.issue,
+    state: parseIssueExecutionState(input.issue.executionState),
+    policy: input.policy,
+  });
+}
+
+/**
+ * Re-arm cadence for a persisted monitor state. Prefers the interval the
+ * scheduler recorded and falls back to the platform default for monitors whose
+ * state predates the field.
+ */
+export function issueMonitorRearmIntervalMinutes(
+  state: IssueExecutionMonitorState | null,
+): number {
+  return normalizeMonitorIntervalMinutes(state?.intervalMinutes) ?? ISSUE_MONITOR_REARM_DEFAULT_INTERVAL_MINUTES;
+}
+
+/**
+ * Whether a persisted monitor has spent its budget. Reads the bounds from the
+ * monitor state rather than the policy, because the trigger already stripped
+ * the policy's monitor. `attemptCount` is the number of attempts already
+ * consumed, so exhaustion is `>=` here where the dispatch path compares the
+ * not-yet-consumed next count with `>`.
+ */
+export function exhaustedPersistedMonitorClearReason(input: {
+  state: IssueExecutionMonitorState | null;
+  now: Date;
+}): IssueExecutionMonitorClearReason | null {
+  const timeoutAt = parseMonitorDate(input.state?.timeoutAt ?? null);
+  if (timeoutAt && input.now.getTime() >= timeoutAt.getTime()) {
+    return "timeout_exceeded";
+  }
+  const maxAttempts = input.state?.maxAttempts ?? null;
+  if (maxAttempts !== null && (input.state?.attemptCount ?? 0) >= maxAttempts) {
+    return "max_attempts_exhausted";
+  }
+  return null;
+}
+
+/**
+ * A monitor policy reconstructed from persisted state, for the recovery and
+ * activity payloads that describe a monitor no longer present in the policy
+ * column. `externalRef` stays redacted: the persisted copy never held the real
+ * value, so only the server-owned quota path may read the raw policy column.
+ */
+export function monitorPolicyFromPersistedState(input: {
+  state: IssueExecutionMonitorState | null;
+  nextCheckAt: string;
+}): IssueExecutionMonitorPolicy | null {
+  const state = input.state;
+  if (!state) return null;
+  return {
+    nextCheckAt: input.nextCheckAt,
+    notes: state.notes ?? null,
+    scheduledBy: state.scheduledBy ?? "assignee",
+    kind: state.kind ?? null,
+    serviceName: state.serviceName ?? null,
+    externalRef: state.externalRef ?? null,
+    timeoutAt: state.timeoutAt ?? null,
+    maxAttempts: state.maxAttempts ?? null,
+    recoveryPolicy: state.recoveryPolicy ?? null,
+    intervalMinutes: state.intervalMinutes ?? null,
+  };
+}
+
+/**
+ * Restore a schedule for a monitor that triggered and whose handling run died.
+ *
+ * Attempt count and `lastTriggeredAt` are preserved: this is not a new attempt,
+ * it is the schedule the dead run never got to write. `monitorWakeRequestedAt`
+ * is cleared so the due-monitor sweep can claim it on the next tick.
+ */
+export function buildIssueMonitorRearmedPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  rearmedAt: Date;
+  intervalMinutes?: number | null;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const nextCheckAt = input.rearmedAt.toISOString();
+  const nextMonitorState: IssueExecutionMonitorState = {
+    status: "scheduled",
+    nextCheckAt,
+    lastTriggeredAt: currentMonitorState?.lastTriggeredAt ?? null,
+    attemptCount: currentMonitorState?.attemptCount ?? 0,
+    notes: currentMonitorState?.notes ?? null,
+    scheduledBy: currentMonitorState?.scheduledBy ?? null,
+    ...monitorMetadataFromState(currentMonitorState),
+    intervalMinutes:
+      normalizeMonitorIntervalMinutes(input.intervalMinutes) ??
+      normalizeMonitorIntervalMinutes(currentMonitorState?.intervalMinutes),
+    clearedAt: null,
+    clearReason: null,
+  };
+
+  return {
+    executionPolicy: stripMonitorFromExecutionPolicy(input.policy) as Record<string, unknown> | null,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: input.rearmedAt,
+    monitorWakeRequestedAt: null,
+    monitorLastTriggeredAt: currentMonitorState?.lastTriggeredAt ?? null,
+    monitorAttemptCount: nextMonitorState.attemptCount,
+    monitorNotes: nextMonitorState.notes,
+    monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
 }

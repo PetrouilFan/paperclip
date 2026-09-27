@@ -690,6 +690,13 @@ export interface IssueExecutionMonitorPolicy {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /**
+   * Cadence the scheduler intends to repeat at. Optional: a policy that only
+   * pins an absolute `nextCheckAt` is still valid. When present it is copied
+   * into the persisted monitor state so a triggered monitor whose handling run
+   * died can be re-armed without guessing the period.
+   */
+  intervalMinutes?: number | null;
 }
 
 export interface IssueExecutionPolicy {
@@ -720,6 +727,11 @@ export interface IssueExecutionMonitorState {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /**
+   * Cadence copied from the scheduling policy. Survives the one-shot trigger
+   * clear, so the reconciliation sweep can re-arm the monitor server-side.
+   */
+  intervalMinutes?: number | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }
