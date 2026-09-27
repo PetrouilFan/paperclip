@@ -124,8 +124,10 @@
 #      of them, both measured on this host on 2026-09-27 against a throwaway unit:
 #      `MAINPID=` re-points the unit's recorded main process -- read from outside,
 #      a unit's MainPID went from 226683 to 226685 after a probe wrote it -- which
-#      is exactly the process a stop signals under `KillMode=process` (PET-621's
-#      gap). And `NOTIFYACCESS=` re-opens the unit's own notify access mid-flight,
+#      is exactly the process a stop signals when the unit is `KillMode=process`,
+#      and a stop that signals one process instead of the cgroup is the setting that
+#      turns any stop into a cgroup-wide kill. And `NOTIFYACCESS=` re-opens the
+#      unit's own notify access mid-flight,
 #      which is the setting this whole ticket is about. Neither was on the list,
 #      and neither would have been: the only way to know the list is complete is
 #      to refuse the fields that were not thought of. There is no flag to widen

@@ -134,8 +134,8 @@ test("nothing on the enforcing path is configurable from the environment", () =>
   // the live unit could name a file it had just written, get an ALLOWED verdict, and
   // have written a datagram. A guard whose central claim can be switched off by two
   // environment variables is not evidence in the one case we would want it to be
-  // evidence -- the unattributed sender of the 09:28 datagram (PET-601), whose
-  // candidate set includes us.
+  // evidence -- the 09:28 datagram whose sender this repository has never
+  // attributed, and whose candidate set includes us.
   const envReads = [...codeOnly().matchAll(/\$\{?(PAPERCLIP_[A-Z_]+|SELF_CGROUP_FILE|TRANSIENT_ROOT)/g)].map((m) => m[1]);
   assert.deepEqual(envReads, [], `the enforcing path must read no PAPERCLIP_* or fixture variable; found ${JSON.stringify(envReads)}`);
   // In code, not in the header: the header names the two variables it removed, and

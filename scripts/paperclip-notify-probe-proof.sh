@@ -187,8 +187,10 @@ fi
 
 # MAINPID= is the field the first version of the key check did not name, and it is
 # the one that matters: it re-points the unit's recorded main process, which is the
-# process a stop signals under KillMode=process (PET-621's gap). Measured at that head
-# against a throwaway unit, MainPID went 226683 -> 226685 after one probe. The
+# process a stop signals when the unit is KillMode=process, and a stop that signals
+# one process instead of the cgroup is what turns any stop into a cgroup-wide kill.
+# Measured at that head against a throwaway unit, MainPID went 226683 -> 226685 after
+# one probe. The
 # allowlist refuses it on its own account, not because the cgroup guard happened to be
 # in the way.
 if [ "$(cat "$OUT/inner-mainpid.rc" 2>/dev/null)" = "1" ] && grep -q 'MAINPID= is not a field' "$OUT/inner-mainpid.txt"; then
