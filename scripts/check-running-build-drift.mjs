@@ -78,6 +78,17 @@ export function runningServerDistCandidates(env = process.env) {
  * names and reason codes rather than line numbers or hashes: a compiled
  * artifact cannot be diffed against a `.ts` file, but a symbol survives
  * compilation, and a rename that drops the guard drops the symbol with it.
+ *
+ * `sinceCommit` is provenance, and it is the field a drift line quotes:
+ * `committed at ${result.sinceCommit} but absent from …`. Nothing in the
+ * evaluation path reads it — markers are compared against the source at `HEAD`
+ * and the installed `dist` — so an anchor that does not contain its own markers
+ * is reported with a commit that cannot account for the finding. Adding a
+ * marker without moving the anchor is the way to produce one, and the
+ * `manifest_mismatch` state cannot catch it, because that state compares the
+ * markers to `HEAD` and not to the anchor. The invariant is therefore asserted
+ * by `anchorsNameTheCommitThatCarriesTheirMarkers`: every marker must be
+ * present at `sinceCommit`.
  */
 export const RUNNING_BUILD_SENTINELS = [
   {
@@ -104,8 +115,15 @@ export const RUNNING_BUILD_SENTINELS = [
     // own, so it read `ok` on a build missing the payload and the exemption
     // below. Requiring a payload key as well keeps the reason string necessary
     // without letting it be sufficient on its own.
+    //
+    // `sinceCommit` is the commit every marker above was introduced by, and
+    // `formatReport` prints it as `committed at <sha> but absent from …` — so
+    // an anchor that predates a marker sends the operator to a commit that
+    // cannot account for it. `f80a08c00` named the reason but not the payload
+    // key, which is why this required `1220016a`, where the binding payload
+    // actually landed. See `anchorsNameTheCommitThatCarriesTheirMarkers`.
     id: "cross-issue-403-names-the-gate",
-    sinceCommit: "f80a08c00",
+    sinceCommit: "1220016a",
     sourcePath: "server/src/services/cross-issue-influence-limit.ts",
     distPath: "services/cross-issue-influence-limit.js",
     markers: ["no_context_source_and_target_unbound", "targetAssignedToOtherActor"],
@@ -121,8 +139,13 @@ export const RUNNING_BUILD_SENTINELS = [
     // Both payload keys are required: either alone is carried by builds that
     // name the holder but not the binding, or the binding but not the
     // assignee, and neither state is the fix.
+    //
+    // The anchor is the later of the two commits that introduced them — the
+    // exemption (`1220016a`) and the checkout naming it grew (`8d1fd26738ab`).
+    // Naming only the first sent an operator looking for the holder at a commit
+    // that does not contain it. See `anchorsNameTheCommitThatCarriesTheirMarkers`.
     id: "run-context-allows-self-assigned-target",
-    sinceCommit: "1220016a",
+    sinceCommit: "8d1fd26738ab",
     sourcePath: "server/src/services/cross-issue-influence-limit.ts",
     distPath: "services/cross-issue-influence-limit.js",
     markers: ["targetAssignedToOtherActor", "targetHeldByAnotherRun"],

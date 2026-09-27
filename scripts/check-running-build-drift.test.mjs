@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -166,6 +167,57 @@ test("the shipped sentinels guard the two files the drift check names", () => {
 test("sentinel ids are unique so a report never double-counts one fix", () => {
   const ids = RUNNING_BUILD_SENTINELS.map((s) => s.id);
   assert.equal(new Set(ids).size, ids.length);
+});
+
+test("anchors name the commit that carries their markers", (t) => {
+  // Every other test in this file stubs `git`, because the evaluation path
+  // never reads `sinceCommit` — it compares markers to the source at `HEAD` and
+  // to the installed `dist`. That is exactly why an unsound anchor survives a
+  // green suite, and why `manifest_mismatch` cannot catch one: that state
+  // compares markers to `HEAD`, never to the anchor. So this test resolves each
+  // anchor for real, which is the one thing the stub cannot do.
+  //
+  // It is skipped outside a checkout, in the same spirit as "an unreadable
+  // source tree is unevaluated, not drift": a missing repository is not
+  // evidence about the manifest. CI runs this in a checkout, so it gates there.
+  const repoRoot = path.join(import.meta.dirname, "..");
+  const show = (rev) => {
+    try {
+      return execFileSync("git", ["show", rev], { cwd: repoRoot, encoding: "utf8", maxBuffer: 1 << 28 });
+    } catch (error) {
+      return { failed: true, message: String(error.stderr ?? error.message).split("\n")[0] };
+    }
+  };
+
+  if (show("HEAD:package.json").failed) {
+    t.skip("not a git checkout, so no anchor can be resolved");
+    return;
+  }
+
+  const unsound = [];
+
+  for (const sentinel of RUNNING_BUILD_SENTINELS) {
+    const anchor = show(`${sentinel.sinceCommit}:${sentinel.sourcePath}`);
+    if (anchor.failed) {
+      // A `sinceCommit` that does not resolve is a manifest defect, not an
+      // environment problem: the commit is supposed to be in this repository
+      // because the manifest names it.
+      assert.fail(`${sentinel.id}: sinceCommit ${sentinel.sinceCommit} does not resolve — ${anchor.message}`);
+    }
+    const absent = sentinel.markers.filter((marker) => !anchor.includes(marker));
+    if (absent.length > 0) {
+      // Collected rather than asserted per sentinel, so one unsound anchor
+      // cannot hide another: fixing the first would otherwise turn the suite
+      // green while the second is still wrong.
+      unsound.push(
+        `${sentinel.id} is anchored at ${sentinel.sinceCommit}, which does not contain ${absent.join(", ")}. ` +
+          `A drift line quotes that commit as the origin, so the operator is sent to a commit that cannot account ` +
+          `for the marker. Move sinceCommit to the commit that introduced ${absent.join(" and ")}.`,
+      );
+    }
+  }
+
+  assert.deepEqual(unsound, [], `\n${unsound.join("\n")}\n`);
 });
 
 test("the source-attribution sentinel is not satisfied by the superseded fallback variant", () => {
