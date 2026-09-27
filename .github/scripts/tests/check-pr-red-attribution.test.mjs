@@ -2,8 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   attributeFailures,
+  headJobVerdict,
+  headRunVerdict,
   jobKey,
   parseFailingTests,
+  partitionLaneJobs,
   selectBaselineForJobs,
   stripAnsi,
 } from '../check-pr-red-attribution.mjs';
@@ -246,4 +249,78 @@ test('a head run with no failed job has nothing to attribute', () => {
   const r = selectBaselineForJobs([greenBase], { [greenBase.databaseId]: [] }, []);
   assert.equal(r.run, null);
   assert.match(r.reason, /no failed job/);
+});
+
+test('a run verdict is only success or failure, and nothing else is read as green', () => {
+  assert.equal(headRunVerdict({ status: 'completed', conclusion: 'success' }), 'success');
+  assert.equal(headRunVerdict({ status: 'completed', conclusion: 'failure' }), 'failure');
+  // A cancelled or timed-out run reported nothing. Reading it as a pass hands a
+  // red pull request a green attribution verdict, which is the same defect as a
+  // missing baseline reached from the other side.
+  for (const conclusion of ['cancelled', 'timed_out', 'skipped', 'action_required', 'stale', null]) {
+    assert.equal(headRunVerdict({ status: 'completed', conclusion }), 'no-verdict', conclusion ?? 'null');
+  }
+  for (const status of ['queued', 'in_progress', 'requested', 'waiting', 'pending']) {
+    assert.equal(headRunVerdict({ status, conclusion: null }), 'pending', status);
+  }
+});
+
+test('a job that was switched off has a verdict; a job that stopped partway does not', () => {
+  // The gate runs inside the lane's own run, so the unit that carries evidence is
+  // the job. A lane the lane itself skipped is the designed state for a middle
+  // pull request in a stack, and `verify` is what asserts it.
+  assert.equal(headJobVerdict({ conclusion: 'success' }), 'success');
+  assert.equal(headJobVerdict({ conclusion: 'failure' }), 'failure');
+  assert.equal(headJobVerdict({ conclusion: 'skipped' }), 'skipped');
+  // `gh run view --json jobs` reports a job still going as an empty string, not
+  // a missing conclusion, so that is the shape a still-running job arrives in.
+  for (const conclusion of ['cancelled', 'timed_out', 'action_required', 'stale', '', null, undefined]) {
+    assert.equal(headJobVerdict({ conclusion }), 'no-verdict', JSON.stringify(conclusion));
+  }
+});
+
+test('the lane partitions into jobs to attribute and jobs that never reported', () => {
+  const { failed, unmeasured } = partitionLaneJobs(
+    [
+      { name: 'ci / Select trusted runner', conclusion: 'success', databaseId: 1 },
+      { name: 'ci / General tests (chat (1/3))', conclusion: 'failure', databaseId: 2 },
+      { name: 'ci / General tests (server (1/12))', conclusion: 'cancelled', databaseId: 3 },
+      { name: 'ci / Build', conclusion: '', databaseId: 4 },
+      // A middle pull request in a stack switches the test matrix off, and that
+      // is not a gap in the evidence.
+      { name: 'ci / e2e shard (1/8)', conclusion: 'skipped', databaseId: 5 },
+    ],
+    36323114581
+  );
+  assert.deepEqual(failed.map(j => j.databaseId), [2]);
+  // Every attributed job carries the run its log is read from. Without it the
+  // comparison would have no address to fetch either the base or the head log.
+  assert.equal(failed[0].runId, 36323114581);
+  assert.deepEqual(unmeasured.map(j => j.name), [
+    'ci / General tests (server (1/12))',
+    'ci / Build',
+  ]);
+});
+
+test('a lane where nothing is red and nothing is unmeasured has nothing to attribute', () => {
+  const { failed, unmeasured } = partitionLaneJobs(
+    [
+      { name: 'ci / policy', conclusion: 'success', databaseId: 1 },
+      { name: 'ci / General tests (server (1/12))', conclusion: 'success', databaseId: 2 },
+    ],
+    42
+  );
+  assert.deepEqual(failed, []);
+  assert.deepEqual(unmeasured, []);
+});
+
+test('a red that is inherited alone still leaves an empty own set, which is the gate condition', () => {
+  // End to end over the 2026-09-27 incident: the PR shard fails on a test the
+  // base shard also fails, so the gate passes while `verify` is red. That
+  // disagreement on one commit is the whole point of the wiring.
+  const shared = 'ui/src/__tests__/chat-panel.test.tsx > panel > renders the composer';
+  const r = attributeFailures(new Set([shared]), new Set([shared]), { baselineAvailable: true });
+  assert.equal(r.passed, true);
+  assert.deepEqual(r.own, []);
+  assert.deepEqual(r.inherited, [shared]);
 });
