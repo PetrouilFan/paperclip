@@ -60,6 +60,10 @@ We do not gate PRs on a pre-existing issue. Two acceptable paths:
    - **Feature:** problem/motivation, proposed solution, alternatives considered, roadmap alignment. See [`feature_request.yml`](.github/ISSUE_TEMPLATE/feature_request.yml).
    - **New adapter:** agent or provider, why it's useful, how it's invoked. See [`adapter_request.yml`](.github/ISSUE_TEMPLATE/adapter_request.yml).
 
+Each label needs real content under it. A lone `-` or a `[...]` placeholder does not count, and the check fails.
+
+You may nest the template inside a Markdown blockquote, which is a common way to put a template under a section heading. The gate removes the `>` from each line before it reads the body, so a quoted label counts the same as an unquoted one.
+
 Either way, a reviewer should be able to understand the underlying issue without leaving the PR. Commitperclip may check that one of these two paths is satisfied. If your repository has GitHub issues disabled, path 1 is unavailable and the gate will only accept path 2 — do not invent a `#NNN` to satisfy it. Only link **public** GitHub issues — see [No Internal Issue References](#no-internal-issue-references) for what to leave out.
 
 ### No Internal Issue References
