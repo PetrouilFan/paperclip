@@ -113,6 +113,29 @@ describe("buildMonitorSurfaceCopy", () => {
     expect(overdue!.tone).toBe("warning");
   });
 
+  it("never promises a resume time for a monitor its host cannot run", () => {
+    const copy = buildMonitorSurfaceCopy(
+      derived({
+        state: "suspended",
+        nextCheckAt: new Date(NOW.getTime() + 2 * 60 * 60_000).toISOString(),
+        attemptCount: 9,
+        serviceName: "model-liveness-probe",
+      }),
+      NOW,
+    );
+
+    expect(copy!.bannerTitle).toBe("Monitor paused — this issue is not runnable");
+    expect(copy!.stripTitle).toBe("Monitor paused");
+    expect(copy!.tone).toBe("warning");
+    expect(copy!.checkNowRejected).toBe(true);
+    // The countdown wording is the lie this state replaces: "resumes in 2h",
+    // "overdue by 18m" and "due now" all name a check the server will not make.
+    expect(copy!.bannerMeta.join(" ")).not.toMatch(/resumes in|overdue by|due now/i);
+    expect(copy!.bannerMeta.join(" ")).toMatch(/cannot run/i);
+    expect(copy!.bannerMeta).toContain("Attempt 9");
+    expect(copy!.bannerMeta).toContain("Watching: model-liveness-probe");
+  });
+
   it("hides both surfaces when cleared, none, or without a next check", () => {
     expect(buildMonitorSurfaceCopy(derived({ state: "cleared", attemptCount: 2 }), NOW)).toBeNull();
     expect(buildMonitorSurfaceCopy(derived({ state: "none" }), NOW)).toBeNull();
@@ -181,6 +204,62 @@ describe("IssueMonitorBanner / IssueMonitorComposerStrip rendering", () => {
     flushSync(() => button?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(onCheckNow).toHaveBeenCalledTimes(1);
 
+    flushSync(() => root.unmount());
+  });
+
+  it("pauses the countdown and drops Check now on a blocked issue, then resumes it", () => {
+    const root = createRoot(container);
+    const overdue = new Date(NOW.getTime() - 2 * 60 * 60_000).toISOString();
+    const render = (issue: Issue) => flushSync(() => root.render(
+      <>
+        <IssueMonitorBanner issue={issue} onCheckNow={vi.fn()} />
+        <IssueMonitorComposerStrip issue={issue} onCheckNow={vi.fn()} />
+      </>,
+    ));
+
+    // A blocked issue whose hourly watch is two hours past due. The server
+    // refuses to dispatch it, so "Overdue by 2h" is a promise it will not keep
+    // and Check now would 409.
+    const blocked = {
+      status: "blocked",
+      monitorNextCheckAt: overdue,
+      monitorAttemptCount: 9,
+      executionState: {
+        monitor: {
+          status: "scheduled",
+          nextCheckAt: overdue,
+          attemptCount: 9,
+          serviceName: "model-liveness-probe",
+        },
+      },
+      scheduledRetry: null,
+    } as unknown as Issue;
+    expect(hasVisibleMonitorSurface(blocked)).toBe(true);
+    render(blocked);
+    expect(container.textContent).toContain("Monitor paused");
+    expect(container.textContent).not.toContain("Overdue by 2h");
+    expect(container.textContent).not.toMatch(/resumes in|overdue by/i);
+    expect(container.querySelector("button")).toBeNull();
+
+    // Checked out again: the cadence is untouched, so the monitor is live again
+    // and the surface returns to a normal countdown with a working button.
+    const checkedOut = { ...blocked, status: "in_progress" } as Issue;
+    render(checkedOut);
+    expect(container.textContent).toContain("Waiting on monitor — overdue by 2h");
+    expect(container.querySelector("button")).toBeTruthy();
+
+    flushSync(() => root.unmount());
+  });
+
+  it("does not treat an issue with no projected status as a held one", () => {
+    const root = createRoot(container);
+    flushSync(() => root.render(
+      <IssueMonitorBanner
+        issue={issueWithMonitor(new Date(NOW.getTime() + 2 * 60 * 60_000).toISOString())}
+        onCheckNow={vi.fn()}
+      />,
+    ));
+    expect(container.textContent).toContain("Waiting on monitor — resumes in 2h");
     flushSync(() => root.unmount());
   });
 

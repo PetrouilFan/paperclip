@@ -562,8 +562,24 @@ export type IssueExecutionMonitorRecoveryPolicy =
 export const ISSUE_EXECUTION_STATE_STATUSES = ["idle", "pending", "changes_requested", "completed"] as const;
 export type IssueExecutionStateStatus = (typeof ISSUE_EXECUTION_STATE_STATUSES)[number];
 
-export const ISSUE_EXECUTION_MONITOR_STATE_STATUSES = ["scheduled", "triggered", "cleared"] as const;
+/**
+ * `suspended` is not a cleared monitor. A cleared monitor was torn down; a
+ * suspended one is still armed (`monitorNextCheckAt` intact) but its host issue
+ * is in a status no monitor can dispatch from, so the cadence is preserved and
+ * fires the moment the issue becomes runnable again. Without this state the
+ * board reads `scheduled` for a watch that has stopped, and the absence of a
+ * signal is indistinguishable from a healthy one.
+ */
+export const ISSUE_EXECUTION_MONITOR_STATE_STATUSES = [
+  "scheduled",
+  "suspended",
+  "triggered",
+  "cleared",
+] as const;
 export type IssueExecutionMonitorStateStatus = (typeof ISSUE_EXECUTION_MONITOR_STATE_STATUSES)[number];
+
+export const ISSUE_EXECUTION_MONITOR_SUSPENDED_REASONS = ["host_status", "host_assignee"] as const;
+export type IssueExecutionMonitorSuspendedReason = (typeof ISSUE_EXECUTION_MONITOR_SUSPENDED_REASONS)[number];
 
 export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "manual",

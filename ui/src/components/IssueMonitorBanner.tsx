@@ -27,6 +27,7 @@ const WAITING_STATES: readonly MonitorDisplayState[] = [
   "retrying",
   "due-now",
   "overdue",
+  "suspended",
 ];
 
 export function isWaitingMonitorState(state: MonitorDisplayState): boolean {
@@ -47,13 +48,23 @@ export interface MonitorSurfaceCopy {
   bannerMeta: string[];
   /** Muted detail line for the composer strip. */
   stripMeta: string[];
-  /** `warning` (amber) once overdue, `info` (blue) while still on schedule. */
+  /** `warning` (amber) once overdue or suspended, `info` (blue) while on schedule. */
   tone: "info" | "warning";
   workspaceWait?: boolean;
+  /** The check-now endpoint rejects a monitor whose host cannot run it. */
+  checkNowRejected?: boolean;
 }
 
 function capitalize(value: string): string {
   return value.length === 0 ? value : `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+}
+
+function attemptLabelFor(derived: DerivedMonitorState): string | null {
+  return derived.attemptCount >= 1 ? `Attempt ${derived.attemptCount}` : null;
+}
+
+function serviceLabelFor(derived: DerivedMonitorState): string | null {
+  return derived.serviceName ? `Watching: ${derived.serviceName}` : null;
 }
 
 /**
@@ -82,6 +93,31 @@ export function buildMonitorSurfaceCopy(
   const eta = formatMonitorEta(derived.nextCheckAt, now); // "in 2h 12m" | "due now" | "overdue by 18m"
   const absolute = formatMonitorAbsolute(derived.nextCheckAt, {}, now); // local time, e.g. "Today, 4:08 PM"
   const isScheduledRetryOnly = derived.source === "scheduled-retry";
+  const attemptLabel = attemptLabelFor(derived);
+  const serviceLabel = serviceLabelFor(derived);
+
+  if (derived.state === "suspended") {
+    // A held issue cannot run its monitor, so every countdown here is a promise
+    // the server will not keep. Say that instead of naming a resume time.
+    return {
+      bannerTitle: "Monitor paused — this issue is not runnable",
+      stripTitle: "Monitor paused",
+      bannerMeta: [
+        "The issue is blocked or not started, so the scheduled check cannot run. It starts again on its own once the issue is back in progress.",
+        `${absolute} (your time)`,
+        attemptLabel,
+        serviceLabel,
+      ].filter((piece): piece is string => Boolean(piece)),
+      stripMeta: [
+        "The scheduled check cannot run while the issue is held.",
+        absolute,
+        attemptLabel,
+        serviceLabel,
+      ].filter((piece): piece is string => Boolean(piece)),
+      tone: "warning",
+      checkNowRejected: true,
+    };
+  }
 
   let bannerTitle: string;
   let stripTitle: string;
@@ -104,9 +140,6 @@ export function buildMonitorSurfaceCopy(
       statusHint = "Fires on next tick";
       break;
   }
-
-  const attemptLabel = derived.attemptCount >= 1 ? `Attempt ${derived.attemptCount}` : null;
-  const serviceLabel = derived.serviceName ? `Watching: ${derived.serviceName}` : null;
 
   const bannerMeta = [statusHint, `${absolute} (your time)`, attemptLabel, serviceLabel].filter(
     (piece): piece is string => Boolean(piece),
@@ -179,7 +212,7 @@ export function IssueMonitorBanner({
       icon={Clock}
       title={copy.bannerTitle}
       className="my-3"
-      actions={onCheckNow && !copy.workspaceWait ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} /> : null}
+      actions={onCheckNow && !copy.workspaceWait && !copy.checkNowRejected ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} /> : null}
     >
       <span>{copy.bannerMeta.join("  ·  ")}</span>
     </InlineBanner>
@@ -214,12 +247,14 @@ export function IssueMonitorComposerStrip({
             <div className="text-xs text-muted-foreground">{copy.stripMeta.join(" · ")}</div>
           </div>
         </div>
-        {onCheckNow && !copy.workspaceWait ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} /> : null}
+        {onCheckNow && !copy.workspaceWait && !copy.checkNowRejected ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} /> : null}
       </div>
       <p className="mt-1.5 text-xs text-muted-foreground">
         {copy.workspaceWait
           ? "You can keep sending instructions while the agent waits."
-          : "Sending a reply wakes the agent now — before the scheduled check."}
+          : copy.checkNowRejected
+            ? "The check cannot run until the issue is back in progress."
+            : "Sending a reply wakes the agent now — before the scheduled check."}
       </p>
     </div>
   );
