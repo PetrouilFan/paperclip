@@ -5,6 +5,7 @@ import {
   ISSUE_EXECUTION_MONITOR_KINDS,
   ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES,
   ISSUE_EXECUTION_MONITOR_STATE_STATUSES,
+  ISSUE_EXECUTION_MONITOR_SUSPENDED_REASONS,
   ISSUE_EXECUTION_POLICY_MODES,
   ISSUE_EXECUTION_STAGE_TYPES,
   ISSUE_EXECUTION_STATE_STATUSES,
@@ -492,6 +493,7 @@ export const issueExecutionMonitorStateSchema = z.object({
     .default(null),
   clearedAt: z.string().datetime().nullable(),
   clearReason: z.enum(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).nullable(),
+  suspendedReason: z.enum(ISSUE_EXECUTION_MONITOR_SUSPENDED_REASONS).nullable().optional().default(null),
 });
 
 export const issueReviewRequestSchema = z

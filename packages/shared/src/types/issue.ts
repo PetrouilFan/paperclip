@@ -9,6 +9,7 @@ import type {
   IssueExecutionMonitorKind,
   IssueExecutionMonitorRecoveryPolicy,
   IssueExecutionMonitorStateStatus,
+  IssueExecutionMonitorSuspendedReason,
   IssueExecutionDecisionOutcome,
   IssueMonitorScheduledBy,
   IssueExecutionPolicyMode,
@@ -722,6 +723,8 @@ export interface IssueExecutionMonitorState {
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
+  /** Why an armed monitor cannot dispatch. Non-null only while `suspended`. */
+  suspendedReason?: IssueExecutionMonitorSuspendedReason | null;
 }
 
 export interface IssueReviewRequest {

@@ -12,7 +12,7 @@ type MonitorDetails = {
   nextCheckAt?: MonitorDate | null;
   attemptCount?: number | null;
   serviceName?: string | null;
-  status?: "scheduled" | "triggered" | "cleared" | null;
+  status?: "scheduled" | "suspended" | "triggered" | "cleared" | null;
 };
 
 type MonitorPolicy = {
@@ -40,6 +40,7 @@ export type MonitorDisplayState =
   | "retrying"
   | "due-now"
   | "overdue"
+  | "suspended"
   | "cleared"
   | "none";
 
@@ -173,6 +174,17 @@ export function formatMonitorAbsoluteFull(
   return `${datePart}, ${timePart}`;
 }
 
+/**
+ * The statuses a monitor can actually dispatch from, matching the server. An
+ * absent status is treated as runnable: a read that did not project one is not
+ * evidence that the watch is held, and wrongly suspending it would replace a
+ * working countdown with a false alarm.
+ */
+function monitorCanRunFrom(status: MonitorIssueLike["status"]): boolean {
+  if (status == null) return true;
+  return status === "in_progress" || status === "in_review";
+}
+
 export function deriveMonitorState(issue: MonitorIssueLike, now: MonitorDate = new Date()): DerivedMonitorState {
   if (issue.status === "done" || issue.status === "cancelled") {
     return { state: "none", source: "none", nextCheckAt: null, attemptCount: 0, serviceName: null };
@@ -201,6 +213,15 @@ export function deriveMonitorState(issue: MonitorIssueLike, now: MonitorDate = n
 
   if (runtimeMonitor?.status === "cleared") {
     return { state: "cleared", source, nextCheckAt, attemptCount, serviceName };
+  }
+
+  // An armed monitor cannot dispatch from `todo` or `blocked`, and the server
+  // refuses those statuses. Without this the banner counts an overdue watch on a
+  // held issue as healthy — a countdown to a check that will never fire, which
+  // reads as "nothing to report". The cadence is still intact, so this clears
+  // itself as soon as the issue returns to in_progress or in review.
+  if (issue.status != null && hasMonitor && !monitorCanRunFrom(issue.status)) {
+    return { state: "suspended", source, nextCheckAt, attemptCount, serviceName };
   }
 
   if (!hasMonitor && !retryIsScheduled) {

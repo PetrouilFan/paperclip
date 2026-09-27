@@ -298,8 +298,10 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  issueMonitorSuspensionReason,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
+  projectIssueMonitorSuspension,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
@@ -2425,6 +2427,9 @@ async function assertCanManageIssueMonitor(
 
 function summarizeIssueMonitor(
   issue: {
+    status?: string;
+    assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
     monitorNextCheckAt?: Date | null;
     monitorLastTriggeredAt?: Date | null;
     monitorAttemptCount?: number | null;
@@ -2435,6 +2440,17 @@ function summarizeIssueMonitor(
   policy: NormalizedExecutionPolicy | null,
 ) {
   const state = parseIssueExecutionState(issue.executionState);
+  // A stored `scheduled` is a snapshot from arming time. If the issue has since
+  // been pinned to a status no monitor dispatches from, reporting it unchanged
+  // tells the board a healthy cadence for a watch that has stopped. Downgrade to
+  // `suspended` and keep the cadence, so the read is honest and the overdue
+  // slot still fires once the issue becomes runnable again.
+  const suspendedReason = issueMonitorSuspensionReason(
+    issue.status ?? "",
+    issue.assigneeAgentId ?? null,
+    issue.assigneeUserId ?? null,
+  );
+  const storedStatus = state?.monitor?.status ?? (policy?.monitor ? "scheduled" : null);
   return {
     nextCheckAt:
       issue.monitorNextCheckAt?.toISOString() ??
@@ -2467,8 +2483,10 @@ function summarizeIssueMonitor(
       policy?.monitor?.maxAttempts ?? state?.monitor?.maxAttempts ?? null,
     recoveryPolicy:
       policy?.monitor?.recoveryPolicy ?? state?.monitor?.recoveryPolicy ?? null,
-    status: state?.monitor?.status ?? (policy?.monitor ? "scheduled" : null),
+    status:
+      storedStatus === "scheduled" && suspendedReason ? "suspended" : storedStatus,
     clearReason: state?.monitor?.clearReason ?? null,
+    suspendedReason: storedStatus === "scheduled" ? suspendedReason : null,
   };
 }
 
@@ -9262,8 +9280,15 @@ export function issueRoutes(
       "Server-Timing",
       `paperclip_issue;dur=${(performance.now() - requestStartedAt).toFixed(1)}`,
     );
+    // `scheduled` is an arming-time snapshot. A status the monitor cannot
+    // dispatch from makes it a lie, so the client-facing payload reports the
+    // watch as suspended instead of silently green.
+    const projectedMonitorState = projectIssueMonitorSuspension(issue);
     res.json({
       ...issue,
+      ...(projectedMonitorState !== issue.executionState
+        ? { executionState: projectedMonitorState }
+        : {}),
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
