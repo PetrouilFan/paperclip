@@ -406,7 +406,19 @@ export function collectCoauthors(commits, prAuthor) {
     // theirs. Compared case-insensitively because GitHub logins are.
     if (login && author && login.toLowerCase() === author) continue;
 
-    // Bots author plenty of commits and crediting them is noise.
+    // Bots author plenty of commits and crediting them is noise. Keyed on the
+    // login, and only the login, on purpose: GitHub does not always put the
+    // `[bot]` marker there. The Copilot coding agent commits as
+    // `copilot-swe-agent[bot]` under the account `Copilot`, so this rule reads
+    // that commit as a person — and a display name is not a safe substitute,
+    // because a person whose `git config user.name` reads `renovate[bot]` under
+    // their own login would be dropped, which is the silent loss the co-author
+    // gate exists to prevent, reached from the other side. The account type is
+    // the discriminating evidence and it is not an input this function has.
+    //
+    // So the line is prescribed, and `plan-merge-attribution.mjs` annotates it
+    // rather than deciding it. A person is never dropped here on the strength of
+    // a name.
     if (login && /\[bot\]$/.test(login)) continue;
     if (!login && !gitName) continue;
 
