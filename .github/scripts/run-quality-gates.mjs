@@ -163,17 +163,17 @@ async function main() {
     fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN),
   ]);
 
-  // Separate, and allowed to fail. The co-author note is informational: it
-  // cannot fail a PR by design, so it must not be able to fail the workflow by
-  // accident either. Sharing the Promise.all above would let one transient
-  // 5xx on this request take down every gate, including the ones that block.
+  // Separate, and allowed to fail. Neither gate that reads commits can fail a PR
+  // because the commit *list* did not arrive: sharing the Promise.all above
+  // would let one transient 5xx on this request take down every gate, including
+  // the ones that block.
   //
-  // The fetch staying optional does not make the surface optional. The
-  // internal-reference gate reads commits, and an empty list it cannot
-  // distinguish from "the fetch failed" would let it report `passed: true`
-  // about text it never saw. So the failure is recorded and handed to that
-  // gate, which fails closed on it; the co-author lookup still gets to be
-  // silent, because it is informational and has no verdict to lose.
+  // The fetch staying optional does not make the surface optional. Both gates
+  // that read commits are handed the empty list and `commitsUnavailable`, and
+  // each fails closed on it rather than reporting a clean scan about text it
+  // never saw — a `Co-Authored-By` trailer it could not check is exactly the
+  // defect the co-author gate exists to catch, and a silent pass there reads as
+  // evidence.
   let commits = [];
   let commitsUnavailable = false;
   try {
@@ -253,7 +253,11 @@ async function main() {
     prefixes: process.env.INTERNAL_REF_PREFIXES,
     productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,
   });
-  const coauthorResult = checkCoauthors(commits, author);
+  // A second gate on the same list, on the same fail-closed rule. Its trailer
+  // check reads the commit messages, and the informational hand-over below reads
+  // the commit authors; the two halves answer different questions and the second
+  // one blocks, so both need the list and both need to know it is missing.
+  const coauthorResult = checkCoauthors(commits, author, { commitsUnavailable });
 
   const allFailures = collectBlockingFailures([
     templateResult,
@@ -262,6 +266,7 @@ async function main() {
     testResult,
     lockfileResult,
     internalRefsResult,
+    coauthorResult,
   ]);
   const informational = [
     ...(depsResult.informational ?? []),

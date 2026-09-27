@@ -1,12 +1,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkCoauthors, fetchAllPullRequestCommits } from '../check-pr-coauthors.mjs';
+import {
+  checkCoauthors,
+  fetchAllPullRequestCommits,
+  readCoauthorTrailers,
+  SANCTIONED_TRAILER,
+} from '../check-pr-coauthors.mjs';
 
 function commit(login, name = null, email = null) {
   return {
     author: login ? { login } : null,
     commit: { author: { name: name ?? login, email: email ?? `${login}@users.noreply.github.com` } },
   };
+}
+
+/** A commit carrying a message, which is where a trailer can live. */
+function messaged(entry, message) {
+  return { ...entry, commit: { ...entry.commit, message } };
+}
+
+/** A commit whose message body ends in `lines` as its own paragraph. */
+function withTrailerBlock(entry, ...lines) {
+  return messaged(entry, `fix: something\n\n${lines.join('\n')}`);
 }
 
 test('checkCoauthors: says nothing when every commit is the PR author\'s own', () => {
@@ -278,9 +293,17 @@ test('checkCoauthors: warns that a local identity was never verified, and still 
   // a commit can be credited to whichever agent configured the tree rather than
   // the one who wrote it. Nothing at PR time can resolve that, but it must not
   // pass unremarked in a gate whose stated purpose is not losing credit.
+  //
+  // The trailer it hands over is the sanctioned line rather than
+  // `Hephaestus <hephaestus@paperclip.local>`. It used to be the raw identity,
+  // and an author who followed that line exactly published an internal agent's
+  // name and an unroutable address into a permanent commit, then failed review
+  // for it. The note still names the raw address: it is diagnosing the commit
+  // metadata that is already published, and the reader needs to know which
+  // identity is in question to rewrite it.
   const result = checkCoauthors([unmatched('Hephaestus', 'hephaestus@paperclip.local')], 'tonio-alucema');
 
-  assert.match(result.informational[0], /Co-Authored-By: Hephaestus <hephaestus@paperclip\.local>/);
+  assert.match(result.informational[0], /Co-Authored-By: Paperclip <noreply@paperclip\.ing>/);
   const note = result.informational.find(line => line.includes('Nothing verified'));
   assert.ok(note, 'the unverified identity is reported');
   assert.match(note, /Hephaestus <hephaestus@paperclip\.local>/);
@@ -477,12 +500,16 @@ test('checkCoauthors: does not call a matched-then-unmatched pair two people', (
 test('checkCoauthors: renders a name without the whitespace it was authored with', () => {
   // The comparison fix has to reach the rendered line too, or the squash body
   // carries a trailer git will not parse as a name.
+  //
+  // The address is a routable one on purpose. A local address normalises to the
+  // sanctioned line, which drops the name entirely, so this fixture used to stop
+  // testing what it is named for once that landed.
   const result = checkCoauthors(
-    [unmatched('  Agent A  ', 'agent@paperclip.local')],
+    [unmatched('  Agent A  ', 'ada@example.com')],
     'tonio-alucema'
   );
 
-  assert.match(trailersNote(result), /Co-Authored-By: Agent A <agent@paperclip\.local>$/m);
+  assert.match(trailersNote(result), /Co-Authored-By: Agent A <ada@example\.com>$/m);
 });
 
 test('checkCoauthors: lists three names on one address as a list, and says how many', () => {
@@ -662,3 +689,304 @@ test('checkCoauthors: never stores an empty name, so the note cannot render unde
   assert.match(collisionNote(result), /only `shared` is carried above/);
   for (const note of result.informational) assert.doesNotMatch(note, /undefined/);
 });
+
+// --- The second question: a trailer the branch already carries ----------------
+//
+// Every fixture below is a case measured on the open pull-request queue of this
+// fork on 2026-09-27, and the numbers in the names are the pull request they came
+// from. They are the regression set: a gate that cannot emit a compliant line and
+// never blocks is what let all of them sit open.
+
+test('checkCoauthors: does not fail a branch whose commits carry no trailer at all', () => {
+  // Pull request #131 and #103. An agent commits with a local identity and adds
+  // no trailer. There is nothing on the branch to reject, and the objection the
+  // original header raised against failing still holds here: the author is not
+  // violating anything, they are absent.
+  const result = checkCoauthors(
+    [
+      unmatched('janus', 'janus@petrouilfan.local'),
+      unmatched('talos', 'talos@paperclip.local'),
+    ],
+    'petros'
+  );
+
+  assert.equal(result.passed, true);
+  assert.deepEqual(result.failures, []);
+});
+
+test('checkCoauthors: hands over the sanctioned line for a machine identity, not the agent name', () => {
+  // Pull request #131, the hand-over half. The old line for this commit was
+  // `Co-Authored-By: janus <janus@users.noreply.github.com>` — the internal agent
+  // name in a public commit, on an address GitHub owns and the agent does not.
+  // An author who followed it exactly was sent back for the work of following it.
+  const result = checkCoauthors(
+    [unmatched('janus', 'janus@petrouilfan.local')],
+    'petros'
+  );
+
+  assert.match(trailersNote(result), new RegExp(`${escapeRegExp(SANCTIONED_TRAILER)}$`, 'm'));
+  assert.doesNotMatch(trailersNote(result), /janus@users\.noreply\.github\.com/);
+  assert.doesNotMatch(trailersNote(result), /petrouilfan\.local/);
+  // The name is still reported, because the branch really does carry its commits.
+  assert.match(trailersNote(result), /carries commits by janus/);
+});
+
+test('checkCoauthors: says why it normalised, so the line is not read as a dropped credit', () => {
+  const result = checkCoauthors(
+    [unmatched('janus', 'janus@petrouilfan.local')],
+    'petros'
+  );
+
+  assert.match(trailersNote(result), /exists only on this machine/);
+  assert.match(trailersNote(result), /credited as Paperclip rather than by name/);
+});
+
+test('checkCoauthors: never fails a real contributor\'s own trailer', () => {
+  // The false positive that would be most expensive: a human co-author trailer is
+  // the entire reason this file exists, and GitHub's per-login no-reply address
+  // is a person's address. Failing it would block the work the gate protects.
+  const result = checkCoauthors(
+    [
+      withTrailerBlock(
+        commit('tonio-alucema', 'Tonio'),
+        'Co-Authored-By: Jannes Stubbemann <stubbi@users.noreply.github.com>'
+      ),
+    ],
+    'tonio-alucema'
+  );
+
+  assert.equal(result.passed, true);
+  assert.deepEqual(result.failures, []);
+});
+
+test('checkCoauthors: leaves the already-correct trailer green', () => {
+  // Pull request #115 and #122. The one form the contribution rules accept, on
+  // the two pull requests that already carry it. A gate that turned these red
+  // would send back the only correct work in the queue.
+  const result = checkCoauthors(
+    [
+      withTrailerBlock(
+        unmatched('prometheus', 'prometheus@paperclip.local'),
+        SANCTIONED_TRAILER
+      ),
+    ],
+    'petros'
+  );
+
+  assert.equal(result.passed, true);
+  assert.deepEqual(result.failures, []);
+});
+
+test('checkCoauthors: fails a third party\'s identity on the branch', () => {
+  // Pull request #106, and the worst case in the queue: a public commit crediting
+  // a vendor's robot as a co-author. A co-author trailer is a credit this
+  // repository grants to a person, and there is no version of this that is fine.
+  const result = checkCoauthors(
+    [
+      withTrailerBlock(
+        unmatched('hephaestus', 'hephaestus@paperclip.local'),
+        'Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>'
+      ),
+    ],
+    'petros'
+  );
+
+  assert.equal(result.passed, false);
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /Claude Opus 4\.5 <noreply@anthropic\.com>/);
+  assert.match(result.failures[0], /automated mailbox/);
+  assert.match(result.failures[0], new RegExp(escapeRegExp(SANCTIONED_TRAILER)));
+});
+
+test('checkCoauthors: fails an instance-local trailer on the PR author\'s own commit', () => {
+  // Pull request #133. The contributor loop skips the PR author's own commits on
+  // its way to deciding who a squash drops, so this trailer is invisible to that
+  // pass. It is the reason the trailer check is a second pass and not a branch of
+  // the same loop: the violation is on the one commit the loop never reads.
+  const result = checkCoauthors(
+    [
+      withTrailerBlock(
+        commit('pfanioudakis', 'Petros Fan', 'pfanioudakis@gmail.com'),
+        'Co-Authored-By: Prometheus <prometheus@paperclip.local>'
+      ),
+    ],
+    'pfanioudakis'
+  );
+
+  assert.equal(result.passed, false);
+  assert.match(result.failures[0], /Prometheus <prometheus@paperclip\.local>/);
+  assert.match(result.failures[0], /cannot leave this machine/);
+});
+
+test('checkCoauthors: fails an agent name carried on the sanctioned address', () => {
+  // The contribution rules ask for the sanctioned line exactly and ask for no
+  // agent name on it, so the address being right does not settle the trailer.
+  const result = checkCoauthors(
+    [
+      withTrailerBlock(
+        unmatched('mnemosyne', 'mnemosyne@paperclip.local'),
+        'Co-Authored-By: mnemosyne <noreply@paperclip.ing>'
+      ),
+    ],
+    'petros'
+  );
+
+  assert.equal(result.passed, false);
+  assert.match(result.failures[0], /mnemosyne <noreply@paperclip\.ing>/);
+  assert.match(result.failures[0], /agent name/);
+});
+
+test('checkCoauthors: names only the trailer that is there, not the commit that has none', () => {
+  // Pull request #132 and #84, the mixed shape: one commit carries a defective
+  // trailer, the next carries nothing. Reporting the absent one would tell the
+  // author to fix a commit that is not broken.
+  const result = checkCoauthors(
+    [
+      withTrailerBlock(
+        unmatched('Hephaestus (Paperclip agent)', 'agent@paperclip.local'),
+        'Co-Authored-By: Hephaestus (Paperclip agent) <agent@paperclip.local>'
+      ),
+      messaged(unmatched('prometheus', 'prometheus@paperclip.local'), 'fix: something\n\nno trailers here'),
+    ],
+    'petros'
+  );
+
+  assert.equal(result.failures.length, 1);
+  const [failure] = result.failures;
+  assert.match(failure, /Hephaestus \(Paperclip agent\) <agent@paperclip\.local>/);
+  assert.equal(failure.match(/Co-Authored-By:/g).length, 2, 'the offending line, and the sanctioned one to replace it');
+  assert.doesNotMatch(failure, /on \d+ commits/, 'one commit carries it, so no count is claimed');
+});
+
+test('checkCoauthors: counts the commits one defective trailer rides on', () => {
+  // Pull request #132, the other half. The same bad line re-authored across a
+  // branch is the common case, and an author needs to know whether they are
+  // looking at one commit or five.
+  const result = checkCoauthors(
+    [
+      withTrailerBlock(unmatched('prometheus', 'prometheus@paperclip.local'),
+        'Co-Authored-By: Prometheus <prometheus@paperclip.local>'),
+      withTrailerBlock(unmatched('prometheus', 'prometheus@paperclip.local'),
+        'Co-Authored-By: Prometheus <prometheus@paperclip.local>'),
+    ],
+    'petros'
+  );
+
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /on 2 commits/);
+  assert.equal(result.failures[0].match(/Prometheus <prometheus@paperclip\.local>/g).length, 1);
+});
+
+test('checkCoauthors: does not read a sentence about the rule as a trailer', () => {
+  // The false positive that would make this gate unusable on this repository: a
+  // commit that documents the trailer rule would otherwise report a violation of
+  // it. Git's own rule is the guard — a trailer block is the last paragraph, and
+  // a line in it that is not `Token: value` means the paragraph is prose.
+  const result = checkCoauthors(
+    [
+      messaged(
+        commit('petros', 'Petros Fan', 'petros@example.com'),
+        'docs: explain the co-author rule\n\n' +
+          'Every commit an agent writes ends with the line\n\n' +
+          '    Co-Authored-By: Paperclip <noreply@paperclip.ing>\n\n' +
+          'and nothing else.'
+      ),
+    ],
+    'someone-else'
+  );
+
+  assert.equal(result.passed, true);
+  assert.deepEqual(result.failures, []);
+});
+
+test('checkCoauthors: reads a trailer block that carries other trailers too', () => {
+  // A real commit message ends in a block, not in one line, and a block with a
+  // `Signed-off-by:` in it is still a block.
+  const result = checkCoauthors(
+    [
+      withTrailerBlock(
+        commit('petros', 'Petros Fan', 'petros@example.com'),
+        'Signed-off-by: Petros Fan <petros@example.com>',
+        'Co-Authored-By: Prometheus <prometheus@paperclip.local>'
+      ),
+    ],
+    'someone-else'
+  );
+
+  assert.equal(result.passed, false);
+  assert.match(result.failures[0], /Prometheus <prometheus@paperclip\.local>/);
+  assert.doesNotMatch(result.failures[0], /Petros Fan <petros@example\.com>/);
+});
+
+test('checkCoauthors: does not judge a trailer that carries no address', () => {
+  // A person may write their name alone. A name alone cannot be told from an
+  // agent's, and failing it would block a human for a missing email — the
+  // expensive direction of the error.
+  const result = checkCoauthors(
+    [withTrailerBlock(commit('petros', 'Petros Fan', 'petros@example.com'), 'Co-Authored-By: Jannes Stubbemann')],
+    'someone-else'
+  );
+
+  assert.equal(result.passed, true);
+  assert.deepEqual(result.failures, []);
+});
+
+test('checkCoauthors: does not let a rebased committer erase a real author', () => {
+  // A rebase rewrites the committer, so on this fork it is an instance-local
+  // address on almost every rebased commit. Reading it as a machine identity on
+  // its own would normalise away the credit of a human whose branch was rebased —
+  // measured, not theoretical: the queue this change was filed against is almost
+  // entirely rebased local commits.
+  const rebased = {
+    author: null,
+    commit: {
+      author: { name: 'Jannes Stubbemann', email: 'jannes@example.com' },
+      committer: { name: 'agent', email: 'agent@paperclip.local' },
+    },
+  };
+
+  const result = checkCoauthors([rebased], 'someone-else');
+
+  assert.match(trailersNote(result), /Co-Authored-By: Jannes Stubbemann <jannes@example\.com>/);
+});
+
+test('checkCoauthors: reports the read it could not do instead of a clean scan', () => {
+  // The commits fetch is allowed to fail so a transient 5xx cannot take down the
+  // gates that do block. The cost is that this gate then has nothing to read, and
+  // a gate that answers "passed" because it could not look is worse than no gate,
+  // because it is evidence.
+  const result = checkCoauthors([], 'petros', { commitsUnavailable: true });
+
+  assert.equal(result.passed, false);
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /could not be read/);
+  assert.match(result.failures[0], /not a clean scan/);
+  assert.deepEqual(result.informational, []);
+});
+
+test('readCoauthorTrailers: reads only a real trailer block, and only the co-author line', () => {
+  const trailers = readCoauthorTrailers(
+    'fix: something\n\nSome prose about it.\n\n' +
+      'Signed-off-by: Petros Fan <petros@example.com>\n' +
+      'Co-Authored-By: Jannes Stubbemann <stubbi@users.noreply.github.com>'
+  );
+
+  assert.equal(trailers.length, 1);
+  assert.equal(trailers[0].name, 'Jannes Stubbemann');
+  assert.equal(trailers[0].email, 'stubbi@users.noreply.github.com');
+});
+
+test('readCoauthorTrailers: matches the key the way git does, and reads a bare address', () => {
+  const [lower] = readCoauthorTrailers('fix: something\n\nco-authored-by: stubbi@users.noreply.github.com');
+  assert.equal(lower.email, 'stubbi@users.noreply.github.com');
+  assert.equal(lower.name, null);
+
+  assert.deepEqual(readCoauthorTrailers('fix: something'), []);
+  assert.deepEqual(readCoauthorTrailers(''), []);
+  assert.deepEqual(readCoauthorTrailers(undefined), []);
+  assert.deepEqual(readCoauthorTrailers('fix: something\n\njust a paragraph'), []);
+});
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
