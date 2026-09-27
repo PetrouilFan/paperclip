@@ -20,6 +20,8 @@ import { hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, ISSUE_CONTINUATIO
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { classifyRunLiveness } from "./run-liveness.js";
+import { resolveRunIssueBindings } from "./run-attribution-source.js";
+import type { RunIssueBindingKind } from "./run-attribution-source.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -555,11 +557,19 @@ export function activityService(db: Db) {
       });
     },
 
+    /**
+     * The issues a run is bound to, resolved with the same reads the cross-issue
+     * influence guard uses, so the two cannot disagree about whether a run holds
+     * anything. Every row carries the source that put it in the set, and a run
+     * holding a checkout reports that issue even when it never wrote to it.
+     */
     issuesForRun: async (runId: string) => {
       const run = await db
         .select({
           companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
           contextSnapshot: heartbeatRuns.contextSnapshot,
+          status: heartbeatRuns.status,
         })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId))
@@ -586,34 +596,55 @@ export function activityService(db: Db) {
         )
         .orderBy(issueIdAsText);
 
-      const context = run.contextSnapshot;
-      const contextIssueId =
-        context && typeof context === "object" && typeof (context as Record<string, unknown>).issueId === "string"
-          ? ((context as Record<string, unknown>).issueId as string)
-          : null;
-      if (!contextIssueId) return fromActivity;
-      if (fromActivity.some((issue) => issue.issueId === contextIssueId)) return fromActivity;
+      const bindings = await resolveRunIssueBindings(db, {
+        companyId: run.companyId,
+        runId,
+        agentId: run.agentId,
+        contextSnapshot: run.contextSnapshot,
+        runStatus: run.status,
+      });
 
-      const fromContext = await db
-        .select({
-          issueId: issues.id,
-          identifier: issues.identifier,
-          title: issues.title,
-          status: issues.status,
-          priority: issues.priority,
-        })
-        .from(issues)
-        .where(
-          and(
-            eq(issues.companyId, run.companyId),
-            eq(issues.id, contextIssueId),
-            visibleIssueCondition(),
+      const activityIssueIds = new Set(fromActivity.map((issue) => issue.issueId));
+      const missingBindingIds = bindings
+        .map((binding) => binding.issueId)
+        .filter((issueId) => !activityIssueIds.has(issueId));
+
+      // A binding the caller cannot see is not reported. Archiving an issue does
+      // not stop the guard honouring the stamp on its row, but surfacing an
+      // archived title here would leak past `visibleIssueCondition()`.
+      const fromMissingBindings = missingBindingIds.length
+        ? await db
+            .select({
+              issueId: issues.id,
+              identifier: issues.identifier,
+              title: issues.title,
+              status: issues.status,
+              priority: issues.priority,
+            })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.companyId, run.companyId),
+                inArray(issues.id, missingBindingIds),
+                visibleIssueCondition(),
+              ),
+            )
+        : [];
+
+      const bindingByIssueId = new Map(bindings.map((binding) => [binding.issueId, binding.kind]));
+      const rows = [
+        ...bindings
+          .map((binding) => ({
+            issue: fromMissingBindings.find((row) => row.issueId === binding.issueId),
+            kind: binding.kind,
+          }))
+          .filter((entry): entry is { issue: (typeof fromMissingBindings)[number]; kind: RunIssueBindingKind } =>
+            Boolean(entry.issue),
           ),
-        )
-        .then((rows) => rows[0] ?? null);
+        ...fromActivity.map((issue) => ({ issue, kind: bindingByIssueId.get(issue.issueId) ?? null })),
+      ];
 
-      if (!fromContext) return fromActivity;
-      return [fromContext, ...fromActivity];
+      return rows.map(({ issue, kind }) => ({ ...issue, binding: kind }));
     },
 
     create: (data: typeof activityLog.$inferInsert) =>

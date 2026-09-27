@@ -60,6 +60,13 @@ export interface IssueForRun {
   title: string;
   status: string;
   priority: string;
+  /**
+   * Which source binds this run to the issue, or `null` when the run only
+   * touched it. Matches what the cross-issue influence guard will honour, so a
+   * non-null value is the answer to "will my write to this issue be charged to
+   * this run, or is the run bound to nothing?".
+   */
+  binding: "context" | "checkout" | "standing_watch" | null;
 }
 
 export const activityApi = {

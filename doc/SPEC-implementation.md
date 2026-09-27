@@ -627,6 +627,21 @@ spends its 20-write budget on any other target, and an unassigned target still
 fails closed. Assignee self-comments do not
 wake the assignee, and a non-assignee comment cannot mint a mention grant.
 
+A run's source issue is resolved from, in precedence order: its wake-time
+context snapshot, the `checkout_run_id` / `execution_run_id` stamp
+`POST /checkout` writes onto the issue row, a standing watch's configured host
+issue, and — only in the fail-closed branch — the caller's own assigned ticket.
+`GET /api/heartbeat-runs/{runId}/issues` resolves that same set through the same
+reads and reports which source put each issue in it, so an agent can tell
+whether its run is bound before it writes rather than inferring it from the
+issues the run happens to have touched. The endpoint and the cap must not
+resolve binding from different sources: a run that reports a binding it is not
+charged to, or a binding the endpoint omits, is the `run_context_required`
+refusal with no way for the caller to tell it apart from a run bound to nothing.
+The endpoint's list stays a superset of the binding set — it also lists issues
+the run merely wrote to, with no binding source — and an issue the caller cannot
+see is not listed even when a stamp binds it.
+
 Agent-authored issue comments persist the responsible user derived from the
 authenticated actor; clients cannot choose that attribution. Each comment also
 records the write-policy reason, and spoof attempts fail with an audited 422.
