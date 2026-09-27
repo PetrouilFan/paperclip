@@ -309,6 +309,44 @@ describe("agent delegation cycle guard", () => {
     expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(parent.id, IDLE_AGENT_ID);
   });
 
+  it("allows an agent to split its own issue into a child assigned to itself", async () => {
+    // The reported false positive: every issue in the chain was created by the
+    // same agent, so the ancestor walk matches the actor's own parent. The
+    // mock returning an ancestor keeps the test honest — if the guard consults
+    // it at all for a self-assignment, the ancestor-shaped answer must not be
+    // able to turn into a 409.
+    const parent = makeIssue({ createdByAgentId: AGENT_ACTOR_ID });
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: parent.id,
+      identifier: "PAP-999",
+      parentId: null,
+      createdByAgentId: AGENT_ACTOR_ID,
+      status: "in_progress",
+    });
+    mockIssueService.createChild.mockResolvedValue({
+      issue: makeIssue({
+        id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        parentId: parent.id,
+        createdByUserId: null,
+        createdByAgentId: AGENT_ACTOR_ID,
+      }),
+      parentBlockerAdded: false,
+    });
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Subtask of my own ticket",
+        description: "Split",
+        assigneeAgentId: AGENT_ACTOR_ID,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.createChild).toHaveBeenCalled();
+    expect(mockIssueService.findOpenAncestorCreatedByAgent).not.toHaveBeenCalled();
+  });
+
   it("allows the same child when no open ancestor was created by the assignee", async () => {
     const parent = makeIssue();
     mockIssueService.getById.mockResolvedValue(parent);
