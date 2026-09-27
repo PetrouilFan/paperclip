@@ -1244,6 +1244,17 @@ test('masking the commit body does not mask the identifier half, so a declared i
   // Paired with the test above: the mask must not switch the address half off,
   // and it must not switch the configured half off either. The body is masked
   // for one tier only, and the other two tiers are untouched.
+  //
+  // The bound this guards is about *detection*, and detection is what
+  // `passed === false` and the surface label assert. What the finding then
+  // prints is a different property, and the two are not the same claim: "this
+  // body is a finding" survives, "the finding quotes the identifier" does not,
+  // because the comment surface is scanned *and written* and a finding that
+  // reproduces its own match mints the next one. That is the `assertNoEcho`
+  // half below, and it is the convention every other site in this file follows
+  // — see the helper. The trailing mask assertion is what keeps the absence
+  // from passing by deletion: without it, a rule that reported the finding with
+  // the identifier simply dropped would satisfy both halves above.
   const result = checkInternalRefs({
     ...CLEAN,
     commits: [
@@ -1251,9 +1262,9 @@ test('masking the commit body does not mask the identifier half, so a declared i
     ],
   });
   assert.equal(result.passed, false, 'a declared identifier in a code span is still a finding');
-  const joined = result.failures.join('\n');
+  const joined = assertNoEcho(result, ['PET-9001']);
   assert.match(joined, /A commit message body carries/);
-  assert.match(joined, /PET-9001/);
+  assert.match(joined, /███████/, 'the mask is in the report, so the absence above is a redaction and not a deletion');
 });
 
 test('narrowing the commit body did not take the address coverage off the other three surfaces', () => {
