@@ -387,6 +387,12 @@ test("guard_message refuses the state-changing keys and passes the informational
     const typo = probe.call("guard_message", ["STATUS"]);
     assert.equal(typo.status, 1);
     assert.match(typo.stdout, /not KEY=VALUE/);
+
+    // A single quoted shell arg can still contain a newline. That must not let a
+    // second, state-changing field piggyback in the same argv entry.
+    const injected = probe.call("guard_message", ["STATUS=ok\nSTOPPING=1"]);
+    assert.equal(injected.status, 1);
+    assert.match(injected.stdout, /single-line KEY=VALUE/);
   } finally {
     probe.cleanup();
   }

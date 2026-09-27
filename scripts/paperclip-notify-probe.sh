@@ -202,6 +202,12 @@ guard_probe() {
 guard_message() {
   local msg key
   for msg in "$@"; do
+    case "$msg" in
+      *$'\n'* | *$'\r'*)
+        printf 'refused: message fields must be single-line KEY=VALUE entries; newline-delimited payload injection is not allowed\n'
+        return 1
+        ;;
+    esac
     key="${msg%%=*}"
     case "$key" in
       STOPPING | RELOADING | READY | WATCHDOG | WATCHDOG_USEC | EXTEND_TIMEOUT_USEC)
