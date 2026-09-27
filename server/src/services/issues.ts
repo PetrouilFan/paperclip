@@ -4799,8 +4799,19 @@ async function listIssueReviewAttentionMap(
         path.kind === "interaction" && path.ref
           ? (interactionAudienceById.get(path.ref) ?? null)
           : null;
-      const candidateAgentId =
-        interactionAudience?.addresseeAgentId ?? issue.assigneeAgentId;
+      // An agent is the responder of an interaction only when the card names
+      // one. Falling back to `issue.assigneeAgentId` reads "nobody was
+      // addressed" as "the assignee was", and the audience check below is a
+      // capability test (may this actor resolve?), not an ownership one, so
+      // under `resolverPolicy: anyone` it passes for the assignee and the
+      // projection names the one party that can never break the cycle: the
+      // assignee is blocked waiting on the card it authored. The creation
+      // route agrees - it wakes an agent only for an explicit
+      // `addresseeAgentId`, with no assignee fallback - so naming the assignee
+      // here reports a responder the one site with a side effect never
+      // notifies. Unaddressed cards take the same `"Board"` fallthrough that
+      // `human_only` cards and `approval` paths already use.
+      const candidateAgentId = interactionAudience?.addresseeAgentId ?? null;
       const interactionResponderAgentId =
         interactionAudience &&
         candidateAgentId &&
