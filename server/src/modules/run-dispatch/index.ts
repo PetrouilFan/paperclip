@@ -16,13 +16,17 @@ export {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
+  WAKE_QUEUE_AGE_KEY,
   RESOLVED_INTERACTION_CONTINUATION_STATUSES,
   isNonAssigneeWorkspaceBusyRetry,
   extractWakeCommentIds,
   deriveCommentId,
   allowsIssueInteractionWake,
   isResolvedInteractionContinuationWakeContext,
+  buildWakeQueueAge,
+  readWakeQueueAge,
 } from "./domain/wake-context.js";
+export type { WakeQueueAgeInput } from "./domain/wake-context.js";
 export type {
   RetryReasonKind,
   BudgetBlockFacts,

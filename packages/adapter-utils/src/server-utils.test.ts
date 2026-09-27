@@ -3255,6 +3255,141 @@ describe("selectPaperclipTaskMarkdown", () => {
   });
 });
 
+describe("renderPaperclipWakePrompt - wake queue age", () => {
+  // The measured case this covers: a diagnostic probe sat at the head of the
+  // queue for 7h00m16s across 17 dispatch decisions and then woke with a wake
+  // contract byte-identical to a fresh assignment. The agent had no way to
+  // notice.
+  const STALE_ENQUEUED_AT = "2026-09-26T22:29:57.943Z";
+  const STALE_STARTED_AT = "2026-09-27T05:30:14.014Z";
+
+  const basePayload = {
+    reason: "issue_assigned",
+    issue: {
+      id: "issue-1",
+      // Deliberately not a PREFIX-NUMBER shape: the internal-reference gate
+      // scans added lines, and a fixture identifier should not be one of its
+      // findings on a run that is not testing that gate.
+      identifier: "QUEUE-AGE-PROBE",
+      title: "isolate assigneeAgentId",
+      description: "isolate assigneeAgentId",
+      status: "todo",
+      workMode: "standard",
+    },
+    commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+    fallbackFetchNeeded: false,
+  };
+
+  const staleQueueAge = {
+    enqueuedAt: STALE_ENQUEUED_AT,
+    startedAt: STALE_STARTED_AT,
+    queueAgeSeconds: 25_216,
+    skippedByDispatchCount: 17,
+    issueUpdatedAt: "2026-09-26T23:05:22.000Z",
+    issueStaleSeconds: 23_092,
+  };
+
+  for (const resumedSession of [false, true]) {
+    it(`states the wait and the fresher runs for resumedSession=${resumedSession}`, () => {
+      const prompt = renderPaperclipWakePrompt(
+        { ...basePayload, queueAge: staleQueueAge },
+        { resumedSession },
+      );
+      expect(prompt).toContain("queue age: 7h 0m");
+      expect(prompt).toContain(`enqueued ${STALE_ENQUEUED_AT}`);
+      expect(prompt).toContain("fresher runs dispatched ahead of this one: 17");
+      expect(prompt).toContain("bound issue unchanged for: 6h 24m");
+    });
+  }
+
+  it("invites the cheap staleness check instead of implying the work is live", () => {
+    const prompt = renderPaperclipWakePrompt(
+      { ...basePayload, queueAge: staleQueueAge },
+      {},
+    );
+    expect(prompt).toContain("Stale-wake check");
+    expect(prompt).toContain("answered, cancelled, or superseded");
+    expect(prompt).toContain("17 fresher runs for the same agent started ahead of it");
+    expect(prompt).toContain("if the work is already done or cancelled, record that and stop");
+  });
+
+  it("reports the age without a stale-wake alarm for routine slot contention", () => {
+    const prompt = renderPaperclipWakePrompt(
+      {
+        ...basePayload,
+        // 4 minutes, zero skips: real queueing, no reason to doubt the work.
+        queueAge: { ...staleQueueAge, queueAgeSeconds: 240, skippedByDispatchCount: 0 },
+      },
+      {},
+    );
+    expect(prompt).toContain("queue age: 4m 0s");
+    expect(prompt).toContain("fresher runs dispatched ahead of this one: 0");
+    expect(prompt).not.toContain("Stale-wake check");
+  });
+
+  it("still alarms on being passed over even when the wait itself was short", () => {
+    // "I have been at the head of the queue and 17 fresher runs went first" is a
+    // different statement from "I waited", and only the first is actionable.
+    const prompt = renderPaperclipWakePrompt(
+      { ...basePayload, queueAge: { ...staleQueueAge, queueAgeSeconds: 20, skippedByDispatchCount: 17 } },
+      {},
+    );
+    expect(prompt).toContain("Stale-wake check");
+    expect(prompt).toContain("17 fresher runs for the same agent started ahead of it");
+  });
+
+  it("says nothing about the wait when the payload carries no queue age", () => {
+    for (const payload of [
+      basePayload,
+      { ...basePayload, queueAge: null },
+      { ...basePayload, queueAge: { enqueuedAt: STALE_ENQUEUED_AT } },
+      { ...basePayload, queueAge: { startedAt: STALE_STARTED_AT } },
+      { ...basePayload, queueAge: "queued" },
+    ]) {
+      const prompt = renderPaperclipWakePrompt(payload, {});
+      expect(prompt).not.toContain("queue age:");
+      expect(prompt).not.toContain("Stale-wake check");
+    }
+  });
+
+  it("keeps a half-stamped payload from reading as a fresh run", () => {
+    // Normalization refuses to emit an age it cannot support, and the prompt
+    // carries no derived age of its own to fill the gap.
+    const normalized = JSON.parse(
+      stringifyPaperclipWakePayload({
+        ...basePayload,
+        queueAge: { enqueuedAt: STALE_ENQUEUED_AT, startedAt: "", queueAgeSeconds: 25_216 },
+      }) ?? "{}",
+    );
+    expect(normalized.queueAge).toBeNull();
+  });
+
+  it("normalizes a nonsense age to zero rather than passing it through", () => {
+    const normalized = JSON.parse(
+      stringifyPaperclipWakePayload({
+        ...basePayload,
+        queueAge: {
+          enqueuedAt: STALE_ENQUEUED_AT,
+          startedAt: STALE_STARTED_AT,
+          queueAgeSeconds: -5,
+          skippedByDispatchCount: Number.NaN,
+        },
+      }) ?? "{}",
+    );
+    expect(normalized.queueAge).toMatchObject({
+      queueAgeSeconds: 0,
+      skippedByDispatchCount: 0,
+    });
+  });
+
+  it("survives the gateway lane as structured JSON", () => {
+    const normalized = JSON.parse(
+      stringifyPaperclipWakePayload({ ...basePayload, queueAge: staleQueueAge }) ?? "{}",
+    );
+    expect(normalized.queueAge).toEqual(staleQueueAge);
+  });
+});
+
 describe("renderPaperclipWakePrompt - task watchdog", () => {
   const baseWatchdogPayload = {
     reason: "task_watchdog_subtree_stopped",
