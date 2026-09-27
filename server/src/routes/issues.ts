@@ -7540,14 +7540,29 @@ export function issueRoutes(
    * something the other assumed it had, the chain of blocked issues grows,
    * and no one tells the human. Humans are unaffected, and closed ancestors
    * do not count — re-engaging the creator of finished work is normal.
+   *
+   * A→B→A needs three distinct facts: A created the ancestor, B is the actor,
+   * and the child goes back to A. The ancestor walk only proves the third and
+   * the first, so the actor comparison below is what separates a real
+   * hand-back from an agent splitting its own ticket. Without it, an agent
+   * whose own open issue is the ancestor trips the guard against itself, and
+   * the only escape the error offers ("leave the child unassigned") drops the
+   * work on the floor where no heartbeat will pick it up.
    */
   async function assertNoAgentDelegationCycle(input: {
     actorType: string;
+    actorAgentId: string | null | undefined;
     parentIssueId: string | null | undefined;
     assigneeAgentId: string | null | undefined;
   }) {
     if (input.actorType !== "agent") return;
     if (!input.parentIssueId || !input.assigneeAgentId) return;
+    // Nobody delegated anything to the actor, so it cannot be handing work
+    // back. With actor !== assignee, an ancestor created by the assignee is
+    // still exactly the A→B→A shape the guard exists to catch.
+    if (input.actorAgentId && input.actorAgentId === input.assigneeAgentId) {
+      return;
+    }
     const ancestor = await svc.findOpenAncestorCreatedByAgent(
       input.parentIssueId,
       input.assigneeAgentId,
@@ -12052,6 +12067,7 @@ export function issueRoutes(
         );
       await assertNoAgentDelegationCycle({
         actorType: req.actor.type,
+        actorAgentId: req.actor.agentId ?? null,
         parentIssueId:
           typeof effectiveParentId === "string" ? effectiveParentId : null,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
@@ -12468,6 +12484,7 @@ export function issueRoutes(
         );
       await assertNoAgentDelegationCycle({
         actorType: req.actor.type,
+        actorAgentId: req.actor.agentId ?? null,
         parentIssueId: parent.id,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
       });
