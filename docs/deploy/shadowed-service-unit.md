@@ -468,6 +468,102 @@ mtime is 2026-09-25 00:57 — the timestamp of the in-place `dist` patches in
 same install, reached by different checks. `/proc/<pid>/exe` is `/usr/bin/node`,
 which is the interpreter and says nothing about the target.
 
+## A probe inherits the live notify socket, and a datagram cannot be aimed
+
+Every diagnostic run on this plane is an **agent run**, so it inherits
+`NOTIFY_SOCKET` from the control plane *and* sits inside the control plane unit's
+cgroup. Both facts are one line each, and together they are a capability:
+
+```sh
+$ env | grep -c '^NOTIFY_SOCKET='
+1                                    # /run/user/1000/systemd/notify
+$ cat /proc/self/cgroup
+0::/user.slice/user-1000.slice/user@1000.service/app.slice/paperclipai.service
+$ systemctl --user show paperclipai.service -p NotifyAccess
+NotifyAccess=all
+```
+
+So **any** harness that talks to systemd IPC — a `systemd-notify` call, a
+`LISTEN_FDS` reader, a `READY=1` from a boot probe — is holding a live handle on
+the unit it is running inside. Nothing about being a probe makes that safe, and
+`STATUS=` is the cheapest datagram there is.
+
+The correction to the obvious mental model, measured on this host 2026-09-27, is
+worth more than the warning. It is tempting to think a notify socket belongs to a
+unit and that writing to the control plane's socket is what endangers it. It does
+not work that way:
+
+```sh
+# A throwaway unit's own child, and the control plane's own child:
+$ tr '\0' '\n' < /proc/$(systemctl --user show pc-probe-x.service -p MainPID --value)/environ \
+    | grep NOTIFY_SOCKET
+NOTIFY_SOCKET=/run/user/1000/systemd/notify
+$ tr '\0' '\n' < /proc/$(systemctl --user show paperclipai.service -p MainPID --value)/environ \
+    | grep NOTIFY_SOCKET
+NOTIFY_SOCKET=/run/user/1000/systemd/notify
+```
+
+**Every unit of one manager shares a single notify socket**, and systemd attributes
+a datagram to the unit the *sending process* is in. Sending from unit A and reading
+the `StatusText` of A, of an unrelated unit B, and of the control plane:
+
+| sender's cgroup | A's `StatusText` | B's | `paperclipai.service` |
+|---|---|---|---|
+| `pc-probe-own-A.service` | `i-am-the-sender` | empty | unchanged |
+| inside a run | — | — | **overwritten** |
+
+Two consequences, and they pull in the opposite direction from the obvious one:
+
+1. **You cannot aim a datagram at another unit.** "Set unit X's status" is a
+   category error, not a risky operation. Any probe that believes it is talking to
+   some other unit is talking to itself.
+2. **The only thing that matters is which cgroup the sender is in.** There is no
+   dangerous socket; there is a dangerous *position*. A probe is safe in a
+   throwaway unit and unsafe everywhere else, including in your own terminal
+   (`user@1000.service`) and in an agent run.
+
+### The supported way to send one
+
+`scripts/paperclip-notify-probe.sh` is the shared guard, and it is the thing to
+call before any harness touches systemd IPC:
+
+```sh
+# What would this send do, and from where?
+scripts/paperclip-notify-probe.sh info
+
+# Refuse to send from a long-lived unit's cgroup. Exit 0 only if allowed.
+scripts/paperclip-notify-probe.sh guard /run/user/$(id -u)/systemd/notify
+
+# The one supported send: the probe itself runs inside a throwaway unit, so the
+# datagram is applied to that unit and to nothing else.
+systemd-run --user --unit="pc-probe-$$" --property=Type=exec \
+  --property=NotifyAccess=all \
+  scripts/paperclip-notify-probe.sh notify \
+    /run/user/$(id -u)/systemd/notify "STATUS=probe-$$"
+```
+
+`--property=Type=exec` rather than `Type=notify`, because a `Type=notify` unit
+stays `activating` until it sends `READY=1`, which the guard refuses — so it would
+fail on `TimeoutStartSec` every time. `Type=exec` with `NotifyAccess=all` is live
+immediately and accepts a `STATUS=` at any moment.
+
+The guard also refuses `STOPPING=`, `RELOADING=`, `READY=`, `WATCHDOG=`,
+`WATCHDOG_USEC=` and `EXTEND_TIMEOUT_USEC=` with no override, so wrapping a probe
+buys a throwaway unit and not a licence to stop anything.
+
+`scripts/paperclip-notify-probe-proof.sh` is the end-to-end proof against a real
+user manager; `scripts/paperclip-notify-probe.test.mjs` is the contract suite and
+runs in the PR gate. The proof script re-demonstrates the attribution table above
+on whatever host it runs on, so neither has to be taken on trust.
+
+**This is a mitigation, not the fix.** The two durable halves are the server-side
+scrub in `sanitizeInheritedPaperclipEnv`
+(`packages/adapter-utils/src/server-utils.ts`), which drops `NOTIFY_SOCKET` and
+the `LISTEN_*` triple from a run child's environment, and the unit-side
+`NotifyAccess=main`, which makes systemd accept a datagram only from the main
+process. The guard covers what neither does: harnesses the control plane did not
+spawn, on a host where the unit is still `NotifyAccess=all`.
+
 ## Rules of thumb
 
 1. **A green `Service definition` is a statement about one file.** It is not a
@@ -478,7 +574,7 @@ which is the interpreter and says nothing about the target.
    list the main file built. Ten drop-ins is a normal, healthy, completely
    ungreppable configuration.
 3. **Resolve the `ExecStart` target before trusting it.** An existing executable
-   file is all the installer checks; a symlink satisfies that and a package install
+   file is all the installer checks. A symlink satisfies that and a package install
    can re-point it with the unit untouched.
 4. **A missing `hot-restart-report.json` is not a clean restart.** It is a restart
    whose run set was never recorded. Correlate the report's `requestedAt` against
@@ -491,3 +587,6 @@ which is the interpreter and says nothing about the target.
 7. **Back the unit up before any re-render, and re-read `systemctl --user show`
    after the reload.** The re-render fixes the file and leaves every drop-in
    standing.
+8. **A notify datagram edits the unit that sent it.** There is no socket to aim at
+   and no per-unit socket to check — check the sender's cgroup, or run the probe in
+   a throwaway unit.
