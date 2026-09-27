@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { and, eq } from "drizzle-orm";
 
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import type { Db } from "@paperclipai/db";
 import { agentSessionGoalActions, agentTaskSessions } from "@paperclipai/db";
 
@@ -280,6 +281,32 @@ async function stopChild(
   }
 }
 
+/**
+ * Environment for the native runner child process.
+ *
+ * The base is `sanitizeInheritedPaperclipEnv`, not a bare `process.env` spread,
+ * and the reason is that this child and everything it spawns inherits the
+ * environment. Under a `Type=notify` unit systemd puts the unit's notify socket
+ * address in the control plane's own environment as `NOTIFY_SOCKET`, so a bare
+ * spread handed every run the address of the socket that controls the unit the
+ * run is executing on. `LISTEN_*` is the same class of leak: it carries the
+ * unit's socket-activated file descriptors.
+ *
+ * This is the same chokepoint `runChildProcess` already applies, so the native
+ * runner path no longer differs from the other adapter paths. `host` is a
+ * parameter so the guarantee is testable without a real systemd unit.
+ */
+export function buildNativeRunnerProcessEnv(
+  input: { environment: Record<string, string>; bootstrapTicket: string },
+  host: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...sanitizeInheritedPaperclipEnv(host),
+    ...input.environment,
+    PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: input.bootstrapTicket,
+  };
+}
+
 export async function executeNativeCodexRunner(input: {
   db: Db;
   companyId: string;
@@ -395,11 +422,10 @@ export async function executeNativeCodexRunner(input: {
   }), {
     cwd: input.cwd,
     detached: process.platform !== "win32",
-    env: {
-      ...process.env,
-      ...input.environment,
-      PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
-    },
+    env: buildNativeRunnerProcessEnv({
+      environment: input.environment,
+      bootstrapTicket: prepared.bootstrapTicket,
+    }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   const exit = waitForExit(child);
