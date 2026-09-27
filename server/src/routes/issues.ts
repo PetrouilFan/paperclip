@@ -211,6 +211,7 @@ import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
   taskWatchdogScopeAllowsIssueMutation,
+  taskWatchdogWriteScopeFromClassification,
 } from "../services/task-watchdog-scope.js";
 import type {
   TaskWatchdogServiceDeps,
@@ -5444,27 +5445,28 @@ export function issueRoutes(
       return false;
     }
     const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (watchdogScope.kind !== "none") {
-      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(
-        db,
-        watchdogScope,
-        issue,
-      );
-      if (scopeResult.kind === "invalid") {
-        res.status(403).json({
-          error: scopeResult.detail,
-          details: {
-            issueId: issue.id,
-            securityPrinciples: [
-              "Least Privilege",
-              "Complete Mediation",
-              "Fail Securely",
-            ],
-          },
-        });
-        return false;
-      }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+    if (watchdogScope.kind === "invalid") {
+      res.status(403).json({
+        error: watchdogScope.detail,
+        details: {
+          issueId: issue.id,
+          securityPrinciples: [
+            "Least Privilege",
+            "Complete Mediation",
+            "Fail Securely",
+          ],
+        },
+      });
+      return false;
+    }
+    if (watchdogScope.kind === "watchdog") {
+      const denial = await evaluateTaskWatchdogIssueMutation(watchdogScope, issue);
+      if (!denial) return true;
+      res.status(denial.code === "scope" ? 403 : 409).json({
+        error: denial.detail,
+        details: denial.details,
+      });
+      return false;
     }
     const boundaryDecision = await decideIssueAccess(
       req,
@@ -5573,27 +5575,28 @@ export function issueRoutes(
     // subtree; downstream status-transition, assignment, recovery, and budget
     // guards in the route handlers still apply.
     const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (watchdogScope.kind !== "none") {
-      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(
-        db,
-        watchdogScope,
-        issue,
-      );
-      if (scopeResult.kind === "invalid") {
-        res.status(403).json({
-          error: scopeResult.detail,
-          details: {
-            issueId: issue.id,
-            securityPrinciples: [
-              "Least Privilege",
-              "Complete Mediation",
-              "Fail Securely",
-            ],
-          },
-        });
-        return false;
-      }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+    if (watchdogScope.kind === "invalid") {
+      res.status(403).json({
+        error: watchdogScope.detail,
+        details: {
+          issueId: issue.id,
+          securityPrinciples: [
+            "Least Privilege",
+            "Complete Mediation",
+            "Fail Securely",
+          ],
+        },
+      });
+      return false;
+    }
+    if (watchdogScope.kind === "watchdog") {
+      const denial = await evaluateTaskWatchdogIssueMutation(watchdogScope, issue);
+      if (!denial) return true;
+      res.status(denial.code === "scope" ? 403 : 409).json({
+        error: denial.detail,
+        details: denial.details,
+      });
+      return false;
     }
     const boundaryDecision = await decideIssueAccess(
       req,
@@ -5689,19 +5692,82 @@ export function issueRoutes(
     return true;
   }
 
-  async function assertFreshTaskWatchdogSourceMutation(
-    res: Response,
-    scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
-    issue: { id: string },
-  ) {
-    if (scope.kind !== "watchdog") return true;
-    if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId)
-      return true;
+  /**
+   * One task-watchdog authorization decision for one mutation.
+   *
+   * The freshness revalidation and the scope check are no longer separable: the
+   * scope is derived from the stop classification, so the classification has to
+   * exist before the target can be checked against it. Revalidating once and
+   * reusing the result is also what keeps this free — the classifier input was
+   * already being collected on every mutation for the freshness check alone.
+   *
+   * The refusal order stays least-privilege-first: a target outside the scope is
+   * reported as out of scope even when the revalidation would also have refused
+   * it as stale, so an out-of-scope write learns nothing about the stop's
+   * freshness. Returns `null` when the mutation is allowed.
+   *
+   * One case sits outside that order. A revalidation can refuse before it has
+   * classified anything at all — no fingerprint in the run context, or no active
+   * watchdog row behind the run. There is no scope to compare against then, so
+   * the write is refused on the revalidation's own reason rather than reported as
+   * out of scope: an empty scope would refuse the whole subtree, including the
+   * watched issue, under a message that names the wrong problem.
+   */
+  async function evaluateTaskWatchdogIssueMutation(
+    scope: Extract<
+      Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
+      { kind: "watchdog" }
+    >,
+    issue: { id: string; companyId: string; parentId?: string | null },
+    opts: { allowWatchdogIssue?: boolean } = {},
+  ): Promise<
+    | null
+    | {
+        code: "scope" | "stale";
+        detail: string;
+        details: Record<string, unknown>;
+      }
+  > {
+    if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId && opts.allowWatchdogIssue !== false) {
+      return null;
+    }
 
     const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
-    if (revalidated.allowed) return true;
-    res.status(409).json({
-      error: revalidated.reason,
+    if (!revalidated.classification) {
+      return {
+        code: "stale",
+        detail: revalidated.reason,
+        details: {
+          watchedIssueId: scope.watchedIssueId,
+          watchdogId: scope.watchdogId,
+          runStopFingerprint: scope.stopFingerprint,
+          currentState: null,
+          currentStopFingerprint: null,
+        },
+      };
+    }
+    const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, scope, issue, {
+      allowWatchdogIssue: opts.allowWatchdogIssue,
+      writeScope: taskWatchdogWriteScopeFromClassification(revalidated.classification),
+    });
+    if (scopeResult.kind === "invalid") {
+      return {
+        code: "scope",
+        detail: scopeResult.detail,
+        details: {
+          issueId: issue.id,
+          securityPrinciples: [
+            "Least Privilege",
+            "Complete Mediation",
+            "Fail Securely",
+          ],
+        },
+      };
+    }
+    if (revalidated.allowed) return null;
+    return {
+      code: "stale",
+      detail: revalidated.reason,
       details: {
         watchedIssueId: scope.watchedIssueId,
         watchdogId: scope.watchdogId,
@@ -5713,8 +5779,7 @@ export function issueRoutes(
             ? revalidated.classification.stopFingerprint
             : null,
       },
-    });
-    return false;
+    };
   }
 
   async function rejectTaskWatchdogConfigMutation(req: Request, res: Response) {
@@ -5749,24 +5814,25 @@ export function issueRoutes(
     if (req.actor.type !== "agent") return true;
     const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
     if (scope.kind === "none") return true;
-    const result = await taskWatchdogScopeAllowsIssueMutation(
-      db,
-      scope,
-      issue,
-      opts,
-    );
-    if (result.kind !== "invalid")
-      return assertFreshTaskWatchdogSourceMutation(res, scope, issue);
-    res.status(403).json({
-      error: result.detail,
-      details: {
-        issueId: issue.id,
-        securityPrinciples: [
-          "Least Privilege",
-          "Complete Mediation",
-          "Fail Securely",
-        ],
-      },
+    if (scope.kind === "invalid") {
+      res.status(403).json({
+        error: scope.detail,
+        details: {
+          issueId: issue.id,
+          securityPrinciples: [
+            "Least Privilege",
+            "Complete Mediation",
+            "Fail Securely",
+          ],
+        },
+      });
+      return false;
+    }
+    const denial = await evaluateTaskWatchdogIssueMutation(scope, issue, opts);
+    if (!denial) return true;
+    res.status(denial.code === "scope" ? 403 : 409).json({
+      error: denial.detail,
+      details: denial.details,
     });
     return false;
   }
@@ -5864,30 +5930,16 @@ export function issueRoutes(
         message: watchdogScope.detail,
       });
     }
-    if (watchdogScope.kind !== "none") {
-      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(
-        db,
-        watchdogScope,
-        issue,
-      );
-      if (scopeResult.kind === "invalid") {
-        return denyIssueThreadInteractionResolution(res, {
-          status: 403,
-          code: "interaction_scope_denied",
-          message: scopeResult.detail,
-        });
-      }
-      const revalidated =
-        await taskWatchdogsSvc.revalidateMutationScope(watchdogScope);
-      if (!revalidated.allowed) {
-        return denyIssueThreadInteractionResolution(res, {
-          status: 403,
-          code: "interaction_scope_denied",
-          message:
-            "This issue-thread interaction is outside the current watchdog scope",
-        });
-      }
-      return true;
+    if (watchdogScope.kind === "watchdog") {
+      const denial = await evaluateTaskWatchdogIssueMutation(watchdogScope, issue);
+      if (!denial) return true;
+      return denyIssueThreadInteractionResolution(res, {
+        status: 403,
+        code: "interaction_scope_denied",
+        message: denial.code === "stale"
+          ? "This issue-thread interaction is outside the current watchdog scope"
+          : denial.detail,
+      });
     }
 
     const boundaryDecision = await decideIssueAccess(
@@ -6069,24 +6121,11 @@ export function issueRoutes(
               "Suggested-task creation is outside the current watchdog scope",
           });
         }
-        if (watchdogScope.kind !== "none") {
-          const scopeResult = await taskWatchdogScopeAllowsIssueMutation(
-            db,
-            watchdogScope,
-            parent,
-            { allowWatchdogIssue: false },
-          );
-          if (scopeResult.kind === "invalid") {
-            return denyIssueThreadInteractionResolution(res, {
-              status: 403,
-              code: "interaction_governed_action_denied",
-              message:
-                "Suggested-task creation is outside the current watchdog scope",
-            });
-          }
-          const revalidated =
-            await taskWatchdogsSvc.revalidateMutationScope(watchdogScope);
-          if (!revalidated.allowed) {
+        if (watchdogScope.kind === "watchdog") {
+          const denial = await evaluateTaskWatchdogIssueMutation(watchdogScope, parent, {
+            allowWatchdogIssue: false,
+          });
+          if (denial) {
             return denyIssueThreadInteractionResolution(res, {
               status: 403,
               code: "interaction_governed_action_denied",
@@ -6289,16 +6328,16 @@ export function issueRoutes(
       });
       return false;
     }
-    const result = await taskWatchdogScopeAllowsIssueMutation(
-      db,
-      scope,
-      parent,
-      { allowWatchdogIssue: false },
-    );
-    if (result.kind !== "invalid")
-      return assertFreshTaskWatchdogSourceMutation(res, scope, parent);
+    const denial = await evaluateTaskWatchdogIssueMutation(scope, parent, {
+      allowWatchdogIssue: false,
+    });
+    if (!denial) return true;
+    if (denial.code === "stale") {
+      res.status(409).json({ error: denial.detail, details: denial.details });
+      return false;
+    }
     res.status(403).json({
-      error: result.detail,
+      error: denial.detail,
       details: {
         parentIssueId: parent.id,
         securityPrinciples: [

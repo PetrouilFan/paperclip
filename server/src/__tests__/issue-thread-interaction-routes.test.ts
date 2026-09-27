@@ -151,6 +151,10 @@ vi.mock("../services/task-watchdog-scope.js", () => ({
   TASK_WATCHDOG_ORIGIN_KIND: "task_watchdog",
   resolveTaskWatchdogMutationScope: mockResolveTaskWatchdogMutationScope,
   taskWatchdogScopeAllowsIssueMutation: vi.fn(async (_db, scope) => scope),
+  taskWatchdogWriteScopeFromClassification: vi.fn(() => ({
+    subtreeIssueIds: new Set<string>(),
+    stopBlockerIssueIds: new Set<string>(),
+  })),
 }));
 
 vi.mock("../services/trust-preset-resolver.js", () => ({
@@ -227,7 +231,18 @@ function registerModuleMocks() {
       getActiveForIssue: vi.fn(async () => null),
       upsertForIssue: vi.fn(),
       disableForIssue: vi.fn(async () => null),
-      revalidateMutationScope: vi.fn(async (scope: unknown) => ({ allowed: true, scope })),
+      // The real service returns a classification alongside `allowed`, and the
+      // route reads the write scope out of it. A mock that omitted it would be
+      // refused for a reason the real service would never produce.
+      revalidateMutationScope: vi.fn(async (scope: { watchedIssueId?: string }) => ({
+        allowed: true,
+        scope,
+        classification: {
+          state: "stopped",
+          includedIssueIds: scope.watchedIssueId ? [scope.watchedIssueId] : [],
+          stoppedLeaves: [],
+        },
+      })),
     }),
     logActivity: mockLogActivity,
     projectService: () => ({}),
