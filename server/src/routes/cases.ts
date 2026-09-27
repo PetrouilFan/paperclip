@@ -234,6 +234,21 @@ async function insertCaseEvent(db: CaseRouteDb, input: {
   return event!;
 }
 
+/**
+ * Which issue a run is *about*, for labelling a run on a case record.
+ *
+ * Deliberately not `resolveRunIssueBindings`. This is a display label on a case,
+ * not an attribution decision, so it answers a different question: it also
+ * matches `origin_run_id` (the run that opened the case), it ignores run
+ * context and standing-watch hosts, and it has no terminal-status rule — a
+ * finished run's stamp still names its case. Folding it into the cap's binding
+ * set would make a case label a budget decision, and a case whose run is over
+ * would lose the issue it was opened against.
+ *
+ * The two answers are expected to differ, and that is not drift: the binding
+ * set answers "may this run charge a cross-issue write to an issue", this one
+ * answers "which case is this run on".
+ */
 async function resolveIssueForRun(db: CaseRouteDb, companyId: string, runId: string | null | undefined) {
   if (!runId || !isUuidLike(runId)) return null;
   return db
