@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
  * check-pr-coauthors.mjs
- * Surfaces the `Co-Authored-By` trailers a squash merge needs to keep
- * contributors credited.
- * Export: checkCoauthors(commits, prAuthor) → { passed, informational }
+ * Hands over the `Co-Authored-By` trailers a squash merge needs to keep
+ * contributors credited, and fails a branch that already carries a trailer
+ * this repository's contribution rules do not accept.
+ * Export: checkCoauthors(commits, prAuthor, options) → { passed, failures, informational }
  *
  * This repository squash-merges, so every commit on a branch collapses into
  * one commit authored by whoever presses the button. When a branch carries
@@ -13,13 +14,70 @@
  * and the PR page keeps showing the original author either way, so the loss is
  * invisible at exactly the moment it happens.
  *
- * Identity matching is a heuristic and is deliberately biased. A commit GitHub
- * could not match to an account is credited unless its name or email resolves
- * to the PR author, which will occasionally credit someone as a co-author of
- * themselves — their git config carrying a real name where the comparison has
- * only a login. That error costs a line a human drops while pasting. The
- * opposite error costs a contributor their attribution silently, which is the
- * failure this gate exists to prevent, so the bias runs towards over-crediting.
+ * ## Two questions, and why only one of them blocks
+ *
+ * The squash message does not exist while the PR is open. So "whose authorship
+ * would a squash drop?" cannot be fixed from the PR, and answering it by failing
+ * would block work on something its author has no way to satisfy. That half
+ * stays informational, and it hands over the exact lines to paste.
+ *
+ * The commit trailers are the other half, and they do exist while the PR is open.
+ * They are a property of the commits, already fetched, and the author can
+ * rewrite them. So "does this branch carry a trailer the rules reject?" is
+ * answerable now and is a failure when the answer is no. Before this split the
+ * gate merged the two questions and answered neither: it could not emit a
+ * compliant line, it never failed, and a queue grew where every trailer was
+ * defective and no author had a sanctioned path to fix one.
+ *
+ * A missing trailer is not a failure. No trailer and no foreign authorship is
+ * not a violation, and the objection the old header raised against failing
+ * still holds for that case: there is nothing on the branch to reject. Only a
+ * trailer that is *present and not accepted* fails, and that is always fixable
+ * by the author because the trailer is theirs to rewrite.
+ *
+ * ## What counts as a credit, and what gets normalised
+ *
+ * A co-author trailer names a person. Two shapes on this fork are not a person:
+ *
+ * - An instance-local address. `hephaestus@paperclip.local` is a machine
+ *   default that no mail outside this machine can reach, and the name beside it
+ *   is an internal agent's. Publishing either is publishing an internal
+ *   coordinate in permanent history.
+ * - An automated mailbox. `noreply@anthropic.com` is a vendor's robot, and a
+ *   third party's identity on this repository's commit is not a credit anyone
+ *   here can grant.
+ *
+ * Both are reported as needing the one line the contribution rules accept for a
+ * machine-authored commit: `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
+ * The same normalisation applies to the line this gate *hands over*, because a
+ * hand-over is a proposal for what should land. A commit by an agent with no
+ * GitHub account behind it is credited as `Paperclip` rather than by name — and
+ * an author who followed the old hand-over exactly, writing their agent's name
+ * and login into a public commit, was worse off than one who ignored it.
+ *
+ * Two deliberate non-cases, because a gate that invents a violation out of a
+ * reading blocks correct work:
+ *
+ * - A matched GitHub account is never normalised away. Its address is its own
+ *   and its name may be wrong, which the unverified note below reports; erasing
+ *   a real contributor because their worktree held a local `user.email` is the
+ *   attribution loss this file exists to prevent.
+ * - A trailer with no address is not judged. A person may write their name
+ *   alone, and a name alone cannot be told from an agent's.
+ *
+ * What this cannot compute is a model name on a routable personal-looking
+ * address, which reads as a person. It is left to the reviewer, and the
+ * unverified note is what puts it in front of one.
+ *
+ * ## Identity matching is a heuristic and is deliberately biased
+ *
+ * A commit GitHub could not match to an account is credited unless its name or
+ * email resolves to the PR author, which will occasionally credit someone as a
+ * co-author of themselves — their git config carrying a real name where the
+ * comparison has only a login. That error costs a line a human drops while
+ * pasting. The opposite error costs a contributor their attribution silently,
+ * which is the failure this gate exists to prevent, so the bias runs towards
+ * over-crediting.
  *
  * Two things that cost a contributor their credit are reported rather than
  * resolved, because neither has a correct answer this gate can compute:
@@ -40,17 +98,22 @@
  *   available — but the note says plainly that nothing verified it, and which of
  *   the two things was unverified.
  *
- * The two biases above govern different decisions and do not contradict each
- * other. Over-crediting answers whether to emit a trailer at all, where the
- * answer is yes even when unverified. Reporting a shared identity answers
- * whether to de-duplicate an address that arrived under two names, where
- * collapsing it is right and staying silent about the loser is not.
+ * The biases above govern different decisions and do not contradict each other.
+ * Over-crediting answers whether to emit a trailer at all, where the answer is
+ * yes even when unverified. Reporting a shared identity answers whether to
+ * de-duplicate an address that arrived under two names, where collapsing it is
+ * right and staying silent about the loser is not. Neither is traded away to
+ * make the new blocking check quieter.
  *
- * Informational rather than a failure, on purpose. The squash message does not
- * exist while the PR is open, so this cannot be verified here and cannot be
- * fixed here either. Failing the PR would block work on something its author
- * has no way to satisfy. What this can do is notice that the situation applies
- * and hand over the exact lines to paste.
+ * ## A note about what a note may print
+ *
+ * The failure and the hand-over disagree about one thing on purpose. The
+ * hand-over is a line to paste into a new permanent commit, so an instance-local
+ * identity is normalised out of it. The notes are diagnostics about what is
+ * already on the branch — already in the commit, already in this repository's
+ * history — so they name the address they are reporting. Removing it would
+ * leave a reader unable to tell which commit to rewrite, and it would add no
+ * exposure the branch has not already published.
  */
 import { fileURLToPath } from 'node:url';
 
@@ -81,6 +144,12 @@ export async function fetchAllPullRequestCommits(ghFetchFn, repo, prNumber, toke
 function noReplyEmail(login) {
   return `${login}@users.noreply.github.com`;
 }
+
+/** The one `Co-Authored-By` form this repository's contribution rules accept. */
+export const SANCTIONED_TRAILER = 'Co-Authored-By: Paperclip <noreply@paperclip.ing>';
+
+const SANCTIONED_TRAILER_NAME = 'paperclip';
+const SANCTIONED_TRAILER_EMAIL = 'noreply@paperclip.ing';
 
 /**
  * Domains that cannot carry someone's mail, so an address in one is a machine
@@ -125,7 +194,184 @@ function listNames(names) {
   return `${quoted.slice(0, -1).join(', ')}, and ${quoted[quoted.length - 1]}`;
 }
 
-export function checkCoauthors(commits, prAuthor) {
+
+/**
+ * `Token: value`, which is what a git trailer line is.
+ *
+ * A token is a word of letters, digits and hyphens, so `Signed-off-by:` and
+ * `Co-Authored-By:` both match and `http://example.com` in prose does not start
+ * a trailer. Case is deliberately not constrained here — the key comparison
+ * below is case-insensitive, as git's own trailer parsing is.
+ */
+const TRAILER_LINE = /^([A-Za-z][A-Za-z0-9-]*):[ \t]*(.*)$/;
+
+/**
+ * Local parts that are a machine's mailbox, never a person's.
+ *
+ * A co-author trailer exists to credit a person, and each entry here is a
+ * mailbox that a mail system answers rather than a human. `noreply` and
+ * `no-reply` are what a vendor or a bot puts in the position a co-author's
+ * address occupies, and the domain it is on does not change that: the identity
+ * being credited is the vendor's mail relay either way. `users.noreply.github.com`
+ * is deliberately not matched by this — GitHub's per-login no-reply address
+ * carries the login as its local part, so a real contributor's line is
+ * `stubbi@users.noreply.github.com` and reads as the person it is.
+ */
+const AUTOMATED_MAILBOX = new Set([
+  'noreply',
+  'no-reply',
+  'donotreply',
+  'do-not-reply',
+  'notifications',
+  'automated',
+  'bounces',
+  'mailer-daemon',
+]);
+
+function isAutomatedMailbox(email) {
+  const at = (email ?? '').lastIndexOf('@');
+  if (at < 1) return false;
+  return AUTOMATED_MAILBOX.has(email.slice(0, at).toLowerCase());
+}
+
+/**
+ * Splits a trailer value into its display name and address.
+ *
+ * `Name <address>` is git's own shape, and a value that is a bare address has
+ * no name to render. Returns `{ name, email }` with either part possibly null,
+ * because "no name" and "no address" are both real on this fork's history and
+ * both have to survive to the classifier to be told apart from a violation.
+ */
+function parseTrailerValue(value) {
+  const text = (value ?? '').trim();
+  const angled = /^(.*?)\s*<([^<>]*)>\s*$/.exec(text);
+  if (angled) {
+    return { name: angled[1].trim() || null, email: angled[2].trim() || null };
+  }
+  return text.includes('@') ? { name: null, email: text } : { name: text || null, email: null };
+}
+
+/**
+ * Reads the `Co-Authored-By` trailers out of one commit message.
+ *
+ * Git's own rule, kept whole: a trailer block is the message's last paragraph,
+ * and a line in that paragraph that is not `Token: value` means the paragraph is
+ * prose. Both halves are load-bearing. Scanning every line of the message would
+ * read this repository's own documentation of the rule as a violation of it —
+ * a commit whose last line is "add the `Co-Authored-By:` trailer to every commit"
+ * is a sentence, not a trailer. Requiring the whole final paragraph to be
+ * trailers is what makes the read conservative in the one direction that costs:
+ * a prose paragraph is never read as a trailer, so a message that discusses the
+ * rule cannot manufacture a failure out of it.
+ *
+ * @returns {Array<{name: string|null, email: string|null, raw: string}>}
+ */
+export function readCoauthorTrailers(message) {
+  if (typeof message !== 'string' || message.trim() === '') return [];
+
+  const paragraphs = message.trim().split(/\n[ \t]*\n/);
+  const lines = paragraphs[paragraphs.length - 1]
+    .split(/\r?\n/)
+    .filter(line => line.trim() !== '');
+
+  if (lines.length === 0) return [];
+  if (!lines.every(line => TRAILER_LINE.test(line))) return [];
+
+  const found = [];
+  for (const line of lines) {
+    const match = TRAILER_LINE.exec(line);
+    if (!match || match[1].toLowerCase() !== 'co-authored-by') continue;
+    const { name, email } = parseTrailerValue(match[2]);
+    found.push({ name, email, raw: line.trim() });
+  }
+  return found;
+}
+
+/**
+ * Decides whether a trailer the branch already carries is one this repository
+ * accepts.
+ *
+ * - `compliant` — a person, or the sanctioned line itself. GitHub's per-login
+ *   no-reply address is a person's, so it lands here.
+ * - `instance-local` — the address cannot leave this machine, so it names no one
+ *   outside it. `isLocalOnlyIdentity` already carries the RFC citations for the
+ *   domain list.
+ * - `machine-mailbox` — the address is a mail system, not a person.
+ * - `agent-name` — the sanctioned address carrying a different name. The
+ *   contribution rules ask for the line exactly and ask for no agent name on it,
+ *   so the address being right does not settle the trailer.
+ * - `unaddressed` — a name with no address. Not a violation: a person may write
+ *   their name alone, and this gate cannot tell that from an agent.
+ */
+function classifyTrailer({ name, email }) {
+  if (!email) return { verdict: 'unaddressed', name, email };
+
+  const address = email.trim().toLowerCase();
+  if (address === SANCTIONED_TRAILER_EMAIL) {
+    return {
+      verdict: (name ?? '').trim().toLowerCase() === SANCTIONED_TRAILER_NAME
+        ? 'compliant'
+        : 'agent-name',
+      name,
+      email,
+    };
+  }
+  if (isLocalOnlyIdentity(address)) return { verdict: 'instance-local', name, email };
+  if (isAutomatedMailbox(address)) return { verdict: 'machine-mailbox', name, email };
+  return { verdict: 'compliant', name, email };
+}
+
+/**
+ * Why one rejected shape is a violation, in the words its own fix needs.
+ *
+ * Full clauses, capitalised, because the report joins one or two of them into a
+ * sentence of their own after the list of offending lines — a fragment spliced
+ * into the middle of a report is the kind of thing a reviewer reads past.
+ */
+const REJECTION = {
+  'instance-local':
+    'An address that cannot leave this machine names nobody outside it, and the name beside it is an internal agent\'s',
+  'machine-mailbox':
+    'An automated mailbox is a mail system, not a person, and a third party\'s identity is not a credit this repository grants',
+  'agent-name':
+    'The sanctioned address carrying an agent name puts the internal name the contribution rules ask to leave out',
+};
+
+/** Renders a trailer back to its canonical `Name <address>` form for a report. */
+function renderTrailer({ name, email }) {
+  if (name && email) return `${name} <${email}>`;
+  return name ?? email ?? '(empty)';
+}
+
+/**
+ * @param {Array<object>} [commits]  entries of `/pulls/{n}/commits`
+ * @param {string} prAuthor  the PR author's login
+ * @param {object} [options]
+ * @param {boolean} [options.commitsUnavailable]  the commit fetch failed, so
+ *   this gate read no trailers at all and must not report a clean scan
+ * @returns {{passed: boolean, failures: string[], informational: string[]}}
+ */
+export function checkCoauthors(commits, prAuthor, { commitsUnavailable = false } = {}) {
+  if (commitsUnavailable) {
+    // The gate has a verdict now, so it cannot be the one gate that stays silent
+    // about a fetch it did not get. This is the same trade the internal-reference
+    // gate makes on the same request, and the same cost: a transient 5xx turns
+    // this one result red until the gate is re-run. Reported as a failure rather
+    // than a pass because "no trailer on this branch" is a claim this run did not
+    // earn, and a defective trailer passing quietly is the defect this half of
+    // the gate exists to catch.
+    return {
+      passed: false,
+      failures: [
+        'The commit list could not be read, so no `Co-Authored-By` trailer on this branch was checked and this ' +
+        'result is not a clean scan. The `/pulls/{n}/commits` fetch is allowed to fail so a transient 5xx cannot ' +
+        'take down the gates that do block; the cost is that this gate then has nothing to read. Re-run the gate ' +
+        'once the API is reachable. Do not read `passed: true` here as "every trailer on this branch is accepted".',
+      ],
+      informational: [],
+    };
+  }
+
   const author = (prAuthor ?? '').toLowerCase();
   const contributors = new Map();
   // Emails already accounted for, mapped to the display name credited for them.
@@ -155,11 +401,21 @@ export function checkCoauthors(commits, prAuthor) {
   // put a verified address for the same person two lines up.
   const unverified = [];
   const unverifiedIds = new Set();
+  // Rejected trailers the branch already carries, keyed on the rendered line,
+  // each with the commit count behind it. A count rather than a bare list,
+  // because one bad line re-authored across a branch is the common case and the
+  // author needs to know whether they are looking at one commit or five.
+  const rejected = new Map();
 
   for (const entry of commits ?? []) {
     const login = entry?.author?.login ?? null;
     const gitName = entry?.commit?.author?.name ?? null;
     const gitEmail = entry?.commit?.author?.email ?? null;
+    // The committer is whoever applied the commit, which on a rebase or a
+    // cherry-pick is not the author. It is read for the machine-identity
+    // decision below and for nothing else: crediting the committer would credit
+    // whoever ran the rebase.
+    const committerEmail = entry?.commit?.committer?.email ?? null;
 
     // The PR author's own commits need no trailer — the squash is already
     // theirs. Compared case-insensitively because GitHub logins are.
@@ -257,24 +513,86 @@ export function checkCoauthors(commits, prAuthor) {
       }
     }
 
+    // A machine identity, and the one thing this file normalises. No GitHub
+    // account resolved the commit, so both the name and the address are whatever
+    // the local tree carried; when the address is one nothing outside this
+    // machine can route, there is no person to credit and the line that can land
+    // is the sanctioned one.
+    //
+    // The committer is corroboration here, not a second trigger. A rebase
+    // rewrites it, so on this fork it is an instance-local address on almost
+    // every rebased commit, and letting it trigger on its own would erase the
+    // credit of a real author whose branch happened to be rebased — the exact
+    // attribution loss this file exists to prevent. It is read only when the
+    // author side names no address at all, where it is the only one the commit
+    // carries.
+    const machineIdentity = !login && (
+      isLocalOnlyIdentity(gitEmail) ||
+      (gitEmail == null && isLocalOnlyIdentity(committerEmail))
+    );
+
     contributors.set(key, {
-      trailer: `Co-Authored-By: ${displayName} <${email}>`,
+      trailer: machineIdentity ? SANCTIONED_TRAILER : `Co-Authored-By: ${displayName} <${email}>`,
       name: displayName,
+      machine: machineIdentity,
     });
+  }
+
+  // The second question, and a second pass on purpose. The loop above skips the
+  // PR author's own commits and bots on the way to deciding who a squash would
+  // drop; a rejected trailer is a different question and has no such exclusion.
+  // The most common instance is the PR author's own commit carrying someone
+  // else's machine identity, which that loop never sees.
+  for (const entry of commits ?? []) {
+    for (const trailer of readCoauthorTrailers(entry?.commit?.message)) {
+      const { verdict } = classifyTrailer(trailer);
+      if (verdict === 'compliant' || verdict === 'unaddressed') continue;
+      const key = renderTrailer(trailer);
+      const prior = rejected.get(key);
+      if (prior) {
+        prior.commits += 1;
+        continue;
+      }
+      // The key is the identity, so two spellings of one bad credit collapse into
+      // one finding; the line reported is the commit's own, because that is the
+      // text the author has to find and rewrite.
+      rejected.set(key, {
+        verdict,
+        reason: REJECTION[verdict],
+        commits: 1,
+        line: trailer.raw || `Co-Authored-By: ${key}`,
+      });
+    }
   }
 
   const informational = [];
 
   if (contributors.size > 0) {
-    const trailers = [...contributors.values()].map(c => c.trailer).sort();
-    const names = [...new Set([...contributors.values()].map(c => c.name))].sort();
+    const entries = [...contributors.values()];
+    // De-duplicated after the map, not before: a machine identity and a real
+    // contributor both normalise onto the same sanctioned line, and the squash
+    // body takes that line once. Two commits that collapse to one line are the
+    // correct output, not a lost second credit — there is no second person.
+    const trailers = [...new Set(entries.map(c => c.trailer))].sort();
+    const names = [...new Set(entries.map(c => c.name))].sort();
     const who = names.length === 1 ? names[0] : `${names.length} other contributors`;
+    const machineCount = entries.filter(c => c.machine).length;
+    // Named here, named by name only — the address is already in the commit and
+    // the unverified note below reports it, so nothing is withheld, and the
+    // sentence stays true: the branch does carry commits by these names.
+    const normalised = machineCount > 0
+      ? `\n\n${machineCount} of the ${entries.length} ` +
+        `${entries.length === 1 ? 'identity is' : 'identities are'} an address that exists only on this ` +
+        'machine, so it is credited as Paperclip rather than by name. That line is the one this ' +
+        "repository's contribution rules accept, and a line naming an internal agent does not survive review."
+      : '';
 
     informational.push(
       `This branch carries commits by ${who}. Squash-merging drops that authorship unless ` +
       'the squash message carries their trailers, and nothing else will notice if it does not. ' +
       'Add to the squash body when merging:\n\n' +
-      trailers.map(line => `      ${line}`).join('\n')
+      trailers.map(line => `      ${line}`).join('\n') +
+      normalised
     );
   }
 
@@ -315,14 +633,40 @@ export function checkCoauthors(commits, prAuthor) {
     );
   }
 
-  if (informational.length === 0) return { passed: true, informational: [] };
+  const failures = [];
+  if (rejected.size > 0) {
+    // One failure, not one per line: the gate's comment renders each failure as
+    // its own checklist item, and an author with five bad trailers has one thing
+    // to do. Capped at five lines because a branch that generated more than that
+    // has a systematic problem the count states on its own.
+    const shown = [...rejected.entries()].slice(0, 5);
+    const listed = shown.map(([, { line, commits }]) =>
+      `\`${line}\`${commits > 1 ? ` (on ${commits} commits)` : ''}`
+    );
+    // The reason is stated once, above the list, because it is the same class of
+    // mistake in every case and repeating it per line buries the fix.
+    const reasons = [...new Set(shown.map(([, { reason }]) => reason))];
 
-  return { passed: true, informational };
+    failures.push(
+      `A \`Co-Authored-By\` trailer on this branch credits an identity that is not a person: ` +
+      `${listed.join('; ')}${rejected.size > shown.length ? `; and ${rejected.size - shown.length} more` : ''}. ` +
+      `${reasons.length === 1 ? reasons[0] : reasons.join('. ')}. ` +
+      `This repository's contribution rules accept exactly one form for a commit an agent wrote: ` +
+      `\`${SANCTIONED_TRAILER}\`. ` +
+      'Rewrite the trailer on the commits that carry it and force-push, or drop the trailer and paste the ' +
+      'sanctioned line into the squash body when merging. A trailer naming a real contributor is not ' +
+      'affected — this only fires on an address that resolves to this machine or to a mail robot.'
+    );
+  }
+
+  return { passed: failures.length === 0, failures, informational };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const commits = JSON.parse(process.env.PR_COMMITS ?? '[]');
-  const result = checkCoauthors(commits, process.env.PR_AUTHOR ?? '');
+  const result = checkCoauthors(commits, process.env.PR_AUTHOR ?? '', {
+    commitsUnavailable: process.env.PR_COMMITS_UNAVAILABLE === 'true',
+  });
   console.log(JSON.stringify(result));
-  process.exit(0);
+  process.exit(result.passed ? 0 : 1);
 }
