@@ -13,6 +13,7 @@ import {
   findInstanceHosts,
   findUnknownInternalRefs,
   isGateComment,
+  maskInlineCodeSpans,
   patchIsComplete,
   resolvePrefixes,
   resolveProductOwnedPrefixes,
@@ -739,6 +740,140 @@ test('the branch surface takes the bare shape, because a branch name is the refe
   // The product's own namespace stays exempt on this surface too.
   const product = checkInternalRefs({ ...CLEAN, prBranch: 'fix/PAP-1-child-mention' });
   assert.equal(product.passed, true, JSON.stringify(product.failures, null, 2));
+});
+
+test('a commit body quotes an identifier shape in a code span, and that is not a reference', () => {
+  // The measurement this came from: the open tier's path rule fired on six
+  // commit bodies across the 4678 commits on master, and two of the six were
+  // commits whose subject matter IS the shape, written as a code span. A body
+  // is the one authored surface where quoting a token is the whole point, and
+  // a 3-of-6 false-positive rate on a tier is the rate at which a gate gets
+  // switched off. Both of the two are named here as they appear in history.
+  for (const body of [
+    // bc0a076e — the commit is the rule about the token.
+    'That renderer auto-links any `IDENT-123`-shaped token to an internal\n`/issues/IDENT-123` link',
+    // d6bee62f — the commit is the bug report about the route.
+    '`/api/issues/PC1897-1` skipped identifier lookup and fell through as a',
+  ]) {
+    const result = checkInternalRefs({ ...CLEAN, commits: [{ commit: { message: `fix: x\n\n${body}` } }] });
+    assert.equal(result.passed, true, `expected a quoted shape to pass: ${JSON.stringify(result.failures)}`);
+  }
+});
+
+test('NEGATIVE CONTROL: masking a quoted shape does not become a general escape hatch', () => {
+  // Each of these is a path or an id a reader could act on, so each has to keep
+  // failing. The exemption is one rule on one surface, and a change that reads
+  // as "code spans are exempt" instead of "a quoted *path shape* is not a
+  // reference" is the change that would have quietly opened this gate.
+  const mustFail = [
+    // The configured half is not masked at all: this instance's own id is a
+    // finding in a code span, in a path, in a link, in any spelling.
+    ['the instance id in a code span', 'the value is `PET-9003`'],
+    ['the instance id in a path', 'POST /api/issues/PET-9003/checkout returned 409'],
+    // A fenced block is a runnable artifact, so a path inside one is pasteable
+    // and stays a finding. Backtick and tilde fences alike.
+    ['a curl in a backtick fence', 'fix: x\n\n```\nPOST /api/issues/TASK-482/checkout\n```'],
+    ['a curl in a tilde fence', 'fix: x\n\n~~~\nPOST /api/issues/TASK-482/checkout\n~~~'],
+    // The other two open-tier rules read the unmasked text, so a verb or a `#`
+    // inside a code span is still a reference.
+    ['a verb inside a code span', 'the body says `Closes TASK-482` verbatim'],
+    ['a hash inside a code span', 'the body says `#TASK-482` verbatim'],
+    // An unterminated backtick is not a span, so nothing is masked and the path
+    // is read. Treating it as a span would make "forgot the closing backtick"
+    // a way to hide a reference.
+    ['an unterminated backtick', '`/api/issues/TASK-482 and the quote never closes'],
+    // Only the span's *interior* is masked. An id between two spans is outside
+    // both, and a masker that ran to the end of the line would lose it.
+    ['an id between two spans', '`a` then /api/issues/TASK-482 then `b`'],
+    // A link destination is a path the commit points at, not one it quotes.
+    ['a link destination', 'see [TASK-482](/issues/TASK-482)'],
+  ];
+  for (const [label, body] of mustFail) {
+    const result = checkInternalRefs({ ...CLEAN, commits: [{ commit: { message: `fix: x\n\n${body}` } }] });
+    assert.equal(result.passed, false, `expected ${label} to fail`);
+  }
+});
+
+test('the three real leaks the quoted-shape rule was measured against all still fail', () => {
+  // A narrowing that drops false positives by dropping coverage is not a fix.
+  // These are the three bodies that the same replay showed to be genuine, and
+  // each is named with the rule that carries it: a Markdown link destination,
+  // and two verb positions that the masking never touched.
+  const mustFail = [
+    ['5320a440', 'Paperclip work item: [ZOL-5477](/ZOL/issues/ZOL-5477).'],
+    ['bb6e7215', 'Closes RUS-56'],
+    ['f6f5fee2', 'Fixes: LAS-101'],
+  ];
+  for (const [sha, body] of mustFail) {
+    const result = checkInternalRefs({ ...CLEAN, commits: [{ sha, commit: { message: `fix: x\n\n${body}` } }] });
+    assert.equal(result.passed, false, `expected ${sha} to still fail: ${JSON.stringify(result.failures)}`);
+    assert.match(result.failures.join('\n'), /ZOL-5477|RUS-56|LAS-101/);
+  }
+});
+
+test('the fourth body, kept deliberately, and the cost of keeping it', () => {
+  // af0e05f3 names the path in running prose with no code span around it, and
+  // it still fails. That is the intended boundary rather than an oversight: a
+  // bare path in prose is a path a reader could paste, and the remedy for it is
+  // to genericise the id (`/JAR/issues/<id>`), which is the same fix the gate
+  // asks for everywhere else. One commit in 4678 is a different proposition
+  // from the three in six that the masking removes.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ commit: { message: 'fix: x\n\nAfter onboarding the wizard navigated to the newly created issue\n(e.g. /JAR/issues/JAR-1). useCompanyPageMemory then saved this path,' } }],
+  });
+  assert.equal(result.passed, false);
+  assert.match(result.failures.join('\n'), /JAR-1/);
+});
+
+test('only the commit body masks: every other authored surface still reads a quoted path', () => {
+  // A pull request title, description and comment are not documents whose topic
+  // is a URL shape, so the exemption stops at the one surface it was measured
+  // on. A body-only rule that leaked onto the other three would have cost
+  // coverage on 736 files' worth of ordinary prose for no measured reason.
+  const quoted = 'the renderer emits a `/issues/TASK-482` link';
+  const bodies = [
+    ['title', { prTitle: quoted }],
+    ['description', { prBody: quoted }],
+    ['comment', { comments: [{ body: quoted, kind: 'issue', user: { login: 'someone' } }] }],
+  ];
+  for (const [surface, override] of bodies) {
+    const result = checkInternalRefs({ ...CLEAN, ...override });
+    assert.equal(result.passed, false, `expected the ${surface} surface to still fail`);
+    assert.match(result.failures.join('\n'), /TASK-482/);
+  }
+});
+
+test('maskInlineCodeSpans preserves length and line breaks, and leaves fences alone', () => {
+  // The masker is a filter over the same string, not a rewrite: a length or
+  // offset change would move every capture the other two rules make on the same
+  // text, which is a much harder failure to see than a wrong finding.
+  const cases = [
+    'plain `code` text',
+    '`a` and `b`',
+    '``double `inner` double``',
+    'unterminated `code',
+    '```\nfenced `code`\n```',
+    '~~~\nfenced `code`\n~~~',
+    'no backticks at all',
+    '',
+  ];
+  for (const input of cases) {
+    const masked = maskInlineCodeSpans(input);
+    assert.equal(masked.length, input.length, `length changed for ${JSON.stringify(input)}`);
+    assert.equal(
+      (masked.match(/\n/g) || []).length,
+      (input.match(/\n/g) || []).length,
+      `line count changed for ${JSON.stringify(input)}`,
+    );
+  }
+
+  // The fence interior survives verbatim, including its backticks.
+  const fenced = maskInlineCodeSpans('```\nPOST /api/issues/TASK-482/x\n```');
+  assert.match(fenced, /TASK-482/);
+  // ...and an inline span's interior does not.
+  assert.doesNotMatch(maskInlineCodeSpans('a `/issues/TASK-482` b'), /TASK-482/);
+  assert.equal(maskInlineCodeSpans('a `/issues/TASK-482` b').length, 'a `/issues/TASK-482` b'.length);
 });
 
 test('FAIL CLOSED: an unusable product-owned exemption list is a failure, not a pass', () => {
