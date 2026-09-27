@@ -9656,6 +9656,20 @@ export function heartbeatService(
       const result = await scheduleBoundedRetryForRun(run, agent);
       return result.outcome === "scheduled" ? result.run : null;
     },
+    // The stale-lock backstop terminalizes runs whose process and sandbox are
+    // gone. It has no teardown step of its own, so an `active` lease on such a
+    // run survives as a stranded row and holds the issue in
+    // `getConversationOwnershipBlocker`. Release it with the same helper the
+    // process-loss reaper uses for the same evidence.
+    releaseOrphanedRunLeases: async (run) => {
+      await releaseEnvironmentLeasesForRun({
+        runId: run.runId,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.failureReason ?? undefined,
+      });
+    },
   });
   const runDispatch = createRunDispatch(db);
 

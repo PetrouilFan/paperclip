@@ -535,6 +535,128 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     );
   });
 
+  it("releases the environment leases of a run it terminalized on process death", async () => {
+    // The backstop proved the process and its sandbox are gone, so an `active`
+    // lease on that run is a stranded row rather than in-flight cleanup.
+    // getConversationOwnershipBlocker holds the issue on such a lease until
+    // something releases it, so the release belongs here rather than waiting
+    // for the periodic stranded-lease sweep.
+    const { companyId, agentId, runningRunId } = await seed();
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: 2_000_000_000 })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Orphaned run leaves a stranded lease",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+
+    const releaseOrphanedRunLeases = vi.fn(async () => {});
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      releaseOrphanedRunLeases,
+    }).sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(releaseOrphanedRunLeases).toHaveBeenCalledTimes(1);
+    expect(releaseOrphanedRunLeases).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: runningRunId,
+        companyId,
+        agentId,
+        status: "interrupted",
+      }),
+    );
+  });
+
+  it("keeps the lease of a run terminalized on issue-terminal authority", async () => {
+    // Issue-terminal authority fires while the process is still alive: reuse
+    // stops the sandbox but keeps the server process running. The provider may
+    // still own that sandbox, so its lease must survive the terminal write.
+    const { companyId, agentId, runningRunId } = await seed();
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: process.pid })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Issue done while the provider process is alive",
+      status: "done",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+
+    const releaseOrphanedRunLeases = vi.fn(async () => {});
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      releaseOrphanedRunLeases,
+    }).sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(releaseOrphanedRunLeases).not.toHaveBeenCalled();
+  });
+
+  it("still clears the lock when the lease release fails after the terminal write", async () => {
+    // The run is already terminal once the release is attempted, so a failed
+    // release must not abort the sweep or leave the stale lock in place. The
+    // stranded-lease sweep remains the fallback for the row.
+    const { companyId, agentId, runningRunId } = await seed();
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: 2_000_000_000 })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Lease release rejects after the run is terminal",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      releaseOrphanedRunLeases: async () => {
+        throw new Error("provider teardown unavailable");
+      },
+    }).sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("interrupted");
+
+    const lock = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock).toEqual({ checkoutRunId: null, executionRunId: null });
+  });
+
   it("terminalizes a running run to cancelled when its issue is cancelled (reuse-lease path)", async () => {
     const { companyId, agentId, runningRunId } = await seed();
     await db
