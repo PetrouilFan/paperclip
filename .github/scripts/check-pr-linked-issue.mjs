@@ -185,6 +185,46 @@ function stripHtmlComments(body) {
   return body.replace(/<!--[\s\S]*?-->/g, '');
 }
 
+// Remove a leading blockquote marker. A `>` is markup, not content, so the
+// label matchers must never see it.
+//
+// Every label regex here anchors at `^\s*` and then requires `#` or `**`. A
+// blockquoted label line therefore matched nothing: `LABEL_LINE` never fired,
+// none of the `KNOWN_LABEL_PATTERNS` fired, and `scoreInlineDescription`
+// scored a complete bug report 0. Quoting is the normal way to nest a template
+// under a section heading — the PR template's own Thinking Path section is
+// written that way — so the gate rejected correct prose and the author had to
+// un-quote a valid body to get a green check.
+//
+// Applied once to every line as the line array is built, not inside the regexes:
+// `isFieldFilled` walks `lines[j]` by index, so a per-matcher rewrite would let
+// the label pass and the content pass disagree about what a line is. One
+// rewrite up front keeps the indices aligned and gives `LABEL_LINE`,
+// `KNOWN_LABEL_PATTERNS`, and `lineHasContent` the same text. Nested quotes
+// (`>> label`) are a quote too, so all levels are stripped.
+//
+// Idempotent: unquoting an already-unquoted line changes nothing, and a bare
+// `>` becomes an empty line, which `lineHasContent` still reads as no content.
+//
+// The same blindness cost the linked-issue route a body too. `> Fixes #123`
+// matched by luck, because the fix/close/ref pattern is unanchored, but
+// `>https://github.com/.../issues/202` — a bare autolink quote, which Markdown
+// allows — did not, because that pattern's leading alternation accepts only
+// `^` or a space/paren and the `>` was neither. Dropping the marker fixes both
+// routes at once and cannot manufacture a reference that was not in the body.
+function stripBlockquoteMarker(line) {
+  return line.replace(/^\s*(?:>\s?)+/, '');
+}
+
+// The line array every matcher in this module reads: author content only, with
+// HTML comments removed and blockquote markers stripped. Built once so the
+// label matchers, the known-label list, and the content check cannot disagree
+// about what a line is, and so the indices `isFieldFilled` walks stay aligned
+// with the array.
+function scanLines(body) {
+  return stripHtmlComments(body).split(/\r?\n/).map(stripBlockquoteMarker);
+}
+
 /**
  * Score a PR body against every issue template.
  *
@@ -204,7 +244,7 @@ function stripHtmlComments(body) {
 export function scoreInlineDescription(body) {
   if (!body || !body.trim()) return { best: 0, union: 0, byTemplate: {} };
 
-  const lines = stripHtmlComments(body).split(/\r?\n/);
+  const lines = scanLines(body);
   const byTemplate = {};
   const filledLabels = new Set();
   let best = 0;
@@ -304,7 +344,7 @@ export function checkLinkedIssue(body, prTitle = '', options = {}) {
     return { passed: false, failures: ['PR body is empty — please fill out the PR template'] };
   }
 
-  const linked = ISSUE_PATTERNS.some(p => p.test(stripHtmlComments(body)));
+  const linked = ISSUE_PATTERNS.some(p => p.test(scanLines(body).join('\n')));
   const inlined = hasInlineIssueDescription(body);
   const passed = linked || inlined;
 

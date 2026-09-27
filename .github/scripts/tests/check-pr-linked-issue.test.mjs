@@ -658,3 +658,185 @@ test('a skip prefix short-circuits before the message is built', () => {
   assert.deepEqual(failures, []);
 });
 
+// --- A blockquote is markup, not content ------------------------------------
+//
+// Every label regex in the gate anchors at `^\s*` and then requires `#` or
+// `**`. A blockquoted label line matched none of them, so `isFieldBoundary`
+// never fired, no field was found, and `scoreInlineDescription` returned 0 for a
+// complete bug report. Quoting is the normal way to nest a template under a
+// section heading — the PR template's own Thinking Path section is written that
+// way — so the gate rejected correct prose, and the author had to un-quote a
+// valid body to get a green check. Observed live on a PR that carried Type /
+// Severity / Description / Steps to reproduce / Expected behavior in a quote:
+// "0 distinct filled, 3 required".
+
+// The exact shape the template asks for: the required section, then a complete
+// four-field bug template nested under it in a blockquote.
+const BLOCKQUOTED_BUG_BODY = `
+## Linked Issues or Issue Description
+
+> **What happened**
+> - The linked-issue check read a complete, blockquoted bug report as zero
+>   filled fields and blocked the pull request.
+>
+> **Expected behavior**
+> - A description written in a blockquote scores the same as the same text
+>   written unquoted.
+>
+> **Steps to reproduce**
+> - Write a bug report with all four template fields.
+> - Put every line of it in a blockquote.
+> - Run the linked-issue check on the body.
+>
+> **Deployment mode**
+> - Local single-user instance.
+`;
+
+test('passes a complete bug report written inside a blockquote', () => {
+  const result = checkLinkedIssue(BLOCKQUOTED_BUG_BODY, 'fix(ci): the linked-issue gate is blind to quotes');
+  assert.equal(result.passed, true, result.failures.join('\n'));
+});
+
+test('a blockquoted bug report fills all four required bug fields', () => {
+  // The non-vacuity assertion: the threshold must be cleared by the fields the
+  // scan really reads, not by some side effect of removing the `>`.
+  const score = scoreInlineDescription(BLOCKQUOTED_BUG_BODY);
+  assert.equal(score.byTemplate.bug, 4);
+  assert.equal(score.union, 4);
+  assert.ok(Math.max(score.best, score.union) >= 3);
+});
+
+test('quoting the body does not change the score', () => {
+  // The strongest statement of the contract: a `>` is markup, so quoting must
+  // be score-neutral. The unquoted form of the same report is the reference.
+  const unquoted = BLOCKQUOTED_BUG_BODY.replace(/^>[ \t]?/gm, '');
+  assert.notEqual(unquoted, BLOCKQUOTED_BUG_BODY, 'fixture must actually be quoted');
+  assert.deepEqual(scoreInlineDescription(BLOCKQUOTED_BUG_BODY), scoreInlineDescription(unquoted));
+  assert.equal(
+    hasInlineIssueDescription(BLOCKQUOTED_BUG_BODY),
+    hasInlineIssueDescription(unquoted)
+  );
+});
+
+test('a blockquoted label is still a field boundary, so a placeholder field stays empty', () => {
+  // "What happened" holds only the bare "-" placeholder, and the next quoted
+  // label must end its content scan. If the quoted labels were invisible as
+  // boundaries, "Steps to reproduce" would be read as the content of "What
+  // happened" and the unfilled field would count as filled — the score would be
+  // 4, not 3, and the gate would be weakened rather than repaired.
+  const body = `
+> **What happened**
+> -
+>
+> **Steps to reproduce:**
+> - Open a PR with a blockquoted description.
+>
+> **Expected behavior**
+> - The check reads the quoted fields.
+>
+> **Deployment mode**
+> - Local instance.
+`;
+  const score = scoreInlineDescription(body);
+  assert.equal(score.byTemplate.bug, 3);
+  assert.equal(checkLinkedIssue(body, 'feat: quoted skeleton').passed, true);
+});
+
+test('an empty blockquoted skeleton still fails', () => {
+  // Unquoting must not turn a placeholder into content.
+  const body = `
+> **What happened**
+> -
+>
+> **Expected behavior:**
+> -
+>
+> **Steps to reproduce:**
+> -
+`;
+  assert.equal(scoreInlineDescription(body).union, 0);
+  assert.equal(checkLinkedIssue(body, 'feat: quoted skeleton').passed, false);
+});
+
+test('a blockquoted prose-only body still fails', () => {
+  // No labels in any position, so there is nothing for the unquote to expose.
+  const body = `
+> This pull request strips the blockquote marker before the description scan
+> runs, so a quoted template is read the same as an unquoted one. The old scan
+> anchored every label regex at the start of the line and matched nothing.
+`;
+  assert.equal(checkLinkedIssue(body, 'feat: quoted prose').passed, false);
+});
+
+test('a stacked blockquoted skeleton of plain labels reads as empty', () => {
+  // Plain labels are boundaries only because KNOWN_LABEL_PATTERNS knows them.
+  // The unquote has to reach that list too, or the next label is read as the
+  // content of the one above it.
+  const body = `
+> What happened?:
+> Expected behavior:
+> Steps to reproduce:
+> Paperclip version:
+`;
+  assert.equal(scoreInlineDescription(body).union, 0);
+  assert.equal(checkLinkedIssue(body, 'feat: quoted skeleton').passed, false);
+});
+
+test('a nested blockquote is a quote too', () => {
+  const nested = BLOCKQUOTED_BUG_BODY.replace(/^>[ \t]?/gm, '>> ');
+  assert.equal(scoreInlineDescription(nested).byTemplate.bug, 4);
+});
+
+test('an indented blockquote is a quote too', () => {
+  // Markdown allows up to three leading spaces before the `>`, and a tab counts
+  // as whitespace. A quoted label inside an indented block must also match.
+  for (const indent of ['  > ', '\t> ', '   > ']) {
+    const indented = BLOCKQUOTED_BUG_BODY.replace(/^>[ \t]?/gm, indent);
+    assert.equal(
+      scoreInlineDescription(indented).byTemplate.bug,
+      4,
+      `indent ${JSON.stringify(indent)} did not unquote`
+    );
+  }
+});
+
+test('a quoted issue link satisfies the linked route', () => {
+  // The same blindness cost the linked route a body: the fix/close/ref pattern
+  // is unanchored so it matched by luck, but a bare `>https://…` autolink quote
+  // did not, because that pattern's leading alternation accepts only `^` or a
+  // space/paren.
+  assert.equal(checkLinkedIssue('> Fixes #123', 'feat: x').passed, true);
+  assert.equal(
+    checkLinkedIssue('>https://github.com/paperclipai/paperclip/issues/202', 'feat: x').passed,
+    true
+  );
+  assert.equal(
+    checkLinkedIssue('> See https://github.com/paperclipai/paperclip/issues/202', 'feat: x').passed,
+    true
+  );
+});
+
+test('an issue link quoted out of a comment or a quote is still a real link', () => {
+  // The gate reads what the body says, not why it says it. A quoted issue link
+  // is still a link to the same number, so the verdict must not depend on the
+  // surrounding `>`.
+  assert.equal(
+    checkLinkedIssue('Earlier I wrote:\n\n> Fixes #123\n\nThis is the same reference.', 'feat: x').passed,
+    true
+  );
+});
+
+test('the unquote does not change the verdict of a body with no quote at all', () => {
+  // Guard the shared scan helper: the linked route now runs on the same array,
+  // so a body that never contained a `>` must reach the same verdicts it always
+  // did — including the cross-repo and embedded-host rejections.
+  assert.equal(checkLinkedIssue('Fixes #123', 'feat: x').passed, true);
+  assert.equal(checkLinkedIssue('See https://github.com/other/repo/issues/123', 'feat: x').passed, false);
+  assert.equal(
+    checkLinkedIssue('See https://evil.example/https://github.com/paperclipai/paperclip/issues/1', 'feat: x')
+      .passed,
+    false
+  );
+  assert.equal(checkLinkedIssue('This is version#123 not an issue link', 'feat: x').passed, false);
+});
+
