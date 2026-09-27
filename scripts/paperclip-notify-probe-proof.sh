@@ -18,6 +18,12 @@
 #   C. The control plane's own StatusText is byte-identical before and after.
 #   D. A lifecycle key is refused even from the allowed position, so wrapping the
 #      probe buys a throwaway unit and not a licence to stop anything.
+#   E. A lifecycle key batched onto the end of an allowed one -- one argument, one
+#      newline, the exact form `printf '%s\n' "$@"` turns into a two-message
+#      datagram -- is refused too, and the throwaway unit is still running
+#      afterwards. This is the leg that proves the refusal against the manager: at the
+#      head before the newline refusal this same send returned 0 and the unit went to
+#      `deactivating (stop-sigterm)`, so a parser-only test cannot stand in for it.
 #
 # Nothing here touches the control plane. The only datagrams written in this script
 # are STATUS= to a throwaway unit, and the whole of part A writes none at all.
@@ -99,10 +105,13 @@ systemd-run --user --no-block --unit="$UNIT" --property=Type=exec --property=Not
                 '$PROBE' guard '$SOCK' >'$OUT/inner-guard.txt' 2>&1; echo \$? >'$OUT/inner-guard.rc';
                 '$PROBE' notify '$SOCK' 'STATUS=pc-probe-proof-ok' >'$OUT/inner-notify.txt' 2>&1; echo \$? >'$OUT/inner-notify.rc';
                 '$PROBE' notify '$SOCK' 'STOPPING=1' >'$OUT/inner-stopping.txt' 2>&1; echo \$? >'$OUT/inner-stopping.rc';
+                '$PROBE' notify '$SOCK' \$'STATUS=ok\nSTOPPING=1' >'$OUT/inner-batched.txt' 2>&1; echo \$? >'$OUT/inner-batched.rc';
                 sleep 12" >/dev/null 2>&1
 
+# The last send is the batched one, so waiting on its rc means every send in the unit
+# has already been attempted.
 for _ in $(seq 1 60); do
-  [ -f "$OUT/inner-stopping.rc" ] && break
+  [ -f "$OUT/inner-batched.rc" ] && break
   sleep 0.25
 done
 
@@ -140,6 +149,24 @@ if [ "$(cat "$OUT/inner-stopping.rc" 2>/dev/null)" = "1" ] && grep -q 'STOPPING'
 else
   bad "STOPPING= was not refused from inside the throwaway unit"
   sed 's/^/        /' "$OUT/inner-stopping.txt" 2>/dev/null
+fi
+
+if [ "$(cat "$OUT/inner-batched.rc" 2>/dev/null)" = "1" ] && grep -q 'single-line KEY=VALUE' "$OUT/inner-batched.txt"; then
+  ok "E. a lifecycle key batched after an allowed one is refused"
+else
+  bad "a batched lifecycle key was not refused from inside the throwaway unit"
+  sed 's/^/        /' "$OUT/inner-batched.txt" 2>/dev/null
+fi
+
+# The half of E that a parser-only assertion cannot make. A refused datagram writes
+# nothing, so if either refusal above had let a STOPPING through, this unit would have
+# been told to stop by now -- it is still in the `sleep` at the bottom of its command.
+sleep 1
+UNIT_STATE="$(systemctl --user is-active "$UNIT.service")"
+if [ "$UNIT_STATE" = "active" ]; then
+  ok "E. the throwaway unit is still active, so no batched STOPPING= reached the manager"
+else
+  bad "the throwaway unit is '$UNIT_STATE'; a batched STOPPING= reached the manager"
 fi
 
 # --- C. the control plane is untouched ----------------------------------------

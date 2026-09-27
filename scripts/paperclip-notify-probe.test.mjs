@@ -43,6 +43,19 @@ const codeOnly = () =>
     .map((line) => line.split("#")[0].replace(/"[^"]*"/g, '""'))
     .join("\n");
 
+// The keys guard_message refuses: they change the state of whichever unit sent the
+// datagram, which is the one thing this script's cgroup check exists to prevent.
+// Named once so the two tests that enumerate them cannot drift apart and leave a key
+// proved in one half only.
+const REFUSED_LIFECYCLE_KEYS = [
+  "STOPPING",
+  "RELOADING",
+  "READY",
+  "WATCHDOG",
+  "WATCHDOG_USEC",
+  "EXTEND_TIMEOUT_USEC",
+];
+
 test("script is executable and parses", () => {
   accessSync(scriptPath, constants.X_OK);
   execFileSync("bash", ["-n", scriptPath]);
@@ -374,7 +387,7 @@ test("the target checks are reachable once the cgroup check has passed", () => {
 test("guard_message refuses the state-changing keys and passes the informational ones", () => {
   const probe = loadProbe();
   try {
-    for (const key of ["STOPPING", "RELOADING", "READY", "WATCHDOG", "WATCHDOG_USEC", "EXTEND_TIMEOUT_USEC"]) {
+    for (const key of REFUSED_LIFECYCLE_KEYS) {
       const r = probe.call("guard_message", [`${key}=1`]);
       assert.equal(r.status, 1, `${key}=1 must be refused`);
       assert.match(r.stdout, new RegExp(`${key}= changes the state`));
@@ -387,12 +400,48 @@ test("guard_message refuses the state-changing keys and passes the informational
     const typo = probe.call("guard_message", ["STATUS"]);
     assert.equal(typo.status, 1);
     assert.match(typo.stdout, /not KEY=VALUE/);
+  } finally {
+    probe.cleanup();
+  }
+});
 
-    // A single quoted shell arg can still contain a newline. That must not let a
-    // second, state-changing field piggyback in the same argv entry.
-    const injected = probe.call("guard_message", ["STATUS=ok\nSTOPPING=1"]);
-    assert.equal(injected.status, 1);
-    assert.match(injected.stdout, /single-line KEY=VALUE/);
+test("a refused key batched into one argument is not an override", () => {
+  // The protocol is newline separated, and `notify` builds the payload with
+  // `printf '%s\n' "$@"`, one argument per line. So a single quoted argument that
+  // contains a newline is not a long value -- it is two messages, and only the
+  // first one is ever parsed. Before this was refused, `STOPPING=1` FIRST was caught
+  // and `STOPPING=1` SECOND was delivered: the guard read the key before the `=`
+  // and validated the argument as a whole, so the second key was never inspected.
+  // Measured end to end against a real user manager at the head before the fix: the
+  // guard returned 0 and the sending unit went to `deactivating (stop-sigterm)`. The proof
+  // that the refusal holds against a manager and not only against this parser is
+  // scripts/paperclip-notify-probe-proof.sh part E.
+  const probe = loadProbe();
+  try {
+    for (const key of REFUSED_LIFECYCLE_KEYS) {
+      // The refused key trailing an allowed one is the bypass: the allowed key is
+      // what `${msg%%=*}` returns, so the refused key is never named.
+      for (const arg of [`STATUS=ok\n${key}=1`, `${key}=1\nSTATUS=ok`, `STATUS=ok\r${key}=1`]) {
+        const r = probe.call("guard_message", [arg]);
+        assert.equal(r.status, 1, `${JSON.stringify(arg)} must be refused`);
+        assert.match(r.stdout, /single-line KEY=VALUE/);
+      }
+      // Two arguments is the documented form, and the batching has to be caught
+      // inside one of them or not at all: this is the case the payload builder
+      // would fold into a single datagram.
+      const batched = probe.call("guard_message", ["STATUS=ok", `${key}=1`]);
+      assert.equal(batched.status, 1, `${key}=1 as its own argument must be refused`);
+      assert.match(batched.stdout, new RegExp(`${key}= changes the state`));
+    }
+    // A second informational key is refused too, for the same reason: the newline is
+    // the smuggling vector whatever the payload behind it is.
+    const twoInformational = probe.call("guard_message", ["STATUS=a\nSTATUS=b"]);
+    assert.equal(twoInformational.status, 1);
+    assert.match(twoInformational.stdout, /single-line KEY=VALUE/);
+    // And the documented form still passes, so the refusal is not just "refuse
+    // everything": one KEY=VALUE per argument, any number of arguments.
+    const ok = probe.call("guard_message", ["STATUS=ok", "ERRNO=2", "STATUS=again"]);
+    assert.equal(ok.status, 0, `one field per argument must pass; got: ${ok.stdout}`);
   } finally {
     probe.cleanup();
   }
