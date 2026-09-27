@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import {
   ALLOWLIST,
   DEFAULT_INTERNAL_REF_PREFIXES,
@@ -21,7 +22,38 @@ const CLEAN = {
 };
 
 /** The negative control the issue asked for, in the form that can be automated. */
-const throwawayTitle = 'chore: add a PET-999 sentinel so the gate has something to catch';
+const throwawayTitle = 'chore: add a PET-9000 sentinel so the gate has something to catch';
+
+/**
+ * The only instance-shaped identifiers the two self-exempt files may contain.
+ *
+ * `SELF_EXEMPT_PATHS` exists because those files *are* the rule and have to
+ * quote the shapes they ban. The cost of that exemption is that the diff scan
+ * never looks inside them, so a real ticket id copied out of a bug report into
+ * a fixture reaches a public repository with no gate in front of it — which is
+ * exactly how this repository came to carry two live identifiers inside the
+ * very script written to remove them. Declaring the set here gives the
+ * exemption a floor: an undeclared literal is a failure, so adding one is a
+ * deliberate act and reusing a real one is caught.
+ *
+ * Membership is the weaker half of the rule. The stronger half — that an entry
+ * is a number this instance never issued — is enforced as a number by
+ * `MIN_SYNTHETIC_ID` below, because a comment asking for it is not a control:
+ * a live id declared once would otherwise be indistinguishable from a
+ * synthetic one forever after, and the next contributor would copy it.
+ */
+const DECLARED_FIXTURE_IDS = new Set(['PET-9000', 'PET-9001', 'PET-9002', 'PET9002']);
+
+/**
+ * The floor that makes "synthetic" checkable instead of promised.
+ *
+ * The instance had issued 490 real issues when this was written, so anything
+ * at or below this bound could be a coordinate and is refused. It sits four
+ * orders of magnitude above the live range, which means it is not a number
+ * anyone has to revisit: raising the instance's issue count to 9,000 is the
+ * only thing that can make it stale.
+ */
+const MIN_SYNTHETIC_ID = 9000;
 
 test('the clean PR passes', () => {
   const result = checkInternalRefs(CLEAN);
@@ -34,31 +66,31 @@ test('NEGATIVE CONTROL: an id in the PR title fails the gate', () => {
   assert.equal(result.passed, false);
   const joined = result.failures.join('\n');
   assert.match(joined, /The PR title/);
-  assert.match(joined, /PET-999/);
+  assert.match(joined, /PET-9000/);
   // The failure has to say why it matters, or it is just noise a reviewer learns to skip.
   assert.match(joined, /commit subject/);
 });
 
 test('an id in the body, the branch, or a commit subject each fail', () => {
-  assert.equal(checkInternalRefs({ ...CLEAN, prBody: 'Fixes PET-334 step 2.' }).passed, false);
-  assert.equal(checkInternalRefs({ ...CLEAN, prBranch: 'fix/pet392-blocker-edge' }).passed, false);
+  assert.equal(checkInternalRefs({ ...CLEAN, prBody: 'Fixes PET-9001 step 2.' }).passed, false);
+  assert.equal(checkInternalRefs({ ...CLEAN, prBranch: 'fix/pet9002-blocker-edge' }).passed, false);
   assert.equal(
-    checkInternalRefs({ ...CLEAN, commits: [{ commit: { message: 'fix(issues): a one-way door (PET-392)' } }] }).passed,
+    checkInternalRefs({ ...CLEAN, commits: [{ commit: { message: 'fix(issues): a one-way door (PET-9002)' } }] }).passed,
     false,
   );
 });
 
 test('the compact branch form is caught even though it carries no hyphen', () => {
-  // `PET-\d+` cannot see `pet392-...`: there is no hyphen after the prefix.
-  const result = checkInternalRefs({ ...CLEAN, prBranch: 'fix/pet392-blocker-edge-one-way-door' });
+  // `PET-\d+` cannot see `pet9002-...`: there is no hyphen after the prefix.
+  const result = checkInternalRefs({ ...CLEAN, prBranch: 'fix/pet9002-blocker-edge-one-way-door' });
   assert.equal(result.passed, false);
-  assert.match(result.failures.join('\n'), /pet392/);
+  assert.match(result.failures.join('\n'), /pet9002/);
 });
 
 test('an id in a changed file name fails, because the name is part of the change', () => {
   const result = checkInternalRefs({
     ...CLEAN,
-    files: [{ filename: 'server/src/__tests__/pet392-blocker-edge-one-way-door.test.ts', status: 'added', changes: 0 }],
+    files: [{ filename: 'server/src/__tests__/pet9002-blocker-edge-one-way-door.test.ts', status: 'added', changes: 0 }],
   });
   assert.equal(result.passed, false);
   assert.match(result.failures.join('\n'), /file name/);
@@ -71,7 +103,7 @@ test('an id in an added diff line fails, and a removed one does not count', () =
       filename: 'cli/src/__tests__/process-identity.test.ts',
       status: 'modified',
       changes: 2,
-      patch: '@@ -370,3 +370,4 @@\n ctx\n+// (PET-334 step 2), and it is not a question this suite can answer.\n ctx2\n',
+      patch: '@@ -370,3 +370,4 @@\n ctx\n+// (PET-9001 step 2), and it is not a question this suite can answer.\n ctx2\n',
     }],
   });
   assert.equal(added.passed, false);
@@ -83,7 +115,7 @@ test('an id in an added diff line fails, and a removed one does not count', () =
       filename: 'cli/src/__tests__/process-identity.test.ts',
       status: 'modified',
       changes: 1,
-      patch: '@@ -370,2 +370,1 @@\n-// (PET-334 step 2), removed by the cleanup.\n ctx\n',
+      patch: '@@ -370,2 +370,1 @@\n-// (PET-9001 step 2), removed by the cleanup.\n ctx\n',
     }],
   });
   assert.equal(removed.passed, true, JSON.stringify(removed.failures, null, 2));
@@ -122,13 +154,13 @@ test('a bare agent:// mention is not a link, but agent:// with the instance pref
 
   const scoped = checkInternalRefs({
     ...CLEAN,
-    prBody: 'See [the issue](agent://PET-392) for the writeup.',
+    prBody: 'See [the issue](agent://PET-9002) for the writeup.',
   });
   assert.equal(scoped.passed, false);
 });
 
 test('an instance route link is caught', () => {
-  const result = checkInternalRefs({ ...CLEAN, prBody: 'Context lives at /PET/issues/PET-392.' });
+  const result = checkInternalRefs({ ...CLEAN, prBody: 'Context lives at /PET/issues/PET-9002.' });
   assert.equal(result.passed, false);
   assert.match(result.failures.join('\n'), /\/PET\/issues/);
 });
@@ -229,7 +261,7 @@ test('the rule text itself is allowlisted, and the allowlist is not a loophole',
       filename: 'doc/notes.md',
       status: 'modified',
       changes: 1,
-      patch: '@@ -1,1 +1,2 @@\n a\n+- PET-999 leaked here\n',
+      patch: '@@ -1,1 +1,2 @@\n a\n+- PET-9000 leaked here\n',
     }],
   });
   assert.equal(other.passed, false);
@@ -251,7 +283,7 @@ test('the gate exempts itself, and only itself', () => {
         filename: path,
         status: 'modified',
         changes: 1,
-        patch: '@@ -1,1 +1,2 @@\n a\n+// PET-999 is what this file searches for\n',
+        patch: '@@ -1,1 +1,2 @@\n a\n+// PET-9000 is what this file searches for\n',
       }],
     });
     assert.equal(result.passed, true, `${path} should be exempt: ${JSON.stringify(result.failures)}`);
@@ -283,7 +315,7 @@ test('a configured extra prefix is honoured and de-duplicated case-insensitively
 });
 
 test('one finding is reported once, not once per surface spelling', () => {
-  const result = checkInternalRefs({ ...CLEAN, prTitle: 'fix: PET-392 and PET-392 and PET-334' });
+  const result = checkInternalRefs({ ...CLEAN, prTitle: 'fix: PET-9002 and PET-9002 and PET-9001' });
   assert.equal(result.passed, false);
   assert.equal(result.failures.filter((f) => f.includes('The PR title')).length, 1);
 });
@@ -489,3 +521,49 @@ test('findInstanceHosts is the whole rule, and it explains its own boundaries', 
   assert.deepEqual(findInstanceHosts('see docs.example.com and 172.15.0.1'), []);
 });
 
+
+test('the self-exempt files carry no identifier outside the declared set', async () => {
+  // Built from the default prefix list rather than hardcoded, so the floor
+  // follows configuration. Only this instance's namespace is checked: the
+  // canonical `PAP-`/`PAPA-` fixtures are inherited legitimately from the
+  // product, which is the whole reason the default list is the instance prefix
+  // alone. Both spellings the gate matches are covered, so the compact form
+  // that a branch name actually uses is caught too.
+  const escaped = DEFAULT_INTERNAL_REF_PREFIXES
+    .map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`))
+    .join('|');
+  const shapes = [new RegExp(String.raw`\b(?:${escaped})-\d+\b`, 'gi'), new RegExp(String.raw`\b(?:${escaped})\d{2,}\b`, 'gi')];
+
+  // Walks `SELF_EXEMPT_PATHS` rather than naming the two files, so the floor
+  // follows the exemption list if it ever grows.
+  for (const relPath of SELF_EXEMPT_PATHS) {
+    const source = await readFile(new URL(`../../../${relPath}`, import.meta.url), 'utf8');
+    const found = new Set(shapes.flatMap((re) => source.match(re) ?? []).map((id) => id.toUpperCase()));
+    const undeclared = [...found].filter((id) => !DECLARED_FIXTURE_IDS.has(id));
+    assert.deepEqual(
+      undeclared,
+      [],
+      `${relPath} carries undeclared identifiers from this instance's namespace: ${undeclared.join(', ')}\n`
+        + 'Declare a synthetic one in DECLARED_FIXTURE_IDS, or use a prefix the gate does not scan.',
+    );
+  }
+});
+
+test('a declared identifier may not be a number the instance could have issued', () => {
+  // The half of the rule that membership cannot express. Without this, the
+  // declared set is a permanent amnesty: a real id pasted in once would be
+  // indistinguishable from a synthetic one on every future run, and the doc
+  // comment asking for synthetic ids would be the only thing standing between
+  // the next contributor and the pattern. Comparing the number against a floor
+  // above the live range turns that comment into a control.
+  const below = [...DECLARED_FIXTURE_IDS]
+    .map((id) => [id, Number(id.replace(/^[A-Za-z]+-?/, ''))])
+    .filter(([, n]) => !Number.isFinite(n) || n < MIN_SYNTHETIC_ID)
+    .map(([id]) => id);
+  assert.deepEqual(
+    below,
+    [],
+    `declared identifiers at or below MIN_SYNTHETIC_ID (${MIN_SYNTHETIC_ID}) could be real: ${below.join(', ')}\n`
+      + 'Pick a synthetic number above the floor instead.',
+  );
+});

@@ -67,7 +67,7 @@ describe("listeningSocketInodesForPort", () => {
 describe("pidsHoldingSocketInodes", () => {
   /** A synthetic /proc: `<root>/<pid>/fd/<n>` is a symlink reading `socket:[i]`. */
   function makeFakeProcRoot(pids: Array<{ pid: number; inodes: number[] }>): string {
-    const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "pet167-proc-"));
+    const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "portown-proc-"));
     for (const { pid, inodes } of pids) {
       const fdDir = path.join(root, String(pid), "fd");
       fsSync.mkdirSync(fdDir, { recursive: true });
@@ -97,7 +97,7 @@ describe("pidsHoldingSocketInodes", () => {
   });
 
   it("does not confuse a non-socket descriptor for a socket", () => {
-    const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "pet167-proc-"));
+    const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "portown-proc-"));
     cleanups.push(() => fsSync.rmSync(root, { recursive: true, force: true }));
     const fdDir = path.join(root, "77", "fd");
     fsSync.mkdirSync(fdDir, { recursive: true });
