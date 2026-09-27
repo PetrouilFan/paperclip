@@ -218,6 +218,20 @@ function readProcessIdentity(pid: number): string | null {
   }
 }
 
+/**
+ * The identity this process would record in a lock it owns right now.
+ *
+ * `readProcessIdentity` stays private because it is platform-specific, and a
+ * caller that had to reimplement the `/proc` and `ps` parsing to predict it
+ * would be a second copy of production's logic rather than a test of it. A
+ * test that needs an owner record this process still owns asks for the value
+ * here instead, so the record it writes is the value the reclaim will compare
+ * against on every platform.
+ */
+export function readCurrentProcessIdentity(): string | null {
+  return readProcessIdentity(process.pid);
+}
+
 function probeRegistryLockOwner(owner: RegistryLockOwner): boolean {
   const control = new Int32Array(new SharedArrayBuffer(4));
   const worker = new Worker(REGISTRY_LOCK_PROBE_SOURCE, {
@@ -236,6 +250,19 @@ function probeRegistryLockOwner(owner: RegistryLockOwner): boolean {
   return isOwner;
 }
 
+/**
+ * Removes a lock whose recorded owner is gone or has been superseded, unless
+ * something changed while the reclaim was deciding.
+ *
+ * Between the first read and `rmSync` another process can legitimately take the
+ * lock over, refresh it, or still be the holder that recorded a pid it has since
+ * reused. Each of the three re-checks below exists for one of those windows, and
+ * each is exercised by a test that fails when its line is deleted:
+ * `worktree-port-registry.test.ts` covers the identity re-check, the owner-token
+ * re-check, and the second staleness read. Deleting any one of the three leaves
+ * that file green only if the matching test is also deleted, so none of them is
+ * defence-in-depth without coverage.
+ */
 function removeStaleRegistryLock(lockPath: string): boolean {
   try {
     const ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
