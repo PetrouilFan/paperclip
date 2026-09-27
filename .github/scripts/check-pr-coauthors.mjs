@@ -89,10 +89,12 @@ function noReplyEmail(login) {
  * `.example` are RFC 6761 §6; `home.arpa` is RFC 8375; and `.internal` is
  * reserved from delegation by ICANN Board Resolution 2024.07.29.06 — a root-zone
  * reservation, not a special-use designation, which is why it is not in IANA's
- * special-use registry. `localdomain` is the hostname Debian ships by default
- * and `.lan` is ad-hoc private use with no reservation and no root-zone entry
- * (RFC 6762 Appendix G); both are unroutable for want of a reservation rather
- * than by one. A domain with no dot at all is the same story.
+ * special-use registry. `localdomain` is a single-label name with no delegation
+ * in the root zone, so a bare `localdomain` is caught by the no-dot rule below
+ * and `host.localdomain` by this regex, and `.lan` is ad-hoc private use with no
+ * reservation and no root-zone entry (RFC 6762 Appendix G); both are unroutable
+ * for want of a reservation rather than by one. A domain with no dot at all is
+ * the same story.
  */
 const LOCAL_ONLY_DOMAIN =
   /\.(localdomain|localhost|local|internal|home\.arpa|test|invalid|example|lan)$/i;
