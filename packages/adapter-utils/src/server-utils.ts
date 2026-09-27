@@ -3447,6 +3447,47 @@ export function sanitizeInheritedPaperclipEnv(
   return env;
 }
 
+/**
+ * The systemd IPC handles, which are an operator capability and not run
+ * configuration. Under a `Type=notify` unit systemd puts the notify socket
+ * address in the control plane's own environment, and the `LISTEN_*` triple
+ * hands over the unit's socket-activated file descriptors. Every process the
+ * control plane spawns inherits them, so a run child that holds `NOTIFY_SOCKET`
+ * can send `STOPPING=1` and move the unit that is running it into
+ * `stop-sigterm`. Neither has any use inside a run.
+ */
+const SYSTEMD_IPC_ENV_KEYS = [
+  "NOTIFY_SOCKET",
+  "LISTEN_PID",
+  "LISTEN_FDS",
+  "LISTEN_FDNAMES",
+] as const;
+
+/**
+ * Drop the systemd IPC handles from an environment bound for a run child.
+ *
+ * This is the chokepoint, and it is not `sanitizeInheritedPaperclipEnv`, which
+ * only ever sees the inherited half. `runChildProcess` builds the child
+ * environment as `{ ...sanitizeInheritedPaperclipEnv(process.env), ...opts.env }`,
+ * so the adapter-supplied `opts.env` is spread *after* the inherited base, and
+ * a `process.env`-derived value in it reaches the child after any scrub applied
+ * upstream. Three of the adapter sites build exactly that shape. Scrubbing the
+ * merged environment covers both halves with one edit, covers a future adapter
+ * that passes a `process.env`-derived `opts.env`, and stays correct when a new
+ * adapter is added.
+ *
+ * The cost, stated rather than assumed: an agent-configured `NOTIFY_SOCKET` is
+ * dropped too. The guarantee is therefore "no run child holds the unit's
+ * systemd handles", not "no run child inherits them". That is the stronger
+ * invariant and the one the incident needs.
+ *
+ * @param env  mutated in place, and returned for use at the call site
+ */
+export function scrubSystemdIpcEnv<T extends NodeJS.ProcessEnv>(env: T): T {
+  for (const key of SYSTEMD_IPC_ENV_KEYS) delete env[key];
+  return env;
+}
+
 export function defaultPathForPlatform() {
   if (process.platform === "win32") {
     return "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem";
@@ -4627,10 +4668,22 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
-    const rawMerged: NodeJS.ProcessEnv = {
+    // The child environment is the merge of an inherited half and an adapter
+    // half, and either can carry a handle, so the merge is what gets scrubbed.
+    // Scrubbing the adapter half alone would leave the inherited half to
+    // `sanitizeInheritedPaperclipEnv`, which does not drop these keys.
+    //
+    // `adapterEnv` is scrubbed and copied separately for the ssh boundary
+    // below, which does not read `rawMerged`. The copy is not incidental:
+    // `rawMerged` is mutated further down and the ssh path reads `adapterEnv`
+    // after that, so the two must not be the same object. Building it here also
+    // means the remote boundary cannot forget the scrub, because it never sees
+    // the unsanitised `opts.env`.
+    const adapterEnv = scrubSystemdIpcEnv({ ...opts.env });
+    const rawMerged: NodeJS.ProcessEnv = scrubSystemdIpcEnv({
       ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
-    };
+      ...adapterEnv,
+    });
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
     // don't refuse to start with "cannot be launched inside another session".
@@ -4653,7 +4706,11 @@ export async function runChildProcess(
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      // The remote path does not build a child environment from `rawMerged`. It
+      // hands this map to the ssh wrapper, which puts each pair on the remote
+      // command line, so a configured handle would otherwise reach the remote
+      // child. Same guarantee, second boundary, same already-scrubbed object.
+      remoteEnv: opts.remoteExecution ? adapterEnv : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {

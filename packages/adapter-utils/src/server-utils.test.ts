@@ -587,6 +587,88 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it("gives the child no systemd IPC handle, from either the inherited base or the adapter env", async () => {
+    // The two vectors, in one real spawn, because the guarantee is about the
+    // child and not about a helper.
+    //
+    // The inherited half is the incident: the control plane runs as a
+    // `Type=notify` unit, so systemd puts the notify socket in its own
+    // environment and every spawned process inherits it. The adapter half is
+    // the one a scrub upstream of the merge cannot see, because `opts.env` is
+    // spread after `sanitizeInheritedPaperclipEnv(process.env)`. Three of the
+    // adapter sites build `opts.env` from `{ ...process.env, ...env }`, so both
+    // vectors are live at once and testing only the first would leave the
+    // second open.
+    const keys = [
+      "NOTIFY_SOCKET",
+      "LISTEN_PID",
+      "LISTEN_FDS",
+      "LISTEN_FDNAMES",
+    ];
+    const inherited = process.env;
+    process.env = {
+      ...inherited,
+      NOTIFY_SOCKET: "/run/user/1000/systemd/notify",
+      LISTEN_PID: "4242",
+      LISTEN_FDS: "3",
+      LISTEN_FDNAMES: "notify",
+    };
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          `process.stdout.write(JSON.stringify(${JSON.stringify(keys)}.filter((k) => k in process.env)))`,
+        ],
+        {
+          cwd: process.cwd(),
+          env: {
+            NOTIFY_SOCKET: "/run/user/1000/systemd/notify",
+            LISTEN_PID: "4242",
+            LISTEN_FDS: "3",
+            LISTEN_FDNAMES: "notify",
+          },
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("[]");
+    } finally {
+      process.env = inherited;
+    }
+  });
+
+  it("still passes an unrelated handle-shaped variable through", async () => {
+    // The control that keeps the scrub from becoming a blunt "drop anything
+    // that looks like a socket". A blanket prefix or substring rule would take
+    // this with it; the guarantee is only about the four systemd keys.
+    const inherited = process.env;
+    process.env = { ...inherited, NOTIFY_SOCKET: "/run/user/1000/systemd/notify" };
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "process.stdout.write(process.env.PAPERCLIP_RUN_SOCKET ?? '')"],
+        {
+          cwd: process.cwd(),
+          env: { PAPERCLIP_RUN_SOCKET: "/tmp/paperclip-run.sock" },
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("/tmp/paperclip-run.sock");
+    } finally {
+      process.env = inherited;
+    }
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();
