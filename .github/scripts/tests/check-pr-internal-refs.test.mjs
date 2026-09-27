@@ -45,7 +45,15 @@ const throwawayTitle = 'chore: add a PET-9000 sentinel so the gate has something
  * a live id declared once would otherwise be indistinguishable from a
  * synthetic one forever after, and the next contributor would copy it.
  */
-const DECLARED_FIXTURE_IDS = new Set(['PET-9000', 'PET-9001', 'PET-9002', 'PET9002']);
+const DECLARED_FIXTURE_IDS = new Set([
+  'PET-9000',
+  'PET-9001',
+  'PET-9002',
+  'PET9002',
+  'PET-9003',
+  'PET9003',
+  'PET-9004',
+]);
 
 /**
  * The floor that makes "synthetic" checkable instead of promised.
@@ -367,8 +375,8 @@ test('one unopenable id is one finding, not one per rule that saw it', () => {
 
 test('an id the configured list already caught is not reported twice', () => {
   // `fix` is both a reference verb and a conventional-commit type, so
-  // `fix: PET-392` is visible to both tiers. One id is one paragraph.
-  const result = checkInternalRefs({ ...CLEAN, prTitle: 'fix: PET-392 and PET-334' });
+  // `fix: PET-9003` is visible to both tiers. One id is one paragraph.
+  const result = checkInternalRefs({ ...CLEAN, prTitle: 'fix: PET-9003 and PET-9004' });
   assert.equal(result.passed, false);
   assert.equal(result.failures.filter((f) => f.includes('The PR title')).length, 1, result.failures.join('\n'));
   // ...and the one finding is the configured-prefix one, which is the report
@@ -567,9 +575,9 @@ test('findUnknownInternalRefs states its own boundaries', () => {
   assert.deepEqual(findUnknownInternalRefs(''), []);
   assert.deepEqual(findUnknownInternalRefs(undefined), []);
   // What the configured tier already reported is not reported again.
-  assert.deepEqual(findUnknownInternalRefs('fix: PET-392', undefined, ['PET-392']), []);
+  assert.deepEqual(findUnknownInternalRefs('fix: PET-9003', undefined, ['PET-9003']), []);
   // ...and a different id on the same surface still is.
-  assert.deepEqual(findUnknownInternalRefs('fix: PET-392 and ticket TASK-482', undefined, ['PET-392']), ['TASK-482']);
+  assert.deepEqual(findUnknownInternalRefs('fix: PET-9003 and ticket TASK-482', undefined, ['PET-9003']), ['TASK-482']);
   // The branch surface drops the reference-position requirement, and only that.
   assert.deepEqual(findUnknownInternalRefs('fix/TASK-482-unbound', undefined, [], { requireReference: false }), ['TASK-482']);
   assert.deepEqual(findUnknownInternalRefs('fix/TASK-482-unbound'), []);
