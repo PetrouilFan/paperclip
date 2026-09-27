@@ -1070,6 +1070,9 @@ importers:
       cross-env:
         specifier: ^10.1.0
         version: 10.1.0
+      oxc-parser:
+        specifier: ^0.127.0
+        version: 0.127.0
       supertest:
         specifier: ^7.0.0
         version: 7.2.2
