@@ -142,12 +142,31 @@ is exactly what the 11:06 stop of 2026-09-27 lacks today.
 
 ### When the shim is needed
 
-Only for the window before the run-IPC fix is deployed. That fix is now on
-`master` as #147: a run inherits no `NOTIFY_SOCKET` and the unit is
-`NotifyAccess=main`, so no run can send a notification at all and there is
-nothing left to trace. The shim is a detector for a capability that was still
-armed on the live host, and it stays useful for any unit whose `NotifyAccess`
-has not been narrowed.
+The shim is still needed. One half of the run-IPC fix is deployed and the other
+half is not.
+
+What is on the default branch: a run child inherits no `NOTIFY_SOCKET` and no
+`LISTEN_*` value. That is the environment half, and it is what stops a run from
+holding the address by inheritance.
+
+What is not on the default branch: the unit is still `NotifyAccess=all`.
+`cli/src/services/service-manager.ts` renders that value into the unit, and
+`cli/src/__tests__/service-manager.test.ts` asserts it. So the unit still accepts
+a notification datagram from any process in the cgroup, and the shim still has
+something to detect.
+
+The two halves are separate changes, and the unit-side one has a precondition
+that is not met yet. The server sends its readiness datagram by running the
+`systemd-notify` binary as a child process: `server/src/index.ts` calls
+`systemdNotify(["--ready", ...])`, and `server/src/services/systemd-notify.ts`
+implements that with `execFile`. `NotifyAccess=main` accepts a datagram only from
+the unit's main process, so a child would be refused. The unit is
+`Type=notify`, so a refused `READY=1` means the unit never reaches `active` and
+sits out `TimeoutStartSec=600` before it is killed and restarted.
+
+Narrowing `NotifyAccess` therefore needs the notifier to send from the main
+process first. Until that happens, `NotifyAccess=all` is load-bearing and must
+not be changed on its own.
 
 ## Safety
 
