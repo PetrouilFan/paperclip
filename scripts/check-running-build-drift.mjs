@@ -157,6 +157,41 @@ export const RUNNING_BUILD_SENTINELS = [
     markers: ["markShutdownIntent", "onRecoveryExhausted"],
     summary: "a requested database stop is not read as an unexpected exit",
   },
+  {
+    // The stranded-run age-out. A `queued` run with `startedAt IS NULL` is one
+    // the dispatcher never claimed, and because it is still `queued` it also
+    // still answers every "does this issue have a live execution path" test. That
+    // combination is self-sealing: the stranded run reads as the live path, so
+    // recovery concludes the issue is covered and never re-queues, and a fresh
+    // run cannot claim the issue while `issues.executionRunId` still points at
+    // the corpse. The issue then has no write surface and the only escape is a
+    // board-only force release.
+    //
+    // This was the one drift on the `default` plane that this check did not
+    // report, for a reason worth recording: it was not a shadowed install at
+    // all. The sweep was committed and merged, no published channel ever carried
+    // it, and so the running build was not "an old build" but a build with a
+    // hole in it — every other sentinel in this manifest reads `ok` or drifted
+    // for a reason that is about a hand-patch, and none of them said anything
+    // about a fix that was merged and then never deployed. A green line on this
+    // check was therefore available to mean "the deploy story is understood"
+    // while the deploy story had a hole in it, and three separate issues ended
+    // up waiting on a sweep no report named.
+    //
+    // Both markers are required. `never_dispatched_timeout` is the reason-code
+    // string literal, which survives compilation unconditionally, so it
+    // distinguishes a build that runs the age-out from one that merely has the
+    // module. The window constant is the identifier that says the age-out is
+    // armed at all, and it is the value a build would get wrong silently: a
+    // sweep that fires too early destroys running work, so losing the constant
+    // has to report drift rather than pass.
+    id: "never-dispatched-runs-age-out",
+    sinceCommit: "b97043008",
+    sourcePath: "server/src/services/never-dispatched-run.ts",
+    distPath: "services/never-dispatched-run.js",
+    markers: ["never_dispatched_timeout", "NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS"],
+    summary: "a queued run the dispatcher never claimed is aged out instead of reading as a live execution path",
+  },
 ];
 
 /** First candidate root that actually holds a server dist. */

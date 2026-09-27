@@ -155,6 +155,104 @@ test("sentinel ids are unique so a report never double-counts one fix", () => {
   assert.equal(new Set(ids).size, ids.length);
 });
 
+/** The shipped age-out markers, as `tsc` leaves them in `services/`. */
+function writeAgeOutModule(root) {
+  writeFileSync(
+    path.join(root, "services", "never-dispatched-run.js"),
+    [
+      "const NEVER_DISPATCHED_RUN_ERROR_CODE = 'never_dispatched_timeout';",
+      "export const NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS = 12 * 60 * 60 * 1000;",
+    ].join("\n") + "\n",
+  );
+}
+
+test("a build with every other fix present still reports the missing stranded-run age-out", () => {
+  // The state this sentinel was added for, reproduced rather than described: a
+  // dist that satisfies every other sentinel in the manifest, on the `default`
+  // plane, while carrying no age-out at all. Before this sentinel existed the
+  // whole report for that dist was green on the fixes it did cover, so the one
+  // drift that had no hand-patch behind it — a fix that was merged and then
+  // never deployed — had nothing to report it. Three issues were waiting on it.
+  //
+  // So the assertion is not that the sweep is missing. It is that a dist
+  // satisfying every *other* sentinel still fails the check, because a report
+  // that only ever names the shadowed-install fixes cannot answer "is the plane
+  // current", which is the question a deploy decision turns on.
+  const everythingElse = {
+    "cross-issue-influence-limit.js": [
+      "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+      "let boundSourceIssueId = null;",
+      "  throw crossIssueInfluenceRunContextError('terminal_status');",
+      "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+    ].join("\n"),
+    "issues.js": "function assertCheckoutRunIsActive() {}\n",
+    // No `never-dispatched-run.js` at all: the module was never deployed, so
+    // this is a file-level absence, not a stale copy of the file.
+  };
+
+  const root = distRootWith(everythingElse);
+  // Two sentinels point outside `services/`, so `distRootWith` cannot place
+  // them. Both are written at the dist root, which is where the checker looks.
+  mkdirSync(path.join(root, "middleware"), { recursive: true });
+  writeFileSync(
+    path.join(root, "middleware", "error-handler.js"),
+    "res.status(400).json({ error: 'Invalid JSON body' });\n",
+  );
+  writeFileSync(
+    path.join(root, "embedded-postgres-supervisor.js"),
+    "const markShutdownIntent = () => {};\noptions.onRecoveryExhausted?.(lastError);\n",
+  );
+  const results = evaluateSentinels(RUNNING_BUILD_SENTINELS, {
+    distRoot: root,
+    git: gitServingAllShippedSentinels(),
+  });
+  const byId = Object.fromEntries(results.map((r) => [r.id, r]));
+
+  // Every other sentinel is satisfied, which is what made the report green.
+  for (const [id, result] of Object.entries(byId)) {
+    if (id === "never-dispatched-runs-age-out") continue;
+    assert.equal(result.state, "deployed", `${id} should read as deployed in this fixture`);
+  }
+
+  const ageOut = byId["never-dispatched-runs-age-out"];
+  assert.equal(ageOut.state, "drifted");
+  assert.equal(ageOut.deployedExists, false);
+  assert.deepEqual(ageOut.missingFromDeployed, [
+    "never_dispatched_timeout",
+    "NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS",
+  ]);
+  assert.ok(summarize(results).drifted.includes("never-dispatched-runs-age-out"));
+});
+
+test("the age-out sentinel needs the window constant, not just the error code", () => {
+  // The two markers are not redundant. A build that has the module but arms the
+  // sweep at the wrong window still runs the age-out, and the failure mode is
+  // the destructive one: too early a window cancels runs that would have
+  // started, each of which was holding an issue execution lock. The constant is
+  // the identifier that says the window is the committed one, so losing it has
+  // to read as drift rather than pass.
+  const root = distRootWith({
+    "never-dispatched-run.js":
+      "const NEVER_DISPATCHED_RUN_ERROR_CODE = 'never_dispatched_timeout';\n" +
+      "export const NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS = 60 * 60 * 1000;\n",
+  });
+  const [result] = evaluateSentinels(
+    [{ ...RUNNING_BUILD_SENTINELS.find((s) => s.id === "never-dispatched-runs-age-out") }],
+    { distRoot: root, git: gitServingAllShippedSentinels() },
+  );
+  assert.equal(result.state, "deployed");
+
+  const rearmed = distRootWith({
+    "never-dispatched-run.js": "const NEVER_DISPATCHED_RUN_ERROR_CODE = 'never_dispatched_timeout';\n",
+  });
+  const [missing] = evaluateSentinels(
+    [{ ...RUNNING_BUILD_SENTINELS.find((s) => s.id === "never-dispatched-runs-age-out") }],
+    { distRoot: rearmed, git: gitServingAllShippedSentinels() },
+  );
+  assert.equal(missing.state, "drifted");
+  assert.deepEqual(missing.missingFromDeployed, ["NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS"]);
+});
+
 test("the source-attribution sentinel is not satisfied by the superseded fallback variant", () => {
   // The variant that shipped as a hand-patch, reproduced from the running
   // build. It carries TERMINAL_HEARTBEAT_RUN_STATUSES, so the older
@@ -290,6 +388,9 @@ function gitServingAllShippedSentinels(overrides = {}) {
     "server/src/middleware/error-handler.ts": "res.status(400).json({ error: 'Invalid JSON body' });\n",
     "server/src/embedded-postgres-supervisor.ts":
       "const markShutdownIntent = () => {};\noptions.onRecoveryExhausted?.(lastError);\n",
+    "server/src/services/never-dispatched-run.ts":
+      "const NEVER_DISPATCHED_RUN_ERROR_CODE = 'never_dispatched_timeout';\n" +
+      "const NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS = 12 * 60 * 60 * 1000;\n",
   };
   const bodies = { ...defaults, ...overrides };
   return (args) => {
@@ -373,7 +474,13 @@ test("the run shape of the live build still reports exactly the findings it has"
   assert.match(out, /ok   embedded-postgres-shutdown-intent/);
   assert.match(out, /DRIFT malformed-json-is-a-400/);
   assert.doesNotMatch(out, /BUG  /);
-  assert.match(out, /3 fix\(es\) are committed/);
+  // Four, not three. The fourth is the stranded-run age-out, and it is the one
+  // with no hand-patch behind it: the artifact is not an old build of a fix
+  // nobody deployed, it is a build missing a fix that was merged and never
+  // shipped in any published channel. The count moved when that sentinel was
+  // added, which is the whole reason the manifest needed it.
+  assert.match(out, /DRIFT never-dispatched-runs-age-out/);
+  assert.match(out, /4 fix\(es\) are committed/);
 });
 
 test("a fix held only by a hand-patch is reported as a reinstall hazard, not as a green line", () => {
@@ -390,6 +497,12 @@ test("a fix held only by a hand-patch is reported as a reinstall hazard, not as 
     path.join(root, "embedded-postgres-supervisor.js"),
     "const markShutdownIntent = () => {};\noptions.onRecoveryExhausted?.(lastError);\n",
   );
+  // This test's premise is "every sentinel is deployed", so the age-out has to
+  // be in the fixture too. Without it the check would report drift, the drift
+  // line would stop reading "every guarded fix is present", and the test would
+  // be asserting the scars section through a different failure than the one it
+  // is about.
+  writeAgeOutModule(root);
   writeFileSync(
     path.join(root, "services", "cross-issue-influence-limit.js.bak-20260925T002012Z"),
     "released original\n",
