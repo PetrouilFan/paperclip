@@ -967,6 +967,28 @@ describe("openapi routes", () => {
     const codes = Object.keys(cancel.responses).sort();
     expect(codes).toEqual(["200", "401", "403", "404"]);
   });
+
+  it("documents both gates on the heartbeat run cancel route", () => {
+    const { spec } = loadSpecRoutes();
+    const cancel = spec.paths["/api/heartbeat-runs/{runId}/cancel"].post;
+    // Both are reachable at run time and the spec has to say so:
+    //  - 404 from the company-access gate, before any cancel logic runs, so a
+    //    run outside the caller's company is not even confirmed to exist.
+    //  - 403 because the route is board-only for every run that is not the
+    //    caller's own stranded run.
+    expect(Object.keys(cancel.responses).sort()).toEqual([
+      "200",
+      "400",
+      "401",
+      "403",
+      "404",
+    ]);
+    // The agent path is a release of a run that holds a lock while doing no work,
+    // not a general Stop. If this wording is dropped the narrowing is not
+    // documented, and the next reader has to infer it from the route body.
+    expect(cancel.description).toMatch(/stranded/);
+    expect(cancel.description).toMatch(/not a\s+Stop/);
+  });
 });
 
 

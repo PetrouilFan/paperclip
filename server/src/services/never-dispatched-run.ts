@@ -49,6 +49,14 @@ import { heartbeatRuns } from "@paperclipai/db";
  */
 export const NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS = 12 * 60 * 60 * 1000;
 
+/**
+ * `errorCode` stamped on a run the age-out sweep cancels. It is the one value
+ * that says "this run held an issue lock and never did any work", so it is
+ * exported next to the predicate that decides it and consumed by both the
+ * sweep and the execution projection rather than being written twice.
+ */
+export const NEVER_DISPATCHED_RUN_ERROR_CODE = "never_dispatched_timeout";
+
 /** `createdAt` at or before which an unclaimed `queued` run counts as stranded. */
 export function neverDispatchedRunCutoff(
   now: Date = new Date(),
@@ -68,6 +76,41 @@ export function isNeverDispatchedQueuedRun(
     run.startedAt === null &&
     run.createdAt.getTime() <= neverDispatchedRunCutoff(now, windowMs).getTime()
   );
+}
+
+/**
+ * Whether an agent caller may release this run without board access.
+ *
+ * Both halves are required, and each one closes a different hole:
+ *
+ *  - The agent must own the run, so this can never reach another agent's work.
+ *  - The run must be one that is holding an issue lock while doing nothing, so
+ *    this can never become a way to stop live execution. A `running` run, a
+ *    `scheduled_retry` run, and any run the dispatcher already claimed are all
+ *    excluded by the shared predicate, which is what keeps this a *release*
+ *    rather than a Stop.
+ *
+ * It reuses {@link isNeverDispatchedQueuedRun} deliberately rather than
+ * restating the condition, so "a self-service release is available" and "the
+ * age-out sweep will clear this anyway" stay true at the same threshold instead
+ * of drifting into two answers that disagree at the boundary.
+ *
+ * The wedge this exists to break: a run the dispatcher never claimed holds
+ * `issues.executionRunId`, and that lock refuses checkout, status change and
+ * comments for the assignee. Without this, the only route that would release the
+ * lock is board-only, so the assignee has no self-service exit.
+ *
+ * Lives here rather than inside the route so the security decision is a pure
+ * function that can be pinned by tests without standing up an HTTP harness.
+ */
+export function canAgentSelfReleaseStrandedRun(
+  actor: { type: string; agentId?: string },
+  run: { agentId: string; status: string; startedAt: Date | null; createdAt: Date },
+  now: Date = new Date(),
+): boolean {
+  if (actor.type !== "agent") return false;
+  if (!actor.agentId || run.agentId !== actor.agentId) return false;
+  return isNeverDispatchedQueuedRun(run, now);
 }
 
 /**

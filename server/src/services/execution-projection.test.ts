@@ -17,6 +17,10 @@ const run = (values: Partial<Run> = {}) =>
     scheduledRetryAttempt: 1,
     retryOfRunId: null,
     executionControlDeadlineAt: null,
+    // The stranded-run branch reads `createdAt` through the shared predicate.
+    // Every other branch short-circuits on `status` first, so a default of `now`
+    // keeps those fixtures inside the admission window without pinning the value.
+    createdAt: now,
     ...values,
   }) as Run;
 const coordinator = (values: Partial<Coordinator> = {}) =>
@@ -282,5 +286,91 @@ describe("execution truth projection", () => {
         }),
       ).phase,
     ).toBe("recovery_needed");
+  });
+  // A `queued` run the dispatcher never claimed still holds its issue's execution
+  // lock, so the issue has no write surface at all. Read as a plain `queued` it is
+  // indistinguishable from a run one second from dispatch, which is how a wedged
+  // `in_progress` issue looks like healthy work in flight on the board.
+  describe("a queued run the dispatcher never claimed", () => {
+    const windowMs = 12 * 60 * 60 * 1_000;
+    const stranded = (values: Partial<Run> = {}) =>
+      run({
+        id: "stranded",
+        status: "queued",
+        runtimeMode: "legacy",
+        startedAt: null,
+        lastUsefulActionAt: null,
+        lastOutputAt: null,
+        createdAt: new Date(now.getTime() - windowMs - 60_000),
+        ...values,
+      });
+
+    it("stops reading as an ordinary queued run and grows a recovery affordance", () => {
+      expect(projectExecution(stranded(), undefined, [], undefined, now)).toMatchObject({
+        phase: "recovery_needed",
+        label: "Stuck in queue",
+        cause: "never_dispatched_timeout",
+        // `agent`, not `board`: the assignee can release their own stranded run
+        // through the cancel route, so this is not a board-only stop.
+        recoveryOwner: "agent",
+        permittedActions: ["inspect_run", "inspect_recovery"],
+        lastConfirmedActivityAt: null,
+      });
+    });
+
+    it("names the release as the next action, because the lock is what is blocking", () => {
+      expect(
+        projectExecution(stranded(), undefined, [], undefined, now).nextAction,
+      ).toMatch(/Cancel this run to release the lock/);
+    });
+
+    it("still reads as ordinary queueing inside the admission window", () => {
+      // `queued` is a legitimate live state. Reporting a run that is waiting its
+      // turn as stranded would be wrong, and the observed queue wait reaches
+      // 7.09h, so this boundary is load-bearing.
+      expect(
+        projectExecution(
+          stranded({ createdAt: new Date(now.getTime() - 60_000) }),
+          undefined,
+          [],
+          undefined,
+          now,
+        ),
+      ).toMatchObject({
+        phase: "queued",
+        label: "Queued",
+        recoveryOwner: null,
+        permittedActions: ["inspect_run"],
+      });
+    });
+
+    it("does not misread a claimed-but-slow run as stranded", () => {
+      expect(
+        projectExecution(
+          stranded({ startedAt: new Date(now.getTime() - 60_000) }),
+          undefined,
+          [],
+          undefined,
+          now,
+        ),
+      ).toMatchObject({ phase: "queued", label: "Queued" });
+    });
+
+    it("defers to a recovery row that already explains the run", () => {
+      // Placement matters: a recovery action is the better explanation of why a
+      // run is not progressing than "the dispatcher never claimed it".
+      expect(
+        projectExecution(stranded(), undefined, [], {
+          status: "active",
+          cause: "agent_stranded",
+          nextAction: "Inspect the stopped agent.",
+        }, now),
+      ).toMatchObject({
+        phase: "recovery_needed",
+        cause: "agent_stranded",
+        recoveryOwner: "board",
+        nextAction: "Inspect the stopped agent.",
+      });
+    });
   });
 });
