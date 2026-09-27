@@ -4,6 +4,8 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -193,6 +195,11 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
   }, 20_000);
 
   afterEach(async () => {
+    // The tree-hold case writes through the mutation path, which leaves an
+    // activity row and a wake row behind. Both hold a company FK, so they have
+    // to go before the company does.
+    await db.delete(agentWakeupRequests);
+    await db.delete(activityLog);
     await db.delete(issueRelations);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
@@ -388,14 +395,21 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.diagnosis).toContain("truncated at 100 blockers");
     expect(res.body.caps).toEqual({ maxBlockers: 100 });
   });
-  it("does not report a tree-held issue as having no blockers, and withholds readiness", async () => {
+  it("does not report a tree-held issue as having no blockers, and still reports the dependency answer", async () => {
     // The measured defect: an issue held by a live child, with no first-class
     // dependency edge, came back as `isDependencyReady: true` and the sentence
     // "is blocked but has no first-class blocker relations" — while the write
-    // path refused the move. The sentence is a negative, and the aggregate the
-    // server enforces with contradicts it.
+    // path refused the move. The sentence was a negative, and the aggregate
+    // the server enforces with contradicted it.
+    //
+    // #96 fixed the sentence by nulling `readiness` too, which traded a wrong
+    // answer for a missing one. The write-path assertion at the bottom of this
+    // test is what settles which of the two is true: the `in_progress` gate
+    // reads dependency edges only, so it accepts the move. With that accepted,
+    // withholding the answer withheld a fact the server had.
     const company = await seedCompany(db, "TreeHold");
     const project = await seedProject(db, company.id, "Tree hold project");
+    const agent = await seedAgent(db, company.id);
     const root = await seedIssue(db, {
       companyId: company.id,
       projectId: project.id,
@@ -417,10 +431,34 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.blockers).toEqual([]);
     // The negative sentence is gone.
     expect(res.body.diagnosis).not.toContain("no first-class blocker relations");
-    expect(res.body.diagnosis).toContain("not first-class dependency edges");
-    // And the answer that invited the refused write is withheld.
-    expect(res.body.readiness).toBeNull();
+    expect(res.body.diagnosis).toContain(
+      "is blocked by 1 hold that is not a first-class dependency edge",
+    );
+    // The hold is still reported, as its own fact, and the sentence says out
+    // loud that the dependency answer does not cover it.
     expect(res.body.unprojectedHold.count).toBe(1);
+    expect(res.body.diagnosis).toContain(
+      "readiness.isDependencyReady covers dependency edges only",
+    );
+    // The dependency answer itself is reported and correct: there is no
+    // dependency edge, so the set is complete and it is ready.
+    expect(res.body.readiness).toEqual({
+      allBlockersDone: true,
+      isDependencyReady: true,
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerCount: 0,
+    });
+
+    // The regression guard for the whole class: the answer the route reports is
+    // the answer the write path gives. If a future change makes the gate refuse
+    // this move, this assertion fails and `readiness` has to be reconsidered
+    // rather than quietly re-nulled.
+    const patch = await request(createApp(db, boardActor(company)))
+      .patch(`/api/issues/${root.id}`)
+      .send({ status: "in_progress", assigneeAgentId: agent.id });
+
+    expect(patch.status, JSON.stringify(patch.body)).toBe(200);
+    expect(patch.body.status).toBe("in_progress");
   });
 
   it("keeps readiness for a correctly blocked issue whose blockers are all projected", async () => {

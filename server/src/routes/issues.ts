@@ -1557,7 +1557,6 @@ function buildIssueBlockerDiagnosticsResponse(input: {
           reason: input.attention.reason,
           sampleBlockerIdentifier,
         };
-  const hasUnprojectedHold = unprojectedHold !== null && unprojectedHold.count > 0;
 
   const blockers: IssueBlockerDiagnosticNode[] = input.visibleBlockers.map(
     (blockerRow) => {
@@ -1581,23 +1580,30 @@ function buildIssueBlockerDiagnosticsResponse(input: {
     },
   );
 
-  // An unprojected hold makes the readiness answer partial, exactly as a
-  // truncated set or an authorization boundary does. Reporting
-  // `isDependencyReady: true` here is the specific defect: the write path
-  // refuses the move on the strength of a hold this object says does not
-  // exist, so the route is telling a reader to attempt something the server
-  // will reject.
-  const readiness: IssueBlockerDiagnosticsReadiness | null =
-    completeVisibleSet && !hasUnprojectedHold
-      ? {
-          allBlockersDone: input.readiness.allBlockersDone,
-          isDependencyReady: input.readiness.isDependencyReady,
-          unresolvedBlockerCount:
-            input.readiness.unresolvedBlockerIssueIds.length,
-          pendingFinalizeBlockerCount:
-            input.readiness.pendingFinalizeBlockerIssueIds.length,
-        }
-      : null;
+  // `readiness` answers one question: will the server refuse this transition on
+  // the strength of a first-class dependency edge? The write path's only
+  // blocker gate reads exactly those edges (`listIssueDependencyReadinessMap`,
+  // consumed by both the `in_progress` transition gate and the checkout gate), so
+  // the projection is complete for that question and the answer is reported
+  // whenever this actor can see the whole set. It is withheld only where the
+  // set itself is partial — truncated, or partly outside the authorization
+  // boundary.
+  //
+  // An unprojected hold does not suppress it. That hold is a real fact about
+  // the issue and is reported as `unprojectedHold` alongside, but the two
+  // answer different questions, and suppressing the first to protect the
+  // second withholds a correct answer: a tree-held issue has no dependency
+  // edge, so the write path accepts the move, and this route used to say
+  // nothing at all where the server had an answer.
+  const readiness: IssueBlockerDiagnosticsReadiness | null = completeVisibleSet
+    ? {
+        allBlockersDone: input.readiness.allBlockersDone,
+        isDependencyReady: input.readiness.isDependencyReady,
+        unresolvedBlockerCount: input.readiness.unresolvedBlockerIssueIds.length,
+        pendingFinalizeBlockerCount:
+          input.readiness.pendingFinalizeBlockerIssueIds.length,
+      }
+    : null;
   const reportedOmittedUnauthorizedBlockerCount = input.truncated
     ? null
     : omittedUnauthorizedBlockerCount;
@@ -1652,13 +1658,20 @@ function buildIssueBlockerDiagnosis(input: {
     const sample = input.unprojectedHold.sampleBlockerIdentifier
       ? ` One of them is ${input.unprojectedHold.sampleBlockerIdentifier}.`
       : "";
+    const singular = input.unprojectedHold.count === 1;
     return `${blockerDiagnosticLabel(
       input.issue,
     )} is blocked by ${input.unprojectedHold.count} hold${
-      input.unprojectedHold.count === 1 ? "" : "s"
+      singular ? "" : "s"
     } that ${
-      input.unprojectedHold.count === 1 ? "is" : "are"
-    } not first-class dependency edges, so they do not appear in the blocker list and readiness is not reported.${sample}`;
+      singular
+        ? "is not a first-class dependency edge"
+        : "are not first-class dependency edges"
+    }, so ${
+      singular ? "it does" : "they do"
+    } not appear in the blocker list; readiness.isDependencyReady covers dependency edges only and does not account for ${
+      singular ? "this hold" : "these holds"
+    }.${sample}`;
   }
   if (input.blockers.length === 0) {
     return input.issue.status === "blocked"

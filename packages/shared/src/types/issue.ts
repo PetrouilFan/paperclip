@@ -273,9 +273,14 @@ export interface IssueBlockerDiagnosticsResponse {
   issue: IssueBlockerDiagnosticIssueSummary;
   diagnosis: string | null;
   /**
-   * `null` when the answer would be partial — truncated, partly outside the
-   * actor's authorization, or carrying an unprojected hold. It is never
-   * `isDependencyReady: true` for an issue the write path refuses to move.
+   * Whether the server will refuse this transition on the strength of a
+   * first-class dependency edge — the question the `in_progress` transition
+   * gate and the checkout gate actually ask. `null` only when that answer would
+   * be partial because the blocker set itself is partial: truncated, or partly
+   * outside the actor's authorization.
+   *
+   * An `unprojectedHold` does not null this. The two answer different
+   * questions, and the hold is reported alongside as its own fact.
    */
   readiness: IssueBlockerDiagnosticsReadiness | null;
   blockers: IssueBlockerDiagnosticNode[];
