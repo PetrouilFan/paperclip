@@ -5172,6 +5172,56 @@ async function lastActivityStatsForIssues(
   return [...byIssueId.values()];
 }
 
+/**
+ * The blocker ids for each issue, straight off the relation rows.
+ *
+ * `blockedBy` stays behind the opt-in `includeBlockedBy` flag because a summary
+ * carries a joined issue row, a sort, and the terminal-blocker and
+ * scheduled-retry fan-out that goes with it. An id array is one indexed scan of
+ * `issue_relations` with no join at all, which is why this projection can back a
+ * field that is readable on every list response while the summaries cannot.
+ *
+ * Sorted by id so the same blocker set serializes identically everywhere, which
+ * is what lets the read path and the PATCH echo agree without a reconciliation
+ * step.
+ */
+async function blockedByIdsMapForIssues(
+  dbOrTx: any,
+  companyId: string,
+  issueIds: string[],
+): Promise<Map<string, string[]>> {
+  const map = new Map<string, string[]>();
+  const uniqueIssueIds = [...new Set(issueIds)];
+  for (const issueId of uniqueIssueIds) map.set(issueId, []);
+  if (uniqueIssueIds.length === 0) return map;
+
+  for (const issueIdChunk of chunkList(
+    uniqueIssueIds,
+    ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE,
+  )) {
+    const rows = await dbOrTx
+      .select({
+        currentIssueId: issueRelations.relatedIssueId,
+        blockerIssueId: issueRelations.issueId,
+      })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.relatedIssueId, issueIdChunk),
+        ),
+      );
+
+    for (const row of rows) {
+      map.get(row.currentIssueId)?.push(row.blockerIssueId);
+    }
+  }
+
+  for (const blockerIds of map.values()) blockerIds.sort();
+  return map;
+}
+
 async function blockedByMapForIssues(
   dbOrTx: any,
   companyId: string,
@@ -7459,17 +7509,28 @@ export function issueService(db: Db) {
     companyId: string,
     rows: T[],
     dbOrTx: DbReader = db,
-  ): Promise<Array<T & IssueRelationSummaryMap>> {
+  ): Promise<Array<T & IssueRelationSummaryMap & { blockedByIssueIds: string[] }>> {
     if (rows.length === 0) return [];
     const relationMap = await getIssueRelationSummaryMap(
       companyId,
       rows.map((row) => row.id),
       dbOrTx,
     );
-    return rows.map((row) => ({
-      ...row,
-      ...(relationMap.get(row.id) ?? { blockedBy: [], blocks: [] }),
-    }));
+    return rows.map((row) => {
+      const relations = relationMap.get(row.id) ?? {
+        blockedBy: [],
+        blocks: [],
+      };
+      return {
+        ...row,
+        ...relations,
+        // Same relation rows `blockedBy` summarizes, reduced to ids and sorted
+        // by id so this matches blockedByIdsMapForIssues on the read path.
+        blockedByIssueIds: relations.blockedBy
+          .map((blocker) => blocker.id)
+          .sort(),
+      };
+    });
   }
 
   async function assertNoBlockingCycles(
@@ -8198,6 +8259,7 @@ export function issueService(db: Db) {
         lastActivityRows,
         archiveRows,
         blockedByMap,
+        blockedByIdsMap,
         liveDescendantCountByIssueId,
       ] = await Promise.all([
         contextUserId
@@ -8213,6 +8275,10 @@ export function issueService(db: Db) {
         includeBlockedBy
           ? blockedByMapForIssues(db, companyId, issueIds)
           : Promise.resolve(new Map<string, IssueRelationIssueSummary[]>()),
+        // Unconditional: a write-only `blockedByIssueIds` reads as "no blocker"
+        // for every ticket, which is how a blocked issue with a real blocker
+        // gets reported as a rule-3 violation. See blockedByIdsMapForIssues.
+        blockedByIdsMapForIssues(db, companyId, issueIds),
         includeLiveDescendantSummary
           ? liveDescendantCountMapForIssues(db, companyId, issueIds)
           : Promise.resolve(new Map<string, number>()),
@@ -8252,6 +8318,7 @@ export function issueService(db: Db) {
             ...(includeBlockedBy
               ? { blockedBy: blockedByMap.get(row.id) ?? [] }
               : {}),
+            blockedByIssueIds: blockedByIdsMap.get(row.id) ?? [],
             lastActivityAt,
             ...(blockerAttentionByIssueId.has(row.id)
               ? { blockerAttention: blockerAttentionByIssueId.get(row.id) }
@@ -8295,6 +8362,7 @@ export function issueService(db: Db) {
           ...(includeBlockedBy
             ? { blockedBy: blockedByMap.get(row.id) ?? [] }
             : {}),
+          blockedByIssueIds: blockedByIdsMap.get(row.id) ?? [],
           lastActivityAt,
           ...(blockerAttentionByIssueId.has(row.id)
             ? { blockerAttention: blockerAttentionByIssueId.get(row.id) }
@@ -11251,10 +11319,34 @@ export function issueService(db: Db) {
           }
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
+        // Closing a liveness escalation drops the edge it raised, below. The
+        // echo has to be computed with that in mind or the response and the
+        // receipt name a blocker the transaction is removing.
+        const livenessBlockerRelease =
+          (issueData.status === "done" ||
+            issueData.status === "cancelled") &&
+          existing.status !== issueData.status &&
+          existing.originKind === RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation
+            ? (() => {
+                const parsedIncident = parseIssueGraphLivenessIncidentKey(
+                  existing.originId,
+                );
+                return parsedIncident?.issueId &&
+                  parsedIncident.companyId === existing.companyId
+                  ? parsedIncident.issueId
+                  : null;
+              })()
+            : null;
         const nextBlockedByIssueIds =
           blockedByIssueIds === undefined
             ? undefined
-            : [...new Set(blockedByIssueIds)].sort();
+            : [...new Set(blockedByIssueIds)]
+                .filter(
+                  (candidate) =>
+                    livenessBlockerRelease === null ||
+                    candidate !== livenessBlockerRelease,
+                )
+                .sort();
         const changes = buildIssueChanges(
           receiptExisting as unknown as Record<string, unknown>,
           updated as unknown as Record<string, unknown>,
@@ -11281,30 +11373,17 @@ export function issueService(db: Db) {
               : {}),
           },
         );
-        if (
-          (issueData.status === "done" || issueData.status === "cancelled") &&
-          existing.status !== issueData.status &&
-          existing.originKind ===
-            RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation
-        ) {
-          const parsedIncident = parseIssueGraphLivenessIncidentKey(
-            existing.originId,
-          );
-          if (
-            parsedIncident?.issueId &&
-            parsedIncident.companyId === existing.companyId
-          ) {
-            await tx
-              .delete(issueRelations)
-              .where(
-                and(
-                  eq(issueRelations.companyId, existing.companyId),
-                  eq(issueRelations.issueId, existing.id),
-                  eq(issueRelations.relatedIssueId, parsedIncident.issueId),
-                  eq(issueRelations.type, "blocks"),
-                ),
-              );
-          }
+        if (livenessBlockerRelease) {
+          await tx
+            .delete(issueRelations)
+            .where(
+              and(
+                eq(issueRelations.companyId, existing.companyId),
+                eq(issueRelations.issueId, existing.id),
+                eq(issueRelations.relatedIssueId, livenessBlockerRelease),
+                eq(issueRelations.type, "blocks"),
+              ),
+            );
         }
         if (
           actorUserId &&
