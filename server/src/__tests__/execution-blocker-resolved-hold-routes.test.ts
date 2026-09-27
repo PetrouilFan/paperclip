@@ -29,6 +29,13 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
  * can still be the hold. These tests assert they agree: when they disagree the
  * issue is refused a run by a recovery action that no read surface names, and the
  * payload reports no owner and nothing to inspect.
+ *
+ * The file name carries the `-routes` suffix on purpose. Each test starts its own
+ * embedded Postgres, and the stable runner puts a file in the serialized shard
+ * when its name matches the route-test pattern. Without the suffix this file runs
+ * in the general shard alongside other embedded-Postgres suites, and
+ * `startEmbeddedPostgresTestDatabase` starts losing the race for its 30s hook
+ * budget - measured here as a hook timeout with every assertion passing.
  */
 describeEmbeddedPostgres("resolved recovery bookkeeping that still holds execution", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;

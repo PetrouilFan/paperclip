@@ -211,6 +211,21 @@ export function projectExecution(
   };
   const set = (phase: ExecutionProjection["phase"], label: string) =>
     Object.assign(projection, { phase, label });
+  /**
+   * A projection that leaves this here is a hold the board owns, and the payload
+   * has to say so. `recovery_needed` is reached by more than one branch, and a
+   * caller reads `recoveryOwner` and `permittedActions` to decide whether to offer
+   * a recovery affordance at all. Stating the owner and the affordance once keeps
+   * a new branch from arriving with a hold and no owner, which is the defect this
+   * projection had.
+   */
+  const held = (label: string) => {
+    projection.recoveryOwner = "board";
+    if (!projection.permittedActions.includes("inspect_recovery")) {
+      projection.permittedActions.push("inspect_recovery");
+    }
+    return set("recovery_needed", label);
+  };
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
     projection.nextAction = recoveryAction.nextAction;
@@ -228,12 +243,10 @@ export function projectExecution(
     // still counts it as a hold, this projection has to name an owner and permit
     // recovery inspection too, or the payload reports no owner and nothing to
     // inspect for an issue dispatch is refusing to move.
-    if (recoveryAction.id && holdingActionIds.has(recoveryAction.id)) {
-      projection.recoveryOwner = "board";
-      projection.permittedActions.push("inspect_recovery");
-    }
     // Diagnostic projection only: no user decision or replay affordance.
-    return set("recovery_needed", "Stopped");
+    return holdingActionIds.has(recoveryAction.id ?? "")
+      ? held("Stopped")
+      : set("recovery_needed", "Stopped");
   }
   if (
     recoveryAction?.status === "resolved" &&
@@ -308,7 +321,6 @@ export function projectExecution(
         "Checking that the previous provider stopped and its action outcomes are known before continuing.";
       return set("reconnecting", "Checking recovery");
     }
-    projection.recoveryOwner = "board";
     projection.cause =
       recoveryAction?.cause ??
       text(detail.replacementDenied) ??
@@ -317,8 +329,7 @@ export function projectExecution(
     if (cleanupQuarantined && !projection.nextAction) {
       projection.nextAction = "Verify the stopped session and its saved work before starting a new attempt.";
     }
-    projection.permittedActions.push("inspect_recovery");
-    return set("recovery_needed", "Recovery needed");
+    return held("Recovery needed");
   }
   if (run.status === "succeeded") {
     if (pending.length)
