@@ -176,14 +176,22 @@ describeEmbeddedPostgres("checkout cannot self-authorize the in_review edge", ()
   it("refuses even when in_review is the only status the caller named", async () => {
     // The all-filtered case must still be a conflict on the issue, not a
     // malformed-request error: the caller named a real status and the refusal
-    // is about authority, not about the shape of the request.
+    // is about authority, not about the shape of the request. The row *is*
+    // in_review here, so the specific refusal and its remediation are the
+    // honest answer.
     const { companyId, agentId, issueId, runId } = await seed("in_review");
 
-    await expect(
-      svc.checkout(issueId, agentId, ["in_review"], runId),
-    ).rejects.toMatchObject({
+    const error = await svc
+      .checkout(issueId, agentId, ["in_review"], runId)
+      .then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+
+    expect(error).toMatchObject({
       status: 409,
       message: "Issue checkout conflict",
+      details: expect.objectContaining({ code: "in_review_not_claimable" }),
     });
     expect(await readRow(issueId)).toMatchObject({
       status: "in_review",
@@ -191,6 +199,96 @@ describeEmbeddedPostgres("checkout cannot self-authorize the in_review edge", ()
       executionRunId: null,
     });
     expect(companyId).toBeTruthy();
+  });
+
+  it("does not claim in_review_not_claimable when the row is not in_review", async () => {
+    // Naming `in_review` as the only expected status says nothing about the
+    // row, and the guard that empties the list runs before the row is read. So
+    // against a `todo`, unassigned, unlocked issue -- a perfectly claimable one
+    // that pre-#143 this request claimed -- the refusal used to be built from
+    // the request and claim a review disposition the issue does not have, then
+    // advise the caller to PATCH a task that is not parked. The conflict has to
+    // answer from the row instead.
+    const { agentId, issueId, runId } = await seed("todo");
+
+    const error = await svc
+      .checkout(issueId, agentId, ["in_review"], runId)
+      .then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+
+    expect(error).toMatchObject({
+      status: 409,
+      message: "Issue checkout conflict",
+    });
+    // Reports the row, not the request.
+    expect((error as { details?: { status?: string } }).details).toMatchObject({
+      issueId,
+      status: "todo",
+    });
+    expect((error as { details?: { code?: string } }).details?.code).toBeUndefined();
+    expect((error as { details?: { remediation?: string } }).details?.remediation)
+      .toBeUndefined();
+    expect(await readRow(issueId)).toMatchObject({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    expect(agentId).toBeTruthy();
+  });
+
+  it("keeps the specific refusal when the named list holds a claimable status too", async () => {
+    // The wart above is narrow: it needs `in_review` as the *sole* named
+    // status. With anything else in the list the update is well-formed, so this
+    // already behaved correctly -- the control for the test above, so a future
+    // change cannot make the guard fire on the documented default either.
+    const { agentId, issueId, runId } = await seed("in_review");
+
+    const error = await svc
+      .checkout(issueId, agentId, DOCUMENTED_AGENT_DEFAULT, runId)
+      .then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+
+    expect(error).toMatchObject({
+      status: 409,
+      details: expect.objectContaining({ code: "in_review_not_claimable" }),
+    });
+    expect(agentId).toBeTruthy();
+  });
+
+  it("tells a bound or human caller to PATCH and an unbound agent to use the review path", async () => {
+    // The PATCH is only reachable for a board member or a run already working
+    // on this issue. For an agent that is not bound to it, the PATCH is a
+    // cross-issue write -- and the 403 that stops it also rules out binding the
+    // run to the issue instead, because claiming moves it to in_progress. So a
+    // single unconditional "PATCH it" is advice with no route behind it, and
+    // the refusal names both routes by who can follow them.
+    const { agentId, issueId, runId } = await seed("in_review");
+
+    const error = await svc
+      .checkout(issueId, agentId, ["in_review"], runId)
+      .then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+    const remediation = (error as { details?: { remediation?: string } }).details
+      ?.remediation ?? "";
+
+    expect(remediation).toContain("review-path disposition");
+    expect(remediation).toContain("PATCH the status to in_progress");
+    // The PATCH route is scoped to who can actually make the call.
+    expect(remediation).toContain("board action");
+    expect(remediation).toContain("already working on");
+    // And the unbound-agent route is the review path, not a state change.
+    expect(remediation).toContain("cross-issue");
+    expect(remediation).toContain("review artifact resolved");
+    // The refusal must not tell the run to claim its way in; that is the
+    // sibling copy's explicit "do not bind this run to another task".
+    expect(remediation).not.toMatch(/check\s?out (the|this) issue/i);
+    expect(agentId).toBeTruthy();
   });
 
   it("still crosses the edge for a server-derived authorization", async () => {

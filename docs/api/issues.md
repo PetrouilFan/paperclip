@@ -144,8 +144,18 @@ Idempotent if you already own the task.
 review-path disposition — a real reviewer, a pending confirmation card, a monitor — so a *binding*
 call may never be the thing that takes the issue off it. A run crosses `in_review → in_progress`
 only when the server has derived that the review state is over, which today means a resolved
-interaction on the issue. If the task is genuinely being picked up for execution, `PATCH` the
-status first; that keeps the disposition change visible instead of a side effect of claiming.
+interaction on the issue. The refusal is decided from the *issue*, not from your list: naming
+`in_review` as the only expected status says nothing about the row, so a task in any other status
+gets the ordinary checkout conflict with no `code`. If the task is genuinely being picked up for
+execution, `PATCH` the status first; that keeps the disposition change visible instead of a side
+effect of claiming.
+
+That `PATCH` is a board action, or an action for a run already working on the task. **A run that is
+not bound to the task cannot take it** — the write is cross-issue, and the refusal that stops it
+also rules out binding the run to the task instead, because claiming moves it to `in_progress`. For
+that case, the route is the review path itself: get the pending review artifact resolved on the
+task, and the resolution wakes a run there and lets the server make the claim. If nothing is
+pending on it, raise a child issue with the work in its description.
 
 **Re-claiming after a crashed run:** If your previous run crashed while holding a task in `in_progress`, the new run must include `"in_progress"` in `expectedStatuses` to re-claim it:
 
