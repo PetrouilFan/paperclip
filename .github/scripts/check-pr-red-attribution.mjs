@@ -18,6 +18,14 @@
  * Export: attributeFailures(ownTests, baseTests) → { passed, own, inherited, fixed, failures }
  * Export: selectBaselineForJobs(runs, jobsByRun, requiredKeys) → { run, matchedJobs } | { run: null, reason }
  * Export: jobKey(name) → the comparable part of a job name
+ * Export: headRunVerdict(run) → 'success' | 'failure' | 'pending' | 'no-verdict'
+ * Export: headJobVerdict(job) → 'success' | 'failure' | 'skipped' | 'no-verdict'
+ * Export: partitionLaneJobs(jobs, runId) → { failed, unmeasured }
+ *
+ * `HEAD_RUN_ID` narrows the head side to one run's jobs — the pull-request
+ * lane's own, named by the `red_attribution` job in pr-trusted.yml. Unset, the
+ * head side is every workflow on the commit, which is what a human running this
+ * by hand wants.
  */
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -160,6 +168,57 @@ export function selectBaselineForJobs(runs, jobsByRun, requiredKeys) {
   };
 }
 
+/**
+ * Conclusions that answer the question on the head side, at run granularity.
+ *
+ * `success` and `failure` are the only two answers. `queued` and `in_progress`
+ * have not run yet; `cancelled`, `timed_out` and `skipped` stopped partway or
+ * never started. None of those is evidence that the pull request's tests passed,
+ * and reading one of them as a pass hands a red pull request a green attribution
+ * verdict — the same defect as a missing baseline, arrived at from the other
+ * direction. `no-verdict` is its own bucket so the caller can name the run that
+ * did not answer rather than fold it into a success.
+ */
+export function headRunVerdict(run) {
+  if (run.status !== 'completed') return 'pending';
+  return BASELINE_CONCLUSIONS.has(run.conclusion) ? run.conclusion : 'no-verdict';
+}
+
+/**
+ * Conclusions that answer the question on the head side, at job granularity.
+ *
+ * The gate job runs *inside* the pull-request lane's run, so the run's own status
+ * is `in_progress` throughout and carries no information — every job it depends
+ * on has settled, and those are the evidence. The unit that matters is the job.
+ *
+ * `skipped` is a verdict here even though it is not one at run level: a lane the
+ * lane itself switched off — the test matrix on a middle pull request in a stack
+ * — is the designed state, and `verify` is what asserts it. A lane that was
+ * `cancelled` or timed out is a different thing: it stopped partway, so it
+ * measured nothing, and treating its silence as a pass is the defect this whole
+ * tool exists to remove. Note that a job still going reports an empty
+ * conclusion, not a missing one, so it lands here too.
+ */
+const HEAD_JOB_VERDICTS = new Set(['success', 'failure', 'skipped']);
+
+export function headJobVerdict(job) {
+  return HEAD_JOB_VERDICTS.has(job.conclusion) ? job.conclusion : 'no-verdict';
+}
+
+/**
+ * Partition the pull-request lane's own jobs into what can be attributed and
+ * what never reported.
+ *
+ * `failed` carries the run id alongside each job because the base comparison and
+ * the log fetch are both addressed to the run, not to the job.
+ */
+export function partitionLaneJobs(jobs, runId) {
+  return {
+    failed: jobs.filter(j => headJobVerdict(j) === 'failure').map(j => ({ ...j, runId })),
+    unmeasured: jobs.filter(j => headJobVerdict(j) === 'no-verdict'),
+  };
+}
+
 function completedRunsOn(sha) {
   return JSON.parse(gh(['run', 'list', '--commit', sha, '--limit', '20', '--json', 'databaseId,conclusion,status']));
 }
@@ -193,28 +252,86 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const base = resolveBaseSha(prNumber);
   const head = JSON.parse(gh(['pr', 'view', String(prNumber), '--json', 'headRefOid'])).headRefOid;
 
-  const headRuns = completedRunsOn(head);
-  const failingHeadRuns = headRuns.filter(r => r.status === 'completed' && r.conclusion === 'failure');
-  const pendingHeadRuns = headRuns.filter(r => r.status !== 'completed');
+  // Two reads of the head side, one per caller, and the caller says which.
+  //
+  // The gate job runs *inside* the pull-request lane's own run, so that run is
+  // `in_progress` for as long as the gate is looking at it and its status says
+  // nothing; the unit that carries evidence is the job, and every job the gate
+  // depends on has already settled. `HEAD_RUN_ID` names that run.
+  //
+  // Unset is the hand-run path, where every workflow on the head is in scope: a
+  // human reading the JSON wants the whole picture and is the one deciding what
+  // to compare. The scope difference is also why the strict no-verdict rule below
+  // applies only to the named run — in the unscoped path this list would hold
+  // `Storybook Visual`, which is `skipped` on nearly every pull request here.
+  const laneRunId = process.env.HEAD_RUN_ID;
+  const laneScoped = laneRunId !== undefined && String(laneRunId).trim() !== '';
+  const lane = laneScoped ? partitionLaneJobs(jobsOf(laneRunId), Number(laneRunId)) : null;
 
-  if (headRuns.length === 0) {
+  const headRuns = laneScoped ? [] : completedRunsOn(head);
+  const failingHeadRuns = headRuns.filter(r => headRunVerdict(r) === 'failure');
+  const pendingHeadRuns = headRuns.filter(r => headRunVerdict(r) === 'pending');
+  // Reported, not failed on. In this scope a completed-but-cancelled run is
+  // usually some other workflow's, and the hand-run path has no way to tell
+  // which — so it is named in the JSON and the reader decides. The gate's own
+  // path has no such ambiguity, which is why `unmeasuredJobs` above can be a
+  // failure.
+  const noVerdictHeadRuns = headRuns.filter(r => headRunVerdict(r) === 'no-verdict');
+
+  // The failed jobs to attribute, each carrying the run its log is read from.
+  const failedJobs = lane
+    ? lane.failed
+    : failingHeadRuns.flatMap(run =>
+        jobsOf(run.databaseId)
+          .filter(j => j.conclusion === 'failure')
+          .map(j => ({ ...j, runId: run.databaseId })));
+
+  // Evidence the lane never produced. A lane that was cancelled or timed out
+  // measured nothing, and its silence is not a green lane. This is the same rule
+  // the base side applies through `selectBaselineForJobs`, arrived at from the
+  // head: a comparison that cannot be made is reported, never assumed.
+  const unmeasuredJobs = lane ? lane.unmeasured : [];
+
+  // In lane mode the run being read is itself the red one, so `redRuns` names it
+  // rather than reporting an empty list beside a non-empty `own`, which would be
+  // a report that contradicts itself. The run's own `conclusion` is not asked
+  // for: it is `in_progress` for as long as this job is reading it.
+  const redRuns = () =>
+    lane && failedJobs.length > 0
+      ? [{ run: Number(laneRunId), conclusion: 'failure' }]
+      : failingHeadRuns.map(r => ({ run: r.databaseId, conclusion: r.conclusion }));
+
+  const unmeasuredFailures = unmeasuredJobs.map(
+    job =>
+      `Lane job \`${job.name}\` finished \`${job.conclusion || 'in_progress'}\`, which reports nothing about whether ` +
+      `the tests passed. A lane that stopped partway is not a green lane, and a green lane is the strongest ` +
+      `evidence there is. This is NOT a pass — re-run CI, or read that job before merging.`
+  );
+
+  if (!laneScoped && headRuns.length === 0) {
     console.log(JSON.stringify({ passed: false, failures: [`No completed CI run found for PR head ${head}.`] }));
     process.exit(1);
   }
 
-  if (failingHeadRuns.length === 0) {
-    // Every completed run on this head is green, so there is nothing to attribute.
-    // This is a pass, and it is reported as one rather than as "nothing found",
-    // which is a different claim. A run still going is not a pass: the checks
-    // that would catch the failure have not reported yet.
-    const pendingNote = pendingHeadRuns.length > 0
-      ? [`${pendingHeadRuns.length} run(s) on this head are still going, so this verdict covers only the runs that have finished. This is NOT a pass.`]
-      : [];
+  if (failedJobs.length === 0) {
+    // Nothing in scope is red, so there is nothing to attribute. This is a pass,
+    // and it is reported as one rather than as "nothing found", which is a
+    // different claim. A run still going is not a pass: the checks that would
+    // catch the failure have not reported yet.
+    const pendingNote = [
+      ...(pendingHeadRuns.length > 0
+        ? [`${pendingHeadRuns.length} run(s) on this head are still going, so this verdict covers only the runs that have finished. This is NOT a pass.`]
+        : []),
+      ...unmeasuredFailures,
+    ];
     console.log(JSON.stringify({
       head,
-      redRuns: [],
+      laneRun: laneScoped ? Number(laneRunId) : null,
+      redRuns: redRuns(),
       completedRuns: headRuns.length,
       pendingRuns: pendingHeadRuns.length,
+      unmeasuredJobs: unmeasuredJobs.map(j => ({ job: j.name, conclusion: j.conclusion })),
+      noVerdictRuns: noVerdictHeadRuns.map(r => ({ run: r.databaseId, conclusion: r.conclusion })),
       baseJobsCompared: [],
       own: [],
       inherited: [],
@@ -234,7 +351,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const own = new Set();
   const inherited = new Set();
   const fixed = new Set();
-  const failures = [];
+  const failures = [...unmeasuredFailures];
   const comparedJobs = [];
   const derivedOnlyJobs = [];
   const unattributableJobs = [];
@@ -252,39 +369,40 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     return baseTestsByRun.get(runId);
   };
 
-  for (const headRun of failingHeadRuns) {
-    for (const job of jobsOf(headRun.databaseId).filter(j => j.conclusion === 'failure')) {
-      const key = jobKey(job.name);
-      const jobFailures = failingTestsOfJob(headRun.databaseId, job.databaseId);
+  for (const job of failedJobs) {
+    const key = jobKey(job.name);
+    const jobFailures = failingTestsOfJob(job.runId, job.databaseId);
 
-      if (jobFailures.size === 0) {
-        // A fan-in, or a gate such as the quality-gate check, that failed
-        // without reporting a test of its own. It is red because something it
-        // consumed or evaluated is red, so it carries no test evidence either
-        // way and demanding a baseline for it would refuse every attribution on
-        // a repository that has one. Named in the output rather than dropped.
-        derivedOnlyJobs.push(job.name);
-        continue;
-      }
-
-      const { run: baseRun, reason } = selectBaselineForJobs(baseRuns, jobsByRun, [key]);
-      if (!baseRun) {
-        unattributableJobs.push(job.name);
-        failures.push(
-          `Failed job \`${job.name}\` reported ${jobFailures.size} failing test(s), and ${reason} ` +
-          `This is NOT a pass — compare that job by hand before merging.`
-        );
-        for (const test of jobFailures) own.add(test);
-        continue;
-      }
-
-      comparedJobs.push({ job: job.name, baseRun: baseRun.databaseId, baseConclusion: baseRun.conclusion });
-      const result = attributeFailures(jobFailures, baseTestsFor(baseRun.databaseId), { baselineAvailable: true });
-      for (const test of result.own) own.add(test);
-      for (const test of result.inherited) inherited.add(test);
-      for (const test of result.fixed) fixed.add(test);
-      for (const failure of result.failures) failures.push(`${job.name}: ${failure}`);
+    if (jobFailures.size === 0) {
+      // A fan-in, or a gate such as the quality-gate check, that failed
+      // without reporting a test of its own. It is red because something it
+      // consumed or evaluated is red, so it carries no test evidence either
+      // way and demanding a baseline for it would refuse every attribution on
+      // a repository that has one. Named in the output rather than dropped.
+      derivedOnlyJobs.push(job.name);
+      continue;
     }
+
+    const { run: baseRun, reason } = selectBaselineForJobs(baseRuns, jobsByRun, [key]);
+    if (!baseRun) {
+      unattributableJobs.push(job.name);
+      // `reason` is already a whole sentence that ends in its own "This is NOT
+      // a pass" and the action to take, so nothing is appended to it. A gate
+      // check's output is read by a person deciding whether to merge, and the
+      // same instruction twice reads as two findings.
+      failures.push(
+        `Failed job \`${job.name}\` reported ${jobFailures.size} failing test(s), and ${reason}`
+      );
+      for (const test of jobFailures) own.add(test);
+      continue;
+    }
+
+    comparedJobs.push({ job: job.name, baseRun: baseRun.databaseId, baseConclusion: baseRun.conclusion });
+    const result = attributeFailures(jobFailures, baseTestsFor(baseRun.databaseId), { baselineAvailable: true });
+    for (const test of result.own) own.add(test);
+    for (const test of result.inherited) inherited.add(test);
+    for (const test of result.fixed) fixed.add(test);
+    for (const failure of result.failures) failures.push(`${job.name}: ${failure}`);
   }
 
   if (own.size === 0 && inherited.size === 0 && failures.length === 0) {
@@ -296,8 +414,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 
   console.log(JSON.stringify({
     head,
-    redRuns: failingHeadRuns.map(r => ({ run: r.databaseId, conclusion: r.conclusion })),
+    laneRun: laneScoped ? Number(laneRunId) : null,
+    redRuns: redRuns(),
     pendingRuns: pendingHeadRuns.length,
+    unmeasuredJobs: unmeasuredJobs.map(j => ({ job: j.name, conclusion: j.conclusion })),
+    noVerdictRuns: noVerdictHeadRuns.map(r => ({ run: r.databaseId, conclusion: r.conclusion })),
     baseJobsCompared: comparedJobs,
     derivedOnlyJobs,
     unattributableJobs,

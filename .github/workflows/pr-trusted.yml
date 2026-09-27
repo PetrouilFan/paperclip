@@ -1328,3 +1328,98 @@ jobs:
               exit 1
               ;;
           esac
+
+  red_attribution:
+    # "Is this red mine or inherited", answered by a check on the commit instead
+    # of by whichever reviewer happens to be awake.
+    #
+    # On 2026-09-27 `Cloud readiness` was red on one assertion in a UI test for
+    # about fifty minutes, and `verify`'s `needs:` list with `if: always()` handed
+    # that red to six pull requests whose branches did not touch `ui/` at all.
+    # Nothing was wrong with those branches, so nothing in their logs said so —
+    # the only way to tell was to notice the failing file was absent from the
+    # diff, which is a thing a person does while tired and not at all a thing a
+    # merge button can see. This fork has no branch protection, so a green check
+    # beside a red `verify` is the only place that distinction can live.
+    #
+    # It waits on every lane rather than on `verify`, because `verify`'s own list
+    # does not include the serialized-server, canary or e2e lanes: a gate that
+    # started while those were still going would see their jobs with no
+    # conclusion and would have to call its own evidence incomplete.
+    #
+    # It is not in `verify`'s needs. `verify` already goes red on an inherited
+    # red, and folding this in would hide the one thing worth seeing: `verify`
+    # red and this green, side by side on the same commit.
+    name: Red attribution (own or inherited)
+    if: ${{ always() }}
+    needs:
+      - gate
+      - policy
+      - typecheck_release_registry
+      - general_tests
+      - verify_paperclip_runner
+      - build
+      - docker_context_integrity
+      - verify_serialized_server
+      - canary_dry_run
+      - e2e_shards
+    # ubuntu-latest rather than the fleet runner: this job is a handful of `gh`
+    # API reads and needs the GitHub CLI, which the `gate` job relies on and the
+    # fleet lanes have never been asked for. Keep it on the image that is known
+    # to have it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # The merge tree, not the base. This workflow file comes from the pull
+      # request too, so a pull request could drop this job or neuter the step
+      # below outright; checking out the base for the script alone would defend
+      # the wrong half of that. The gate's integrity rests on `.github/**` being
+      # CODEOWNERS-reviewed, which is the assumption the `policy` lane already
+      # makes about every other check in this file.
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Attribute the red to the pull request or the base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Pinned rather than inferred from the checkout's `origin`, so the tool
+          # cannot quietly audit a different repository than this workflow ran
+          # on if that remote is ever absent or rewritten.
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # This run. The tool reads the lane's own jobs, every one of which has
+          # settled by the time this job starts, instead of every workflow on the
+          # head: a review bot or an image build reports no failing test, and
+          # reading its red as a test failure would make this gate red for a
+          # reason that has nothing to do with the tests.
+          HEAD_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          verdict="$(node .github/scripts/check-pr-red-attribution.mjs)"
+          status=$?
+          printf '%s\n' "$verdict" | tee red-attribution.json
+          printf '%s\n' "$verdict" | jq -R 'fromjson? | .failures[]?' | sed 's/^/  - /' || true
+
+          # `passed` is the tool's own verdict and this job's exit code is not
+          # taken on trust from the tool's exit status alone: a crash, a changed
+          # output shape, or a truncated report has to read as a failure here. A
+          # check that cannot say what it found must not be readable as saying
+          # there is nothing to find — that is the same defect as an inherited
+          # red read as an own one, one level up.
+          if ! jq -e 'has("passed")' red-attribution.json >/dev/null 2>&1; then
+            echo '::error title=Red attribution::the attribution tool reported no verdict; this is not a pass'
+            exit 1
+          fi
+
+          own="$(jq '.own | length' red-attribution.json)"
+          inherited="$(jq '.inherited | length' red-attribution.json)"
+          if [ "$own" -eq 0 ] && [ "$inherited" -gt 0 ]; then
+            echo "::notice title=Red attribution::every red on this pull request is on the base commit too. $inherited inherited, 0 own."
+          else
+            echo "::notice title=Red attribution::$own own, $inherited inherited."
+          fi
+          exit "$status"
