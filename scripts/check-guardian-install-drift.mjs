@@ -337,7 +337,7 @@ const INSTALLED_REMEDY = {
   absent:
     "reinstall the committed guardian over it: cp scripts/paperclip-unit-guardian.sh ~/.local/bin/paperclip-unit-guardian.sh && chmod +x ~/.local/bin/paperclip-unit-guardian.sh",
   stubbed:
-    "the install is not the guardian. Restore it from the committed copy (cp scripts/paperclip-unit-guardian.sh ~/.local/bin/ && chmod +x); the preserved original, if one exists, is evidence, not a source",
+    "the install is not the guardian. If it was disabled on purpose, the guardian documents two first-class ways to do that and neither of them is replacing the script: touch ~/.local/state/paperclip-unit-guardian/PAUSE, or systemctl --user disable --now paperclip-unit-guardian.timer. Anything else is an unrecoverable silent degradation, and restoring it is cp scripts/paperclip-unit-guardian.sh ~/.local/bin/ && chmod +x. A preserved .real-* file next to it is evidence, not a source",
   altered:
     "the two disagree and this check does not say which is right: a one-character host fix that was never pushed looks exactly like a tamper. Diff them, decide which side is authoritative, and make the other one match",
 };

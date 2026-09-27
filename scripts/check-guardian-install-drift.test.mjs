@@ -422,8 +422,19 @@ test("the stub finding says presence would have passed, and gives a remedy", () 
     const report = { installed: guardian, goldenSet, ...summarize({ installed: guardian, goldenSet }) };
     const text = formatReport(report);
     assert.match(text, /A presence check passes on this\. Only content does not\./);
-    assert.match(text, /Restore it from the committed copy/);
+    assert.match(text, /restoring it is cp scripts\/paperclip-unit-guardian\.sh ~\/\.local\/bin\/ && chmod \+x/);
     assert.match(text, /presence, mtime, size and ownership were all true of the/i);
+    // The remedy has to name the guardian's own escape hatches before it tells
+    // anyone to overwrite the file, or a reader who disabled the guardian on
+    // purpose is told to undo their own decision. Found by running this check
+    // against a host where the stub is a deliberate `disable --now`.
+    assert.match(text, /If it was disabled on purpose/);
+    assert.match(text, /touch ~\/\.local\/state\/paperclip-unit-guardian\/PAUSE/);
+    assert.match(text, /systemctl --user disable --now paperclip-unit-guardian\.timer/);
+    // The escape hatches the remedy names must be the ones the committed guardian
+    // actually documents, or the remedy is inventing an escape.
+    assert.match(committed, /touch ~\/\.local\/state\/paperclip-unit-guardian\/PAUSE/);
+    assert.match(committed, /systemctl --user disable --now paperclip-unit-guardian\.timer/);
     // One finding, and it names the install, so the operator knows which file.
     assert.equal(report.findings.length, 1);
     assert.equal(report.findings[0].state, "stubbed");
