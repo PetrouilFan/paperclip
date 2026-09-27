@@ -97,7 +97,7 @@ head_ "B. wrapped in a throwaway unit the send is allowed and lands there"
 systemd-run --user --no-block --unit="$UNIT" --property=Type=exec --property=NotifyAccess=all \
   /bin/bash -c "'$PROBE' info >'$OUT/inner-info.txt' 2>&1;
                 '$PROBE' guard '$SOCK' >'$OUT/inner-guard.txt' 2>&1; echo \$? >'$OUT/inner-guard.rc';
-                '$PROBE' notify '$SOCK' 'STATUS=pet626-proof-ok' >'$OUT/inner-notify.txt' 2>&1; echo \$? >'$OUT/inner-notify.rc';
+                '$PROBE' notify '$SOCK' 'STATUS=pc-probe-proof-ok' >'$OUT/inner-notify.txt' 2>&1; echo \$? >'$OUT/inner-notify.rc';
                 '$PROBE' notify '$SOCK' 'STOPPING=1' >'$OUT/inner-stopping.txt' 2>&1; echo \$? >'$OUT/inner-stopping.rc';
                 sleep 12" >/dev/null 2>&1
 
@@ -129,10 +129,10 @@ fi
 
 sleep 1
 GOT="$(systemctl --user show "$UNIT.service" -p StatusText --value)"
-if [ "$GOT" = "pet626-proof-ok" ]; then
+if [ "$GOT" = "pc-probe-proof-ok" ]; then
   ok "the datagram landed on the throwaway unit (StatusText=$GOT)"
 else
-  bad "the throwaway unit's StatusText is '$GOT', expected pet626-proof-ok"
+  bad "the throwaway unit's StatusText is '$GOT', expected pc-probe-proof-ok"
 fi
 
 if [ "$(cat "$OUT/inner-stopping.rc" 2>/dev/null)" = "1" ] && grep -q 'STOPPING' "$OUT/inner-stopping.txt"; then

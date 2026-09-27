@@ -17,7 +17,11 @@
 #
 #   # a STATUS= datagram written from that run process:
 #   $ systemctl --user show paperclipai.service -p StatusText
-#   StatusText=pet609-baseline-20260927T075332Z
+#   StatusText=<the exact marker this run had just sent>
+#
+# The marker is elided because its value is not the point: what the line
+# shows is that the text we sent is the text the unit now reports, from a
+# process that had no business sending it.
 #
 # STATUS= is the cheapest datagram there is and it already lands. STOPPING=1 is
 # the same socket, the same cgroup and the same access check, so "I only sent the
