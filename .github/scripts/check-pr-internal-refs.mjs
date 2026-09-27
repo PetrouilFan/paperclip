@@ -84,8 +84,8 @@
  * - **Not the compact form, anywhere.** `fix/SHA256-digest` is a perfectly good
  *   branch name and nothing structural separates it from `fix/task482-thing`,
  *   so an open compact shape is a blocklist wearing a shape. The configured
- *   list is what catches `fix/pet392-blocker-edge`, which is the compact case
- *   that has actually been observed on this fork.
+ *   list is what catches `fix/pet9003-blocker-edge`, which is the compact case
+ *   shape that has actually been observed on this fork.
  * - **Not on a prepositional mention.** "the defect in TASK-482" is not a
  *   reference position, and `UTF-8` is not either. The same reason a bare
  *   `10.0.0.7` is left alone below: reaching for it fires on correct work.
@@ -441,7 +441,7 @@ const OPEN_REF_RULES = [
  * same surface, and it is subtracted here so that one id is one finding even
  * when both tiers can see it. The second half of that is not cosmetic: the
  * conventional-commit prefix `fix:` is also a reference verb, so a title
- * reading `fix: PET-392` is visible to both matchers, and an author who fixed
+ * reading `fix: PET-9003` is visible to both matchers, and an author who fixed
  * one identifier and got two paragraphs about it learns to skip the gate.
  *
  * `requireReference: false` drops the reference-position condition, and is used
