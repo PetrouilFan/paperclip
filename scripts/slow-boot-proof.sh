@@ -1307,6 +1307,24 @@ info "control effective TimeoutStartUSec=$CONTROL_EFF (${CONTROL_EFF_SECS}s)"
 PROOF_IO_CG="$IO_CG"
 UNIT="$CONTROL_UNIT"
 IO_CG="$(prop ControlGroup)"
+# ...and that read comes back EMPTY for the control, because systemd materialises
+# a unit's cgroup lazily, when it forks that unit's first process. The control
+# has been written and daemon-reload has run, but it has never been started, so
+# there is no cgroup to name. The property itself is not missing -- 7a just read
+# TimeoutStartUSec off the same unit, from the same `show` -- the cgroup is.
+#
+# So derive it. Both unit files are written to the same $HOME/.config/systemd/user
+# by this script, and the control fragment is the proof fragment with two lines
+# rewritten, so it keeps the proof's Slice=: the parent is the reliable part of
+# the path and only the leaf differs. cg_enable then creates the directory,
+# which is the same derivation from the unit name it already relies on for the
+# proof leg (see above). If this ever derives the wrong parent, the lever lands
+# in an orphan cgroup the control never runs in, the control boots fast, and 7b
+# reports the outage as absent -- red, never a false green.
+if [ -z "$IO_CG" ] && [ -n "$PROOF_IO_CG" ]; then
+  IO_CG="$(dirname "$PROOF_IO_CG")/$CONTROL_UNIT"
+  info "control cgroup: 'show' reported none for a never-started unit, derived ${IO_CG} from the unit under test's own cgroup"
+fi
 if [ "$CONTROL_EFF_SECS" != "90" ]; then
   fail_ "7a the control really does run on the 90s default (got ${CONTROL_EFF_SECS}s); without that the control proves nothing"
   systemctl --user stop "$CONTROL_UNIT" >/dev/null 2>&1 || true
