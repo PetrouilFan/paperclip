@@ -68,7 +68,42 @@ each one).
 * RUN GREPTILE UNTIL IT GETS TO 5/5 - DO NOT STOP UNTIL GREPTILE IS 5/5, all
   tests pass, all verification checks pass, and there are no merge conflicts.
 
-## 6. Report back and hand off
+## 6. Merge — check the body you are about to write
+
+A squash merge drops every commit message on the branch, including the
+`Co-Authored-By` lines from step 1. The credit only survives in the body the
+merger writes, so it is checked there, against the body, before the merge.
+
+* Ask what the branch is owed. This re-derives the trailer block from the
+  branch's commits rather than reading it out of the gate's comment on the pull
+  request, so a force-push cannot leave a stale block behind:
+
+  ```sh
+  node .github/scripts/plan-merge-attribution.mjs <pr>
+  ```
+
+* If the block is empty the merge body owes no trailer. If it is not, write the
+  pull request's own text, a blank line, and then the block, in that order — git
+  reads the trailer block out of the last paragraph, and a line pasted into the
+  middle of a description is read as prose:
+
+  ```sh
+  node .github/scripts/plan-merge-attribution.mjs <pr> --write-body /tmp/merge-body.md
+  gh pr merge <pr> --squash --body-file /tmp/merge-body.md
+  ```
+
+* The same command judges a body you already have, and exits non-zero on a lost
+  credit. Use it before every squash merge, not once per branch:
+
+  ```sh
+  node .github/scripts/plan-merge-attribution.mjs <pr> --body-file /tmp/merge-body.md
+  ```
+
+* `audit-merge-attribution.mjs <pr>` is the other end of the same question, for
+  after the merge. It cannot un-merge, so anything it reports is permanent and
+  this step is the only place the loss is still avoidable.
+
+## 7. Report back and hand off
 
 * Comment on the driving task: what you did, the PR URL(s), the worktree path
   (use `~` for home), Greptile score, and check status.
