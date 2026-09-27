@@ -102,6 +102,16 @@ export interface IssueWriteDenialContext {
    * will be refused with a 409.
    */
   targetAssignedToOtherActor?: boolean | null;
+  /**
+   * The target is checked out by a *different* run right now, so
+   * `POST /api/issues/<id>/checkout` is a 409 `Issue checkout conflict` for this
+   * actor. Distinct from {@link targetAssignedToOtherActor}: the actor may well
+   * be the assignee, and still not be able to take the binding while another
+   * run holds it. Only the caller can know this — it reads the target's
+   * `checkout_run_id`/`execution_run_id`, which the guard has in hand at the
+   * moment it refuses.
+   */
+  targetHeldByAnotherRun?: boolean | null;
   /** Target issue identifier, e.g. `TASK-482`. */
   issueIdentifier?: string | null;
   /** Per-run cross-issue influence cap. */
@@ -296,6 +306,32 @@ export function describeIssueWriteDenial(
       // is already resolved and only the *source issue* is absent — the header
       // is in the bearer token and the server already read it.
       if (context.runContextReason && !RUN_HEADER_FIX_REASONS.has(context.runContextReason)) {
+        // A finished run is a different dead end from a run with no task. Its
+        // checkout stamp is on the issue row and is deliberately *not* honoured
+        // — that is what `terminal_status` means — so telling it to check out is
+        // advice that cannot work, and "bound to none" is false: the binding is
+        // the very thing being refused. The run is over; the only live path is
+        // the next one.
+        if (context.runContextReason === "terminal_status") {
+          return {
+            code,
+            status: 403,
+            tone: "boundary",
+            boundary: "Heartbeat run context",
+            title: "This run has already finished",
+            description:
+              `The run that made this request is over, so its write cannot be charged ` +
+              `to a task or counted against the per-run budget — an ended run's ` +
+              `checkout is left on the issue for the audit trail and is not a live ` +
+              `binding. ${issue} was not written to, and nothing about ${issue} changed.`,
+            whoCanAct: `${actor}, on its next heartbeat run.`,
+            sanctionedPath:
+              `Continue on the next heartbeat run: the per-run budget resets, and ` +
+              `that run can check out a task to charge ${issue} to. Do not retry ` +
+              `\`X-Paperclip-Run-Id\` with this run's id — the run header is ` +
+              `accepted, the run it names is finished.`,
+          };
+        }
         // A target held by someone else is a different dead end from a target
         // nobody holds. Check out the run's *own* task and the write is fine —
         // but checking out *this* issue is a 409 checkout conflict, so telling
@@ -323,6 +359,33 @@ export function describeIssueWriteDenial(
               `task ${actor} owns, and the write then counts against the per-run cap ` +
               `like any other. Do not resend \`X-Paperclip-Run-Id\` — this run already ` +
               `carried it.`,
+          };
+        }
+        // Same 409 problem, different cause: the actor may be the assignee and
+        // still be unable to take the binding, because a *live* run holds the
+        // checkout right now. "Check one out and the write counts against the
+        // cap" is exactly the advice that cannot be followed, and following it
+        // costs a round trip to learn nothing.
+        if (context.targetHeldByAnotherRun) {
+          return {
+            code,
+            status: 403,
+            tone: "boundary",
+            boundary: "Heartbeat run context",
+            title: "Another run is holding this task",
+            description:
+              `This run is valid and attributed, but ${issue} is checked out by a ` +
+              `run that is still live, so its binding cannot be taken over. A ` +
+              `cross-issue write must be charged to a task, and this run has no ` +
+              `other task to charge it to.`,
+            whoCanAct:
+              `${actor}, on a run that does not race the holder — or ${assignee} ` +
+              `directly on ${issue}.`,
+            sanctionedPath:
+              `Wait for the run holding ${issue} to finish and check it out on a ` +
+              `later heartbeat, or ${CHILD_ISSUE_PATH}. Checking ${issue} out now ` +
+              `is a 409 checkout conflict, so do not spend the attempt. Do not ` +
+              `resend \`X-Paperclip-Run-Id\` — this run already carried it.`,
           };
         }
         return {

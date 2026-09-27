@@ -44,6 +44,8 @@ export function crossIssueInfluenceRunContextError(
     assigneeLabel?: string | null;
     /** The target's assignee is a different principal than the actor. */
     targetAssignedToOtherActor?: boolean | null;
+    /** A different, still-live run holds the target's checkout. */
+    targetHeldByAnotherRun?: boolean | null;
   } = {},
 ) {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
@@ -57,6 +59,7 @@ export function crossIssueInfluenceRunContextError(
     issueIdentifier: labels.issueIdentifier ?? null,
     assigneeLabel: labels.assigneeLabel ?? null,
     targetAssignedToOtherActor: labels.targetAssignedToOtherActor ?? null,
+    targetHeldByAnotherRun: labels.targetHeldByAnotherRun ?? null,
   });
   return forbidden(body.error, { ...body.details, reason });
 }
@@ -234,6 +237,8 @@ export async function observeCrossIssueInfluence(
         .select({
           assigneeAgentId: issues.assigneeAgentId,
           assigneeName: agents.name,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
         })
         .from(issues)
         .leftJoin(agents, eq(agents.id, issues.assigneeAgentId))
@@ -245,14 +250,22 @@ export async function observeCrossIssueInfluence(
       if (targetAssignee?.assigneeAgentId && targetAssignee.assigneeAgentId === input.agentId) {
         return null;
       }
-      // The read above already knows who holds the target, so hand the copy
+      // Read above already knows who holds the target, so hand the copy
       // that fact. Without it the rejection tells the actor to check out this
       // issue, which is a 409 `Issue checkout conflict` for anyone who is not
       // the assignee — a correct refusal converted into a second, worse one.
+      //
+      // `targetHeldByAnotherRun` covers the case the assignee flag misses: the
+      // actor *is* the assignee, so the exemption above did not apply, and
+      // another live run still holds the binding. Checkout is just as much a 409
+      // there, and "check one out and the write counts against the cap" is
+      // unfollowable advice. A stamp on the target at this point is always
+      // another run's: `targetIsBound` short-circuited above if it were ours.
       throw crossIssueInfluenceRunContextError("no_context_source_and_target_unbound", {
         issueIdentifier: input.targetIssueIdentifier ?? null,
         assigneeLabel: targetAssignee?.assigneeName ?? null,
         targetAssignedToOtherActor: Boolean(targetAssignee?.assigneeAgentId),
+        targetHeldByAnotherRun: Boolean(targetAssignee?.checkoutRunId ?? targetAssignee?.executionRunId),
       });
     }
 
