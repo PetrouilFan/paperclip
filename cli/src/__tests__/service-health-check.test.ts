@@ -51,7 +51,18 @@ function managerFixture(active = true) {
     uninstall: vi.fn(async () => undefined),
     start: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),
-    restart: vi.fn(async () => undefined),
+    // restart() reports the measured downtime , so a mock has to
+    // supply one, and the honest value for a mock is a fast one.
+    restart: vi.fn(async () => ({
+      serviceName: "paperclipai.service",
+      platform: "systemd" as const,
+      requestedAt: "2026-09-27T00:00:00.000Z",
+      completedAt: "2026-09-27T00:00:00.000Z",
+      elapsedMs: 0,
+      thresholdMs: 30_000,
+      severity: "ok" as const,
+      settled: true,
+    })),
     status: vi.fn(async () => ({
       platform: "systemd" as const,
       serviceName: "paperclipai.service",
@@ -134,6 +145,52 @@ describe("service health doctor checks", () => {
     });
 
     expect(results.every((result) => result.status === "pass")).toBe(true);
+  });
+
+  it("reports a recorded slow restart to whoever runs doctor next", async () => {
+    // This is the channel that reaches a human who was not the process's parent
+    // and was not attached to the restart at all: the record written by
+    // `restart()` is read back by the next `doctor`, whenever that is and
+    // whoever that is. A 520s restart on 2026-09-27 is the motivating case --
+    // nobody was told at the time, so the record has to outlive the process.
+    const manager = managerFixture();
+    const completedAt = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    const results = await serviceHealthChecks(config, {
+      detect: vi.fn(async () => ({ supported: true as const, manager })),
+      probe: vi.fn(async () => ({ ok: true, version: "1.2.3" })),
+      readSlowRestart: vi.fn(async () => ({
+        version: 1 as const,
+        instanceId: "default",
+        serviceName: "paperclipai.service",
+        platform: "systemd" as const,
+        requestedAt: "2026-09-27T01:07:04.000Z",
+        completedAt,
+        elapsedMs: 520_000,
+        thresholdMs: 30_000,
+        severity: "severe" as const,
+        settled: true,
+        previousServerPid: 4242,
+        previousServerStartedAt: null,
+      })),
+    });
+
+    const check = results.find((result) => result.name === "Last slow restart");
+    expect(check?.status).toBe("fail");
+    expect(check?.message).toContain("520.0s");
+    // The age is what separates a one-off from a chronic 520s boot, and a record
+    // that only ever says "520s" is a fact nobody acts on twice.
+    expect(check?.message).toContain("2d ago");
+    expect(check?.message).toContain("process_lost");
+  });
+
+  it("adds no slow-restart check when no restart has ever crossed the threshold", async () => {
+    const manager = managerFixture();
+    const results = await serviceHealthChecks(config, {
+      detect: vi.fn(async () => ({ supported: true as const, manager })),
+      probe: vi.fn(async () => ({ ok: true, version: "1.2.3" })),
+      readSlowRestart: vi.fn(async () => null),
+    });
+    expect(results.every((result) => result.name !== "Last slow restart")).toBe(true);
   });
 
   it("surfaces an ExecStart resolver refusal verbatim instead of generic drift", async () => {
@@ -275,7 +332,18 @@ describe("service runtime shim awareness", () => {
       uninstall: vi.fn(async () => undefined),
       start: vi.fn(async () => undefined),
       stop: vi.fn(async () => undefined),
-      restart: vi.fn(async () => undefined),
+      // restart() reports the measured downtime , so a mock has to
+    // supply one, and the honest value for a mock is a fast one.
+    restart: vi.fn(async () => ({
+      serviceName: "paperclipai.service",
+      platform: "systemd" as const,
+      requestedAt: "2026-09-27T00:00:00.000Z",
+      completedAt: "2026-09-27T00:00:00.000Z",
+      elapsedMs: 0,
+      thresholdMs: 30_000,
+      severity: "ok" as const,
+      settled: true,
+    })),
       status: vi.fn(async () => ({
         platform: "launchd" as const,
         serviceName: "ing.paperclip.paperclipai",
