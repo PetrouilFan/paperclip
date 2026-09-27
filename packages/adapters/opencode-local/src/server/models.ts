@@ -189,9 +189,17 @@ export async function discoverOpenCodeModels(
     // image). Fall back to process.env.HOME.
   }
   // Prevent OpenCode from writing an opencode.json into the working directory.
+  //
+  // Deliberately NOT spreading `process.env` into `env` below. `runChildProcess`
+  // already merges `sanitizeInheritedPaperclipEnv(process.env)` underneath
+  // `opts.env`, so the spread contributed nothing except the one thing that must
+  // not reach a child: the server's own `PAPERCLIP_API_KEY`, a company-scoped key
+  // carrying `responsible_user_id` that does not expire with a run. The
+  // inherited scrub deletes it from the base, then this half spread it straight
+  // back in, so `opencode models` was handed the control plane's credential.
+  // PATH and HOME still reach the child through the merged base.
   const runtimeEnv = normalizeEnv(
     ensurePathInEnv({
-      ...process.env,
       ...env,
       ...(resolvedHome ? { HOME: resolvedHome } : {}),
       OPENCODE_DISABLE_PROJECT_CONFIG: "true",

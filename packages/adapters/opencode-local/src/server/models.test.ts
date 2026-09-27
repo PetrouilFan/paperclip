@@ -104,6 +104,46 @@ describe("openCode models", () => {
     await expect(listOpenCodeModels()).resolves.toEqual([]);
   });
 
+  // The leak, asserted on the object the call site actually hands the
+  // chokepoint. `discoverOpenCodeModels` used to spread `process.env` into
+  // `opts.env`, and `runChildProcess` spreads `opts.env` over the sanitized
+  // inherited base — so the spread restored the control plane's own
+  // `PAPERCLIP_API_KEY` to a child that `sanitizeInheritedPaperclipEnv` had just
+  // removed it from. The server's key is company-scoped, carries
+  // `responsible_user_id`, and does not expire with a run the way a run-scoped
+  // token does.
+  it("does not put the control plane's API key in the discovery child env", async () => {
+    const originalApiKey = process.env.PAPERCLIP_API_KEY;
+    const originalWakePayload = process.env.PAPERCLIP_WAKE_PAYLOAD_JSON;
+    process.env.PAPERCLIP_API_KEY = "server-process-key";
+    process.env.PAPERCLIP_WAKE_PAYLOAD_JSON = '{"companyId":"stale"}';
+    try {
+      const spy = stubModelsCli({
+        refresh: { exitCode: 1, stderr: "unrecognized flag" },
+        plain: () => childResult({ stdout: "openai/gpt-5.2-codex\n" }),
+      });
+
+      await discoverOpenCodeModels({ env: { PAPERCLIP_TEST_MARKER: "from-caller" } });
+
+      const opts = spy.mock.calls[0]?.[3] as { env: Record<string, string> };
+      expect(opts.env.PAPERCLIP_API_KEY).toBeUndefined();
+      expect(opts.env.PAPERCLIP_WAKE_PAYLOAD_JSON).toBeUndefined();
+      // Non-vacuity: two keys are dropped, not the environment. The caller's
+      // own keys and the discovery-specific ones must survive — a fix that
+      // emptied `opts.env` would pass the two assertions above while breaking
+      // discovery. PATH and HOME are added by `ensurePathInEnv`.
+      expect(opts.env.PAPERCLIP_TEST_MARKER).toBe("from-caller");
+      expect(opts.env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe("true");
+      expect(opts.env.PATH).toBeTruthy();
+      expect(opts.env.HOME).toBeTruthy();
+    } finally {
+      if (originalApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
+      else process.env.PAPERCLIP_API_KEY = originalApiKey;
+      if (originalWakePayload === undefined) delete process.env.PAPERCLIP_WAKE_PAYLOAD_JSON;
+      else process.env.PAPERCLIP_WAKE_PAYLOAD_JSON = originalWakePayload;
+    }
+  });
+
   it("rejects when model is missing", async () => {
     await expect(
       ensureOpenCodeModelConfiguredAndAvailable({ model: "" }),

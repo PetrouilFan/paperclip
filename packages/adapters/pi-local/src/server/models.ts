@@ -108,7 +108,15 @@ export async function discoverPiModels(input: {
   const command = resolvePiCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
-  const runtimeEnv = normalizeEnv({ ...process.env, ...env });
+  // Deliberately NOT `{ ...process.env, ...env }`. `runChildProcess` already
+  // merges `sanitizeInheritedPaperclipEnv(process.env)` underneath `opts.env`, so
+  // spreading process.env here contributed nothing except the one thing that
+  // must not reach a child: the server's own `PAPERCLIP_API_KEY`, a
+  // company-scoped key carrying `responsible_user_id` that does not expire with
+  // a run. The inherited scrub deletes it from the base, then this half spread
+  // it straight back in, so `pi --list-models` was handed the control plane's
+  // credential. PATH and HOME still reach the child through the merged base.
+  const runtimeEnv = env;
 
   const result = await runChildProcess(
     `pi-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
