@@ -204,7 +204,12 @@ test('an internal-refs failure reaches the list that decides the exit code', () 
   const clean = { failures: [] };
   const failures = collectBlockingFailures([clean, clean, internalRefs, clean]);
   assert.equal(failures.length, 1);
-  assert.match(failures[0], /TICKET-392/);
+  // The gate masks what it matched, so the id itself is gone from the line that
+  // decides the exit code — which is the point: that line is posted to the pull
+  // request. The configured prefix still arrives in its genericised form, which
+  // is what tells the author which namespace to look in.
+  assert.equal(failures[0].includes('TICKET-392'), false, 'the finding must not carry the id it matched');
+  assert.match(failures[0], /prefixes: TICKET-<number>/);
 });
 
 test('collectBlockingFailures tolerates a gate that returned nothing', () => {
