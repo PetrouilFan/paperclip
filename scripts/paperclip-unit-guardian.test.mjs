@@ -238,3 +238,101 @@ test("the golden-copy alert fires once per change, not once a minute", () => {
   // ...and clears its marker once the gap is closed, so a recurrence alerts again.
   assert.match(script, /elif \[ -f "\$UNPROTECTED_SEEN" \]; then\n\s+rm -f "\$UNPROTECTED_SEEN"/);
 });
+
+// --- step 6b: the cgroup-wide threshold, executed rather than grepped.
+
+test("the step 6b threshold fires when a majority of the cgroup is stopped", () => {
+  // This is the check that exists because `is-active` reports `active` for a cgroup
+  // whose processes are all SIGSTOPped, so the unit looks healthy while the board
+  // cannot answer. It was added with a missing `]` on the third test:
+  //
+  //   if [ "$total" -ge 8 ] && [ "$stopped_total" -ge 4 ] && [ "$stopped_total" -gt $(( total / 2 )); then
+  //
+  // `bash -n` passes that line, because the missing bracket is a runtime error and
+  // not a parse error -- so the "script is executable and parses" test above was
+  // green over a dead detector. The failure only appears once the first two tests
+  // pass and bash actually evaluates the third: it then reports `missing ']'` on
+  // stderr and returns non-zero, so the ALERT never fires. Under `set -uo pipefail`
+  // with no `-e` the script carries straight on, which is why it was silent for the
+  // whole window it was supposed to cover.
+  //
+  // So this test runs the shipped condition. Reading the script is not enough: the
+  // defect is invisible to every assertion that only looks at the text.
+  const line = script.split("\n").find((l) => l.includes('-ge 8') && l.includes("stopped_total"));
+  assert.ok(line, "could not find the step 6b threshold in the guardian");
+  assert.ok(line.trimEnd().endsWith("; then"), `step 6b threshold is not an if-header: ${line.trim()}`);
+
+  const dir = mkdtempSync(join(tmpdir(), "guardian-6b-"));
+  const helper = join(dir, "threshold.sh");
+  // The header is reused verbatim; only the body is swapped for an echo, so what
+  // runs is the shipped condition and not a transcription of it.
+  writeFileSync(helper, `#!/usr/bin/env bash\nset -uo pipefail\ntotal=$1\nstopped_total=$2\n${line.trim()}\n  echo FIRE\nelse\n  echo quiet\nfi\n`);
+  try {
+    const verdict = (total, stopped) => {
+      const r = spawnSync("bash", [helper, String(total), String(stopped)], { encoding: "utf8" });
+      // A bracket the shell had to complain about is a detector that cannot be
+      // trusted, whichever verdict it happens to return.
+      assert.equal(r.stderr, "", `step 6b wrote to stderr for total=${total} stopped=${stopped}: ${r.stderr.trim()}`);
+      return r.stdout.trim();
+    };
+
+    // Absolute floor and majority both met: the freeze this check exists for.
+    assert.equal(verdict(10, 6), "FIRE", "6 of 10 stopped is a majority past the floor");
+    assert.equal(verdict(8, 8), "FIRE", "every process stopped must fire");
+    assert.equal(verdict(20, 11), "FIRE", "11 of 20 is a bare majority");
+
+    // Majority not met, and the floor cases that keep test-owned children quiet.
+    assert.equal(verdict(10, 5), "quiet", "exactly half is not a majority");
+    assert.equal(verdict(8, 4), "quiet", "4 of 8 is half, not a majority");
+    assert.equal(verdict(10, 4), "quiet", "4 stopped is at the floor but not a majority");
+    assert.equal(verdict(7, 7), "quiet", "below the absolute floor of 8, even unanimously");
+    assert.equal(verdict(3, 0), "quiet", "a small cgroup is out of scope");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the step 6b ALERT reaches the log, not just the condition", () => {
+  // The test above proves the condition can be true. This one proves that being
+  // true results in the operator actually being told, by running the shipped
+  // threshold together with the shipped `log` call and nothing else. The two
+  // halves drifted apart once already: a threshold that could never be true left
+  // the ALERT text in the file, present for every text-based check to find and
+  // unreachable in practice.
+  const lines = script.split("\n");
+  const start = lines.findIndex((l) => l.includes('if [ "$total" -ge 8 ]'));
+  assert.ok(start >= 0, "could not find the step 6b threshold in the guardian");
+  const end = lines.findIndex((l, i) => i > start && l.trim() === "fi");
+  assert.ok(end > start, "the step 6b threshold has no closing fi");
+  const block = lines.slice(start, end + 1).join("\n");
+
+  const dir = mkdtempSync(join(tmpdir(), "guardian-6b-log-"));
+  const helper = join(dir, "block.sh");
+  // `log` is redefined rather than stubbed at the filesystem, so this stays a test
+  // of the shipped control flow with the one side effect observed.
+  writeFileSync(helper, `#!/usr/bin/env bash\nset -uo pipefail\nlog() { echo "LOGGED: $*"; }\nUNIT=paperclipai.service\nCG=/system.slice/user.slice/x\n${block.replace(/^ {4}/gm, "")}\n`);
+  try {
+    const run = (total, stopped) =>
+      spawnSync("bash", [helper], {
+        encoding: "utf8",
+        env: { ...process.env, total: String(total), stopped_total: String(stopped) },
+      });
+
+    const fired = run(10, 6);
+    assert.equal(fired.stderr, "", `step 6b wrote to stderr: ${fired.stderr.trim()}`);
+    assert.match(
+      fired.stdout,
+      /^LOGGED: ALERT 6 of 10 processes in \/system\.slice\/user\.slice\/x are stopped/m,
+      "a stopped majority must reach the log with both counts and the cgroup named",
+    );
+    // The advice line is the part a human acts on, so it has to survive too.
+    assert.match(fired.stdout, /--kill-whom=all --signal=SIGCONT/);
+    // And the count the operator reads must be the measured one, not a literal.
+    assert.match(fired.stdout, /6 of 10/);
+
+    assert.doesNotMatch(run(10, 5).stdout, /LOGGED/, "half is not a majority and must stay silent");
+    assert.doesNotMatch(run(7, 7).stdout, /LOGGED/, "below the floor of 8 it must stay silent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
