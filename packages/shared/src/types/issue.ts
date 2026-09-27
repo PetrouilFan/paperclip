@@ -880,6 +880,12 @@ export interface Issue {
   labelIds?: string[];
   labels?: IssueLabel[];
   blockedBy?: IssueRelationIssueSummary[];
+  /**
+   * The ids of the issues that block this one, derived from the same relation
+   * rows `blockedBy` summarizes. Readable, not write-only: a caller that only
+   * needs the ids should not have to ask for the summaries.
+   */
+  blockedByIssueIds?: string[];
   blocks?: IssueRelationIssueSummary[];
   blockerAttention?: IssueBlockerAttention;
   reviewAttention?: IssueReviewAttention;
@@ -957,6 +963,7 @@ export type CompactIssue = Pick<
   labelIds?: string[];
   labels?: IssueLabel[];
   blockedBy?: IssueRelationIssueSummary[];
+  blockedByIssueIds?: string[];
   blockerAttention?: IssueBlockerAttention;
   reviewAttention?: IssueReviewAttention;
   blockedInboxAttention?: IssueBlockedInboxAttention | null;

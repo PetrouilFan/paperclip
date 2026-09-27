@@ -3222,6 +3222,17 @@ class AutoApprovalIssueMissingError extends Error {
   }
 }
 
+/**
+ * The single derivation of `blockedByIssueIds` from a relation summary list.
+ * Sorted by id so every read path and the PATCH echo serialize the same blocker
+ * set the same way, and `[]` for no blockers rather than a missing field.
+ */
+function sortedRelationIds(
+  relations: Array<{ id: string }> | undefined | null,
+): string[] {
+  return (relations ?? []).map((relation) => relation.id).sort();
+}
+
 function toCompactIssue(issue: any): CompactIssue {
   return {
     externalConversationState: issue.externalConversationState ?? null,
@@ -3261,6 +3272,11 @@ function toCompactIssue(issue: any): CompactIssue {
     ...(issue.labelIds ? { labelIds: issue.labelIds } : {}),
     ...(issue.labels ? { labels: issue.labels } : {}),
     ...(issue.blockedBy ? { blockedBy: issue.blockedBy } : {}),
+    ...(issue.blockedByIssueIds
+      ? { blockedByIssueIds: issue.blockedByIssueIds }
+      : issue.blockedBy
+        ? { blockedByIssueIds: sortedRelationIds(issue.blockedBy) }
+        : {}),
     ...(issue.blockerAttention
       ? { blockerAttention: issue.blockerAttention }
       : {}),
@@ -9322,6 +9338,11 @@ export function issueRoutes(
       scheduledRetry,
       activeRecoveryAction: revalidatedActiveRecoveryAction,
       blockedBy: relationsWithRecoveryActions.blockedBy,
+      // Readable, not write-only. A blocked issue that reads `null` here is
+      // indistinguishable from one waiting on nothing, which is how a ticket
+      // with a legitimate first-class blocker gets reported as a rule-3
+      // staleness violation.
+      blockedByIssueIds: sortedRelationIds(relationsWithRecoveryActions.blockedBy),
       blocks: relationsWithRecoveryActions.blocks,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map(
@@ -14251,9 +14272,13 @@ export function issueRoutes(
         updatedRelations = await svc.getRelationSummaries(issue.id);
         issueResponse = {
           ...issue,
-          blockedByIssueIds:
-            issue.blockedByIssueIds ??
-            [...new Set(req.body.blockedByIssueIds as string[])].sort(),
+          // Re-read the committed edges rather than echoing the request. The
+          // write normalizes the list (dedupe, company scoping, cycle refusal)
+          // and a liveness-escalation close can drop an edge in the same
+          // transaction, so the request body is not always what landed. The
+          // read path derives this field the same way, so the two agree by
+          // construction instead of by coincidence.
+          blockedByIssueIds: sortedRelationIds(updatedRelations.blockedBy),
           blockedBy: updatedRelations.blockedBy,
           blocks: updatedRelations.blocks,
         };
