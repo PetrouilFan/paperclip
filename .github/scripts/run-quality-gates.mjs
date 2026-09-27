@@ -213,6 +213,7 @@ async function main() {
     commits,
     files,
     prefixes: process.env.INTERNAL_REF_PREFIXES,
+    productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,
   });
   const coauthorResult = checkCoauthors(commits, author);
 

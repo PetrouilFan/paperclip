@@ -5,12 +5,15 @@ import { readFile } from 'node:fs/promises';
 import {
   ALLOWLIST,
   DEFAULT_INTERNAL_REF_PREFIXES,
+  DEFAULT_PRODUCT_OWNED_PREFIXES,
   MAX_PR_FILES,
   SELF_EXEMPT_PATHS,
   checkInternalRefs,
   findInstanceHosts,
+  findUnknownInternalRefs,
   patchIsComplete,
   resolvePrefixes,
+  resolveProductOwnedPrefixes,
 } from '../check-pr-internal-refs.mjs';
 
 const CLEAN = {
@@ -318,6 +321,258 @@ test('one finding is reported once, not once per surface spelling', () => {
   const result = checkInternalRefs({ ...CLEAN, prTitle: 'fix: PET-9002 and PET-9002 and PET-9001' });
   assert.equal(result.passed, false);
   assert.equal(result.failures.filter((f) => f.includes('The PR title')).length, 1);
+});
+
+// --- the open identifier shape, in authored text only ---------------------
+//
+// The finding this exists for: PR #85 merged to `master` as `1220016a0` with
+// `TASK-482` written three times in its *Steps to reproduce*, the `review` gate
+// green, because the identifier half of this gate matched a configured prefix
+// list and the rule text bans a shape. The negative controls below are
+// load-bearing in the same way the address controls are: the bare shape flags
+// `GPT-5` in four **Model Used** sections, and a matcher that fails the pull
+// request documenting the model that wrote it gets disabled.
+
+/** The three *Steps to reproduce* lines from #85, verbatim. */
+const PR85_REPRO = [
+  '1. Give agent B a task `TASK-482`; leave it assigned to agent B.',
+  '3. From that run, comment on or update `TASK-482`.',
+  '5. Follow the advice: call `POST /api/issues/{TASK-482}/checkout` as agent A.',
+].join('\n');
+
+test('the merged #85 body fails the gate it passed', () => {
+  // The positive control. If this ever passes again, the open matcher has
+  // stopped seeing references and the finding is unrepeatable.
+  const result = checkInternalRefs({ ...CLEAN, prBody: `**Steps to reproduce**\n\n${PR85_REPRO}` });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  const joined = result.failures.join('\n');
+  assert.match(joined, /The PR description/);
+  assert.match(joined, /TASK-482/);
+  // The failure has to name the fix. An author who reads "add TASK to the prefix
+  // list" has closed this instance's hole and left the next tool's open.
+  assert.match(joined, /Restate what the issue was in plain English/);
+});
+
+test('one unopenable id is one finding, not one per rule that saw it', () => {
+  // `TASK-482` here is in all three reference positions at once, and the
+  // de-duplication is per finding rather than per rule.
+  const result = checkInternalRefs({ ...CLEAN, prBody: 'See #TASK-482, or POST /api/issues/TASK-482, or fix TASK-482.' });
+  assert.equal(result.passed, false);
+  assert.equal(
+    result.failures.filter((f) => f.includes('namespace this repository has no exemption')).length,
+    1,
+    result.failures.join('\n'),
+  );
+});
+
+test('an id the configured list already caught is not reported twice', () => {
+  // `fix` is both a reference verb and a conventional-commit type, so
+  // `fix: PET-392` is visible to both tiers. One id is one paragraph.
+  const result = checkInternalRefs({ ...CLEAN, prTitle: 'fix: PET-392 and PET-334' });
+  assert.equal(result.passed, false);
+  assert.equal(result.failures.filter((f) => f.includes('The PR title')).length, 1, result.failures.join('\n'));
+  // ...and the one finding is the configured-prefix one, which is the report
+  // text that has existed all along.
+  assert.match(result.failures.join('\n'), /internal issue identifier/);
+});
+
+test('every reference position fires, and each is one an id is written into', () => {
+  const cases = [
+    ['#TASK-482', 'a `#` reference'],
+    ['/issues/TASK-482', 'an issue-router path'],
+    ['/api/issues/{TASK-482}/checkout', 'a URL template, which is how #85 wrote it'],
+    ['Fixes TASK-482', 'a reference verb, no quoting'],
+    ['give agent B a task `TASK-482`', 'a reference verb, backtick-quoted'],
+    ['see "TASK-482" for context', 'a reference verb, quote-wrapped'],
+    ['Ref TASK-482', 'a reference verb, abbreviated'],
+  ];
+  for (const [body, why] of cases) {
+    const result = checkInternalRefs({ ...CLEAN, prBody: body });
+    assert.equal(result.passed, false, `expected failure (${why}) for: ${body}\n${JSON.stringify(result.failures)}`);
+    assert.match(result.failures.join('\n'), /TASK-482/, `expected the id itself in the report for: ${body}`);
+  }
+});
+
+test('an unopenable reference fails in the title, the branch and a commit subject', () => {
+  const title = checkInternalRefs({ ...CLEAN, prTitle: 'fix(shared): route the write at the ticket TASK-482' });
+  assert.equal(title.passed, false);
+  assert.match(title.failures.join('\n'), /The PR title/);
+
+  const branch = checkInternalRefs({ ...CLEAN, prBranch: 'fix/TASK-482-unbound-target' });
+  assert.equal(branch.passed, false);
+  assert.match(branch.failures.join('\n'), /branch name/);
+
+  const subject = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ commit: { message: 'fix(shared): the advice named ticket TASK-482\n\nbody' } }],
+  });
+  assert.equal(subject.passed, false);
+  assert.match(subject.failures.join('\n'), /A commit subject/);
+});
+
+// --- the negative controls -------------------------------------------------
+//
+// These are what make the open shape usable. Each one is a real string that
+// appeared on this fork and would fail a naive open matcher.
+
+test('NEGATIVE CONTROL: the model name in Model Used is not an issue reference', () => {
+  // This is the finding that shaped the matcher. `- Model: GPT-5 (codex)` is
+  // required content in a required section, and the bare open shape flags it on
+  // four of the last sixty pull requests.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    prTitle: 'fix(e2e): report the real cause when no run appears',
+    prBody: [
+      '## Model Used',
+      '',
+      '- Provider: OpenAI',
+      '- Model: GPT-5 (codex)',
+      '- Context window: 400k',
+      '- Reasoning mode: high',
+    ].join('\n'),
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('NEGATIVE CONTROL: an identifier given as an example is not a reference', () => {
+  // From #67: the config field is documented by naming its *shape*, and the
+  // shape happens to look like an id. A code span is where an author quotes a
+  // value, which is not the same as pointing at a ticket.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    prBody: 'It reads `runtimeConfig.heartbeat.standingWatchIssueId`. The value can be a UUID or an issue identifier such as `PROJ-123`.',
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('NEGATIVE CONTROL: a standard or protocol token is not an issue reference', () => {
+  for (const body of [
+    'The payload is UTF-8 and the digest is SHA-256.',
+    'The status line is HTTP-404 and the retry is HTTP-503.',
+    'Conforming to RFC-2119 and ISO-8601 is the whole requirement.',
+    'The wire format is HTTP/1.1 and the encoding is UTF-8.',
+  ]) {
+    const result = checkInternalRefs({ ...CLEAN, prBody: body });
+    assert.equal(result.passed, true, `expected pass for: ${body}\n${JSON.stringify(result.failures, null, 2)}`);
+  }
+});
+
+test('NEGATIVE CONTROL: the product\'s own namespace is exempt in a reference position too', () => {
+  // The exemption is the reason the open shape is usable at all. `/PAP/issues/...`
+  // is a canonical route across 90+ files, and #85's own diff is full of it.
+  for (const body of [
+    'The route /PAP/issues/PAP-224 still renders.',
+    'The canonical fixture is PAP-1/child and it must keep working.',
+    'Fixes PAPA-123 is the product\'s own namespace, not ours.',
+  ]) {
+    const result = checkInternalRefs({ ...CLEAN, prBody: body });
+    assert.equal(result.passed, true, `expected pass for: ${body}\n${JSON.stringify(result.failures, null, 2)}`);
+  }
+});
+
+test('NEGATIVE CONTROL: the open matcher does not reach the diff', () => {
+  // The same surface split as the address rule. 736 files on master carry
+  // `PAP-`/`PAPA-` legitimately, and the configured list is what covers them.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{
+      filename: 'server/src/routes/issues.ts',
+      status: 'modified',
+      changes: 1,
+      patch: '@@ -1,1 +1,2 @@\n a\n+  // issue-router path shape: /issues/PROJ-1 is documented, not linked\n',
+    }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('NEGATIVE CONTROL: the compact open form is not used, because SHA256 is a branch name', () => {
+  // `fix/SHA256-digest` is a perfectly good branch name and no open compact
+  // form separates it from `fix/task482-thing`. The configured list still
+  // catches the instance's own lowercase prefix — see the test above — so the
+  // gap this leaves is narrow, and naming `SHA256` is cheaper than the
+  // blocklist that would be needed to exclude it.
+  for (const name of ['fix/SHA256-digest', 'feat/HTTP2-push', 'docs/UTF8-normalization']) {
+    const result = checkInternalRefs({ ...CLEAN, prBranch: name });
+    assert.equal(result.passed, true, `expected ${name} to pass: ${JSON.stringify(result.failures)}`);
+  }
+});
+
+test('the branch surface takes the bare shape, because a branch name is the reference', () => {
+  // A branch name has no verb, no `#` and no path, so the reference rules can
+  // never fire on it. Measured over the 96 branch names that have been a pull
+  // request head on this fork, the bare separated shape flags none of them.
+  const separated = checkInternalRefs({ ...CLEAN, prBranch: 'fix/TASK-482-unbound-target' });
+  assert.equal(separated.passed, false);
+  assert.match(separated.failures.join('\n'), /TASK-482/);
+  assert.match(separated.failures.join('\n'), /branch name/);
+
+  // ...and the cost of that choice, stated rather than hidden: a standards-named
+  // branch does fail. The remedy is a rename, which costs nothing before the
+  // branch is pushed and nothing after.
+  const standards = checkInternalRefs({ ...CLEAN, prBranch: 'fix/UTF-8-normalization' });
+  assert.equal(standards.passed, false);
+  assert.match(standards.failures.join('\n'), /UTF-8/);
+
+  // The product's own namespace stays exempt on this surface too.
+  const product = checkInternalRefs({ ...CLEAN, prBranch: 'fix/PAP-1-child-mention' });
+  assert.equal(product.passed, true, JSON.stringify(product.failures, null, 2));
+});
+
+test('FAIL CLOSED: an unusable product-owned exemption list is a failure, not a pass', () => {
+  // The failure mode here is silent and points the dangerous way: an empty list
+  // makes every honest mention of /PAP/issues/PAP-1 a failure, which is how a
+  // gate earns a reputation for noise.
+  for (const bad of [[], ['', '  '], ',,']) {
+    const result = checkInternalRefs({ ...CLEAN, prBody: 'The route /PAP/issues/PAP-224 renders.', productOwnedPrefixes: bad });
+    assert.equal(result.passed, false, `expected failure for ${JSON.stringify(bad)}`);
+    assert.match(result.failures.join('\n'), /PRODUCT_OWNED_REF_PREFIXES/);
+  }
+  for (const bad of ['P-P', '1PAP', 'P', 'PAP.*']) {
+    const result = checkInternalRefs({ ...CLEAN, prBody: 'The route /PAP/issues/PAP-224 renders.', productOwnedPrefixes: bad.split(',') });
+    assert.equal(result.passed, false, `expected failure for ${JSON.stringify(bad)}`);
+    assert.match(result.failures.join('\n'), /identifier prefix/);
+  }
+  const wrongType = checkInternalRefs({ ...CLEAN, prBody: 'The route /PAP/issues/PAP-224 renders.', productOwnedPrefixes: { a: 1 } });
+  assert.equal(wrongType.passed, false);
+  assert.match(wrongType.failures.join('\n'), /PRODUCT_OWNED_REF_PREFIXES/);
+});
+
+test('the exemption list is a default, and a deployment can widen it', () => {
+  assert.deepEqual(DEFAULT_PRODUCT_OWNED_PREFIXES, ['PAP', 'PAPA']);
+  const { owned, configError } = resolveProductOwnedPrefixes(undefined);
+  assert.equal(configError, undefined);
+  assert.deepEqual(owned, ['pap', 'papa']);
+
+  // A fork that has its own product namespace names it, and that namespace
+  // stops being reported without anyone touching the matchers.
+  const widened = checkInternalRefs({
+    ...CLEAN,
+    prBody: 'The canonical route is /UPSTREAM/issues/UPSTREAM-9 and it must survive.',
+    productOwnedPrefixes: ['PAP', 'PAPA', 'UPSTREAM'],
+  });
+  assert.equal(widened.passed, true, JSON.stringify(widened.failures, null, 2));
+});
+
+test('findUnknownInternalRefs states its own boundaries', () => {
+  // Exported so a caller can get the finding without the report text, and so
+  // the boundaries are a unit under test rather than a claim in a comment.
+  assert.deepEqual(findUnknownInternalRefs('see #TASK-482'), ['TASK-482']);
+  assert.deepEqual(findUnknownInternalRefs('/api/issues/{TASK-482}/checkout'), ['TASK-482']);
+  assert.deepEqual(findUnknownInternalRefs('the model is GPT-5'), []);
+  assert.deepEqual(findUnknownInternalRefs('such as `PROJ-123`'), []);
+  assert.deepEqual(findUnknownInternalRefs('the payload is UTF-8'), []);
+  assert.deepEqual(findUnknownInternalRefs('a public ref like #123 stays'), []);
+  assert.deepEqual(findUnknownInternalRefs('a heading ## Checklist'), []);
+  assert.deepEqual(findUnknownInternalRefs('the route /PAP/issues/PAP-224'), []);
+  assert.deepEqual(findUnknownInternalRefs(''), []);
+  assert.deepEqual(findUnknownInternalRefs(undefined), []);
+  // What the configured tier already reported is not reported again.
+  assert.deepEqual(findUnknownInternalRefs('fix: PET-392', undefined, ['PET-392']), []);
+  // ...and a different id on the same surface still is.
+  assert.deepEqual(findUnknownInternalRefs('fix: PET-392 and ticket TASK-482', undefined, ['PET-392']), ['TASK-482']);
+  // The branch surface drops the reference-position requirement, and only that.
+  assert.deepEqual(findUnknownInternalRefs('fix/TASK-482-unbound', undefined, [], { requireReference: false }), ['TASK-482']);
+  assert.deepEqual(findUnknownInternalRefs('fix/TASK-482-unbound'), []);
 });
 
 // --- the instance-local address rule, in authored text only ----------------
