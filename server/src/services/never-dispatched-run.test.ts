@@ -14,6 +14,7 @@ import {
 } from "../__tests__/helpers/embedded-postgres.js";
 import {
   NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS,
+  canAgentSelfReleaseStrandedRun,
   isNeverDispatchedQueuedRun,
   neverDispatchedQueuedRun,
   neverDispatchedRunCutoff,
@@ -125,6 +126,100 @@ describe("never-dispatched queued run predicate", () => {
         now,
       ),
     ).toBe(false);
+  });
+});
+
+// The wedge this predicate breaks: a run the dispatcher never claimed holds
+// `issues.executionRunId`, and that lock refuses checkout, status change and
+// comments for the assignee -- so the agent's only route out is a board-only
+// cancel. These tests pin both that the assignee gets in, and -- more
+// importantly -- that nothing else does.
+describe("agent self-service release of a stranded run", () => {
+  const now = new Date("2026-09-26T09:00:00.000Z");
+  const owner = "11111111-1111-4111-8111-111111111111";
+  const other = "22222222-2222-4222-8222-222222222222";
+  const strandedAgeMs = NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS + 60_000;
+  const agentActor = (agentId: string) => ({ type: "agent", agentId });
+  const run = (values: Partial<Parameters<typeof canAgentSelfReleaseStrandedRun>[1]> = {}) => ({
+    agentId: owner,
+    status: "queued",
+    startedAt: null,
+    createdAt: new Date(now.getTime() - strandedAgeMs),
+    ...values,
+  });
+
+  it("lets the assignee release their own stranded run without board access", () => {
+    expect(canAgentSelfReleaseStrandedRun(agentActor(owner), run(), now)).toBe(true);
+  });
+
+  it("never releases another agent's run", () => {
+    expect(canAgentSelfReleaseStrandedRun(agentActor(other), run(), now)).toBe(false);
+    // And the reverse direction: owning the caller is not enough if the run
+    // belongs to someone else.
+    expect(
+      canAgentSelfReleaseStrandedRun(
+        agentActor(other),
+        run({ agentId: other }),
+        now,
+      ),
+    ).toBe(true);
+  });
+
+  it("is not a Stop: it refuses the caller's own live work", () => {
+    // A self-service release that could cancel a running run would hand every
+    // agent a way to stop its own execution, which is an operator action. Each
+    // of these must stay board-only.
+    const executing = run({
+      status: "running",
+      startedAt: new Date(now.getTime() - 26 * 60 * 60 * 1_000),
+    });
+    const retrying = run({ status: "scheduled_retry", startedAt: new Date() });
+    // Old, unclaimed-looking, but the dispatcher did claim it and it is slow.
+    // Cancelling this would destroy real work.
+    const claimedButSlow = run({ startedAt: new Date(now.getTime() - 60_000) });
+    // A terminal run is not stranded; it has nothing left to release.
+    const finished = run({ status: "succeeded", startedAt: new Date() });
+
+    for (const candidate of [executing, retrying, claimedButSlow, finished]) {
+      expect(canAgentSelfReleaseStrandedRun(agentActor(owner), candidate, now)).toBe(false);
+    }
+  });
+
+  it("refuses a freshly queued run, so the affordance appears only once it is stranded", () => {
+    expect(
+      canAgentSelfReleaseStrandedRun(
+        agentActor(owner),
+        run({ createdAt: new Date(now.getTime() - 1_000) }),
+        now,
+      ),
+    ).toBe(false);
+  });
+
+  it("agrees with the sweep on the boundary, so both paths open at the same moment", () => {
+    const justInside = new Date(now.getTime() - NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS + 1_000);
+    const justOutside = new Date(now.getTime() - NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS - 1_000);
+    const selfRelease = (createdAt: Date) =>
+      canAgentSelfReleaseStrandedRun(agentActor(owner), run({ createdAt }), now);
+    const sweepWouldAct = (createdAt: Date) =>
+      isNeverDispatchedQueuedRun(run({ createdAt }), now);
+
+    expect(selfRelease(justInside)).toBe(sweepWouldAct(justInside));
+    expect(selfRelease(justOutside)).toBe(sweepWouldAct(justOutside));
+    expect(selfRelease(justInside)).toBe(false);
+    expect(selfRelease(justOutside)).toBe(true);
+  });
+
+  it("refuses a non-agent actor, and an agent caller with no agent identity", () => {
+    // Board callers do not need this predicate: `assertBoard` admits them, so
+    // the predicate must not be the thing that decides their case.
+    for (const actor of [
+      { type: "board" },
+      { type: "none" },
+      { type: "agent" },
+      { type: "agent", agentId: "" },
+    ]) {
+      expect(canAgentSelfReleaseStrandedRun(actor, run(), now)).toBe(false);
+    }
   });
 });
 

@@ -6844,8 +6844,23 @@ registry.registerPath({
   path: "/api/heartbeat-runs/{runId}/cancel",
   tags: ["runs"],
   summary: "Cancel a heartbeat run",
+  description:
+    "Board callers may cancel any run in their company. An agent may also cancel " +
+    "its own run when that run is stranded: `queued`, never claimed by the " +
+    "dispatcher (`startedAt` is null), and older than the never-dispatched " +
+    "admission window. That run holds its issue's execution lock while doing no " +
+    "work, so without this path the assignee could not check the issue out, " +
+    "change its status, or comment on it. The agent path is a release, not a " +
+    "Stop: a `running`, `scheduled_retry`, or already-claimed run stays " +
+    "board-only, because cancelling those would destroy work in progress.",
   request: { params: z.object({ runId: heartbeatRunIdParamSchema }) },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({

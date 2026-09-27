@@ -9,6 +9,10 @@ import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import {
+  canAgentSelfReleaseStrandedRun,
+  NEVER_DISPATCHED_RUN_ERROR_CODE,
+} from "../services/never-dispatched-run.js";
 import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaperclipRunnerProvider } from "@paperclipai/adapter-utils";
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
@@ -6777,10 +6781,22 @@ export function agentRoutes(
     })))));
   });
 
+  /**
+   * The two halves of {@link readHeartbeatRunId}, as a predicate, so a route
+   * that must answer an unauthorized caller without ever reporting *why* can
+   * reuse the exact same notion of a well-formed run id. Anything that derives
+   * its own looser check here would drift from the one used to validate input
+   * for board callers.
+   */
+  function isWellFormedHeartbeatRunId(runId: unknown): boolean {
+    if (typeof runId !== "string") return false;
+    // isUuidLike accepts surrounding whitespace, but PostgreSQL UUID inputs do not.
+    return runId === runId.trim() && isUuidLike(runId);
+  }
+
   function readHeartbeatRunId(req: Request): string {
     const runId = req.params.runId as string;
-    // isUuidLike accepts surrounding whitespace, but PostgreSQL UUID inputs do not.
-    if (runId !== runId.trim() || !isUuidLike(runId)) {
+    if (!isWellFormedHeartbeatRunId(runId)) {
       throw badRequest("Invalid heartbeat run ID");
     }
     return runId;
@@ -6803,30 +6819,79 @@ export function agentRoutes(
     ));
   });
 
+  /**
+   * Cancellation reason recorded when an agent releases its own stranded run.
+   * Mirrors the age-out sweep's reason so the two paths that free the same lock
+   * are indistinguishable in the run log, which is the point: the condition, not
+   * who noticed it, is what should be readable afterwards.
+   */
+  const NEVER_DISPATCHED_RUN_CANCELLATION_REASON =
+    "Released by the assignee: the dispatcher never claimed this run, and it was holding the issue execution lock without doing any work";
+
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
-    assertBoard(req);
-    const runId = readHeartbeatRunId(req);
+    // Board actors keep the original order: their actor check precedes ID
+    // validation, so a malformed id tells them nothing they could not already
+    // tell. An agent is the case this route newly admits, and an agent must not
+    // be handed a different answer that reveals whether an id is well-formed --
+    // this route is reachable by agents now, so a 400 here would be a validation
+    // oracle over run ids the agent may not touch. A malformed id from an agent
+    // is therefore just another denied case and answers 403, identically to a
+    // well-formed id the agent has no release rights over. That is what
+    // agent-live-run-routes.test.ts pins, and it still holds.
+    const agentActor = req.actor.type === "agent";
+    if (!agentActor) assertBoard(req);
+    const runId = isWellFormedHeartbeatRunId(req.params.runId)
+      ? (req.params.runId as string)
+      : null;
+    if (!runId) {
+      if (agentActor) throw forbidden("Board access required");
+      throw badRequest("Invalid heartbeat run ID");
+    }
+    // The resource is loaded before the actor check so a run outside the
+    // caller's company is a 404 rather than a 403. That is the same
+    // existence-oracle shape as GET /heartbeat-runs/:runId above, and it is
+    // also what the pre-existing board-only order produced for board callers.
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
-    // Stamp the cancellation as operator-initiated (this route is board-only).
-    // Recovery reads this to stand down instead of classifying the cancelled
-    // run as agent stranding and re-waking the agent the operator just stopped.
-    const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
-      resultJson: {
-        cancelledByActorType: "user",
-        cancelledByUserId: req.actor.userId ?? null,
-      },
-    });
+    // An agent may release its own run when that run is holding an issue
+    // execution lock without doing any work. Without this, a run the dispatcher
+    // never claimed wedges its issue until the age-out sweep clears it, and the
+    // assignee has no way out in the meantime: checkout, status change and
+    // comment all refuse against the lock, and the one route that would release
+    // it was board-only. The scope is deliberately one condition and no wider —
+    // an agent still cannot stop a run that is executing, is retrying, or has
+    // started, because that is a Stop, not a release.
+    const selfServiceRelease = canAgentSelfReleaseStrandedRun(req.actor, existing);
+    if (!selfServiceRelease) assertBoard(req);
+    // Stamp the cancellation as operator-initiated. Recovery reads this to stand
+    // down instead of classifying the cancelled run as agent stranding and
+    // re-waking the agent the operator just stopped. A self-service release
+    // deliberately does not carry this marker: the run is stranded rather than
+    // stopped on purpose, so the issue's work should be re-queued exactly as the
+    // age-out sweep re-queues it.
+    const run = selfServiceRelease
+      ? await heartbeat.cancelRun(runId, NEVER_DISPATCHED_RUN_CANCELLATION_REASON, {
+          errorCode: NEVER_DISPATCHED_RUN_ERROR_CODE,
+        })
+      : await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+          resultJson: {
+            cancelledByActorType: "user",
+            cancelledByUserId: req.actor.userId ?? null,
+          },
+        });
 
     if (run) {
       await logActivity(db, {
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
+        actorType: selfServiceRelease ? "agent" : "user",
+        actorId: selfServiceRelease ? req.actor.agentId ?? "agent" : req.actor.userId ?? "board",
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: run.id,
-        details: { agentId: run.agentId },
+        details: {
+          agentId: run.agentId,
+          ...(selfServiceRelease ? { releaseReason: "self_service_stranded_run" } : {}),
+        },
       });
     }
 

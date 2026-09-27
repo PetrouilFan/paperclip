@@ -510,6 +510,11 @@ import {
 import { withRecoveryContext } from "./recovery/status-only-context.js";
 import {
   NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS,
+  // Terminal reason recorded on a run cancelled because the dispatcher never
+  // claimed it. Distinct from `cancelled` so an operator can tell an age-out
+  // apart from an operator Stop or an agent cancellation. Imported from next to
+  // the predicate that decides it so the code and its condition cannot drift.
+  NEVER_DISPATCHED_RUN_ERROR_CODE,
   neverDispatchedQueuedRun,
 } from "./never-dispatched-run.js";
 import {
@@ -775,12 +780,6 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "running",
   "scheduled_retry",
 ] as const;
-/**
- * Terminal reason recorded on a run cancelled because the dispatcher never
- * claimed it. Distinct from `cancelled` so an operator can tell an age-out apart
- * from an operator Stop or an agent cancellation.
- */
-const NEVER_DISPATCHED_RUN_ERROR_CODE = "never_dispatched_timeout";
 /** Bounds one sweep pass so a large backlog cannot monopolise the scheduler. */
 const NEVER_DISPATCHED_RUN_SWEEP_LIMIT = 50;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = [

@@ -10,8 +10,13 @@ import type { ExecutionProjection } from "@paperclipai/shared";
 import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
 import { executionBlockerPredicate } from "./execution-blocker.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import {
+  isNeverDispatchedQueuedRun,
+  NEVER_DISPATCHED_RUN_ERROR_CODE,
+} from "./never-dispatched-run.js";
 const text = (v: unknown) => (typeof v === "string" ? v : null);
 const executionRunColumns = {
+  createdAt: heartbeatRuns.createdAt,
   id: heartbeatRuns.id,
   errorCode: heartbeatRuns.errorCode,
   executionControlDeadlineAt: heartbeatRuns.executionControlDeadlineAt,
@@ -330,6 +335,32 @@ export function projectExecution(
       projection.nextAction = "Verify the stopped session and its saved work before starting a new attempt.";
     }
     return held("Recovery needed");
+  }
+  // A `queued` run the dispatcher never claimed still holds its issue's
+  // execution lock, so the issue is unwritable — but the run itself is not
+  // executing, has produced no output, and is not retrying. Read as a plain
+  // `queued` it is indistinguishable from a run that is one second away from
+  // being dispatched, which is how a wedged `in_progress` issue ends up looking
+  // like healthy work in flight on the board.
+  //
+  // The predicate is the same measured, grace-bounded one the age-out sweep
+  // uses, not a bare `status === "queued"` test. `queued` is a legitimate live
+  // state for a run waiting its turn, and the observed queue wait reaches
+  // 7.09 h; reporting those as stranded would be wrong. See
+  // NEVER_DISPATCHED_RUN_ADMISSION_WINDOW_MS for the measurement.
+  //
+  // This branch sits after the recovery-action branch above on purpose: when a
+  // recovery row already explains the run, that explanation is the better one.
+  // It is for the bare stranded run that would otherwise have no affordance at
+  // all. `recoveryOwner` is `agent` because the assignee can release their own
+  // stranded run through the cancel route; this is not a board-only stop.
+  if (isNeverDispatchedQueuedRun(run, now)) {
+    projection.recoveryOwner = "agent";
+    projection.cause = NEVER_DISPATCHED_RUN_ERROR_CODE;
+    projection.nextAction =
+      "The dispatcher never claimed this run, so it is holding the issue lock without doing any work. Cancel this run to release the lock.";
+    projection.permittedActions.push("inspect_recovery");
+    return set("recovery_needed", "Stuck in queue");
   }
   if (run.status === "succeeded") {
     if (pending.length)
