@@ -19,7 +19,7 @@ function deferred<T = void>() {
 }
 
 function stubLogger() {
-  return { info: vi.fn(), error: vi.fn() };
+  return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
 describe("finalizeServerShutdown", () => {
@@ -332,7 +332,9 @@ describe("drainRunExecutionFinalizersForShutdown", () => {
       });
       await vi.advanceTimersByTimeAsync(250);
       await expect(pending).resolves.toBe("timed_out");
-      expect(log.info).toHaveBeenCalledWith(
+      // `warn`, not `info`: a drain that gave up is the difference between an
+      // orderly stop and a wedged one.
+      expect(log.warn).toHaveBeenCalledWith(
         expect.objectContaining({ timeoutMs: 250 }),
         expect.stringContaining("timed out"),
       );
@@ -427,6 +429,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: { mode: "prepared", skipDrain: true },
       preparationError: null,
       waitedForSchedulerIdle: true,
+      abandonedSchedulerSweeps: [],
     });
   });
 
@@ -452,6 +455,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       },
       preparationError: null,
       waitedForSchedulerIdle: true,
+      abandonedSchedulerSweeps: [],
     });
   });
 
@@ -483,6 +487,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: { mode: "not_requested", skipDrain: false },
       preparationError: null,
       waitedForSchedulerIdle: true,
+      abandonedSchedulerSweeps: [],
     });
   });
 
@@ -500,6 +505,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: null,
       preparationError: null,
       waitedForSchedulerIdle: true,
+      abandonedSchedulerSweeps: [],
     });
   });
 
@@ -520,6 +526,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: null,
       preparationError,
       waitedForSchedulerIdle: true,
+      abandonedSchedulerSweeps: [],
     });
   });
 });

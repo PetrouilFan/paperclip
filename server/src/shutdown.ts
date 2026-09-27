@@ -4,6 +4,12 @@ type HotRestartShutdownPreparation = {
 
 type ShutdownLogger = {
   info(obj: object, msg: string): void;
+  /**
+   * A truncated drain. Deliberately not `info`: a drain that gave up is the
+   * difference between an orderly stop and a wedged one, and it is the only
+   * line that records which sweeps or runs were still holding the unit.
+   */
+  warn(obj: object, msg: string): void;
   error(obj: object, msg: string): void;
 };
 
@@ -25,7 +31,7 @@ export async function drainRunExecutionFinalizersForShutdown(input: {
       }),
     ]);
     if (result === "timed_out") {
-      input.log.info(
+      input.log.warn(
         { signal: input.signal, timeoutMs },
         "bounded heartbeat execution finalizer drain timed out",
       );
@@ -195,6 +201,176 @@ export async function finalizeServerShutdown(input: {
 
 const COORDINATED_SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM"] as const;
 
+/**
+ * The wall-clock budget systemd gives this process to stop, in milliseconds.
+ *
+ * This mirrors `TimeoutStopSec=300` in the unit rendered by
+ * `cli/src/services/service-manager.ts`. It is a mirror, not a channel: the unit
+ * is not readable from here, and a server that read the wrong number would be
+ * worse than one that reads a stale one. What keeps the two honest is
+ * `server/src/__tests__/shutdown-stop-budget.test.ts`, which parses the rendered
+ * unit and fails if the drain budget is no longer strictly below it. Lowering
+ * `TimeoutStopSec` without lowering this is a test failure, not a silent wedge.
+ *
+ * The number is load-bearing in the other direction too, which is why
+ * `TimeoutStopSec` must not be reduced on its own: the graceful run drain waits
+ * for an in-flight agent run, and `adapter_config.timeoutSec` is 3600 on every
+ * `opencode_local` agent, raised from 1800 to 3600 on all eight of them. A drain
+ * that can wait an hour inside a five-minute stop budget is not a drain, it is a
+ * guaranteed cgroup-wide
+ * SIGKILL — and it is guaranteed whether or not any of the bugs fixed here are
+ * reachable. That is the arithmetic `resolveHeartbeatDrainBudgetMs` exists to
+ * close.
+ */
+export const SHUTDOWN_STOP_BUDGET_MS = 300_000;
+
+/**
+ * What the stop budget keeps back for everything that is not the run drain:
+ * the notify, the scheduler idle wait, the HTTP listener close, the database
+ * pool end, the embedded postmaster stop, and the OTel/Sentry flushes. A stop
+ * that spends all 300 s on the drain has no budget left for any of them, and
+ * `finalizeServerShutdown` is the code that has to run before `process.exit(0)`.
+ */
+export const SHUTDOWN_STOP_RESERVE_MS = 60_000;
+
+/**
+ * The scheduler idle wait's own ceiling, taken out of the reserve rather than
+ * added on top of it, so the two bounded waits still sum to less than the stop
+ * budget. Ten seconds is far above a real drain: the six execution-control
+ * sweeps are single-flight DB queries, and the wait only has to let an
+ * already-running one commit before the run snapshot is taken. It exists to
+ * bound a query that never returns, not to be generous.
+ */
+export const SHUTDOWN_SCHEDULER_IDLE_TIMEOUT_MS = 10_000;
+
+/**
+ * The graceful run drain's deadline: the stop budget minus the reserve.
+ *
+ * Strictly less than `SHUTDOWN_STOP_BUDGET_MS` by construction, and asserted to
+ * be so in `shutdown-stop-budget.test.ts` against the *rendered unit* rather
+ * than against this file. A run that cannot drain inside it is abandoned; the
+ * caller flushes `flushInFlightRunLogMirrors()` immediately afterwards, which is
+ * what keeps an abandoned run's output from being lost with the process.
+ */
+export function resolveHeartbeatDrainBudgetMs(options: {
+  stopBudgetMs?: number;
+  reserveMs?: number;
+} = {}): number {
+  const stopBudgetMs = options.stopBudgetMs ?? SHUTDOWN_STOP_BUDGET_MS;
+  const reserveMs = options.reserveMs ?? SHUTDOWN_STOP_RESERVE_MS;
+  const budget = stopBudgetMs - reserveMs;
+  if (budget <= 0) {
+    throw new Error(
+      `heartbeat drain budget must be positive: stopBudgetMs=${stopBudgetMs} reserveMs=${reserveMs}`,
+    );
+  }
+  return budget;
+}
+
+/**
+ * Wait for tracked scheduler work, but never longer than `timeoutMs`.
+ *
+ * This replaces the deadline-free `while (inFlight.size > 0) await
+ * Promise.allSettled(...)` loop. That loop is a hang, not a wait: the tracked
+ * work is six DB-backed execution-control sweeps plus the environment, GitHub
+ * and tool-continuity sweeps, and nothing in a shutdown can force a query that
+ * is already in flight on a dying database to return. The loop is also
+ * unbounded in *iterations*, because a sweep that settles can immediately hand
+ * the set a new tracked promise before the size is read again.
+ *
+ * What is given up is named, not swallowed. `tracked` maps a still-pending
+ * promise to the label of the scheduler tick that started it, so the timeout
+ * line is the only record anyone ever gets that a drain was truncated and which
+ * sweeps were still holding it. Without the labels the log could say "timed
+ * out" and leave the operator to guess between six sweeps and a dozen.
+ */
+export async function waitForTrackedSchedulerWork(input: {
+  tracked: Map<string, Promise<void>>;
+  timeoutMs: number;
+  signal: "SIGINT" | "SIGTERM";
+  log: ShutdownLogger;
+}): Promise<{ idled: boolean; abandoned: string[] }> {
+  if (input.tracked.size === 0) return { idled: true, abandoned: [] };
+  let timer: NodeJS.Timeout | null = null;
+  const pending = [...input.tracked.values()];
+  try {
+    const result = await Promise.race([
+      Promise.allSettled(pending).then(() => "idled" as const),
+      // Deliberately not `unref`'d. An unreferenced deadline is skipped
+      // entirely whenever the event loop would otherwise be empty, which is
+      // precisely when a drain that depends on nothing else is most likely to be
+      // the thing still holding the process. A deadline that can be skipped is
+      // not a deadline.
+      new Promise<"timed_out">((resolve) => {
+        timer = setTimeout(() => resolve("timed_out"), input.timeoutMs);
+      }),
+    ]);
+    if (result === "timed_out") {
+      // Read the live set rather than the snapshot: a label that started after
+      // the race was armed is also work this wait gave up on.
+      const abandoned = [...input.tracked.keys()];
+      input.log.warn(
+        {
+          signal: input.signal,
+          timeoutMs: input.timeoutMs,
+          abandonedSweeps: abandoned,
+          abandonedCount: abandoned.length,
+        },
+        "heartbeat scheduler drain timed out; continuing shutdown without quiescing the remaining sweeps",
+      );
+      return { idled: false, abandoned };
+    }
+    return { idled: true, abandoned: [] };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Run a drain with a deadline, and report whether it finished.
+ *
+ * A drain that is still pending when the deadline arrives is abandoned, not
+ * awaited. The caller is already inside a stop budget it cannot extend, and a
+ * `TimeoutStopSec` SIGKILL is strictly worse than an abandoned run: it takes
+ * the database, every other run in the cgroup, and the unit's own clean-exit
+ * record with it. An abandoned run leaves its rows in `running` for the reaper,
+ * which is the same place a SIGKILLed run leaves them, and its output reaches
+ * the run log through the in-flight mirror flush that follows.
+ */
+export async function drainWithDeadline<T>(input: {
+  drain: (() => Promise<T>) | null;
+  timeoutMs: number;
+  signal: "SIGINT" | "SIGTERM";
+  log: ShutdownLogger;
+  timedOutMessage: string;
+}): Promise<{ outcome: "drained" | "timed_out" | "unavailable"; value?: T }> {
+  if (!input.drain) return { outcome: "unavailable" };
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    const result = await Promise.race([
+      input.drain().then(
+        (value) => ({ outcome: "drained" as const, value }),
+        (err: unknown) => ({ outcome: "drained" as const, value: undefined, err }),
+      ),
+      // Not `unref`'d, for the same reason as the scheduler idle wait above.
+      new Promise<{ outcome: "timed_out" }>((resolve) => {
+        timer = setTimeout(() => resolve({ outcome: "timed_out" }), input.timeoutMs);
+      }),
+    ]);
+    if (result.outcome === "timed_out") {
+      input.log.warn(
+        { signal: input.signal, timeoutMs: input.timeoutMs },
+        input.timedOutMessage,
+      );
+    } else if ("err" in result) {
+      throw result.err;
+    }
+    return result as { outcome: "drained" | "timed_out"; value?: T };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 type ShutdownSignalTarget = {
   rawListeners(eventName: string): Function[];
   removeListener(eventName: string, listener: (...args: any[]) => void): unknown;
@@ -238,25 +414,97 @@ export async function loadWithoutCoordinatedShutdownSignalHooks<T>(
   return loaded;
 }
 
+/**
+ * The backstop's own deadline: the two bounded waits in front of the ordered
+ * teardown, plus the reserve.
+ *
+ * It has to be *larger* than the waits it is guarding. A watchdog armed at the
+ * run-drain budget would fire while a legitimate run drain was still counting
+ * down, turning a slow stop into the exact cgroup SIGKILL it exists to prevent —
+ * so the sum, not either term, is the number. It is still strictly inside the
+ * stop budget, which is what makes the exit it produces this process's own clean
+ * `exit(0)` rather than systemd's timeout kill.
+ */
+export function resolveShutdownWatchdogMs(options: {
+  stopBudgetMs?: number;
+  reserveMs?: number;
+} = {}): number {
+  return SHUTDOWN_SCHEDULER_IDLE_TIMEOUT_MS + resolveHeartbeatDrainBudgetMs(options);
+}
+
+/**
+ * The last-resort guarantee that a stop ends.
+ *
+ * `shutdown()` is `void`-ed from the signal handler, so nothing observes its
+ * promise: a rejection, or a step that never settles, means the process stays
+ * alive with a stopping unit until `TimeoutStopSec` expires and systemd
+ * SIGKILLs the cgroup. That is the wedge in
+ * the 2026-09-27 control-plane stops, and the bounded waits above remove the
+ * three awaits that were reachable. This is the
+ * backstop for the ones that are not known, and for the next one that gets
+ * added.
+ *
+ * The timer is deliberately not `unref`'d. An unreferenced timer is skipped
+ * whenever the event loop would otherwise be empty, which is exactly the state a
+ * process is in once the HTTP listener has closed and only the teardown is left —
+ * so an `unref`'d watchdog is a watchdog that stops watching at the moment it
+ * starts to matter. `clearShutdownWatchdog()` is called on the normal path,
+ * which is what makes this a backstop and not a policy.
+ */
+export function startShutdownExitWatchdog(input: {
+  signal: "SIGINT" | "SIGTERM";
+  timeoutMs?: number;
+  log: ShutdownLogger;
+  exit: (code: number) => void;
+  setTimer: (fn: () => void, ms: number) => unknown;
+  clearTimer: (handle: unknown) => void;
+}): () => void {
+  const timeoutMs = input.timeoutMs ?? resolveShutdownWatchdogMs();
+  const handle = input.setTimer(() => {
+    input.log.error(
+      { signal: input.signal, timeoutMs },
+      "shutdown did not complete inside its budget; exiting anyway rather than waiting for TimeoutStopSec",
+    );
+    input.exit(0);
+  }, timeoutMs);
+  return () => input.clearTimer(handle);
+}
+
 export async function coordinateHeartbeatSchedulerShutdown<
   TPreparation extends HotRestartShutdownPreparation,
 >(input: {
   signal: "SIGINT" | "SIGTERM";
   prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<TPreparation>) | null;
-  waitForHeartbeatSchedulerIdle: () => Promise<void>;
+  waitForHeartbeatSchedulerIdle: () => Promise<{ idled: boolean; abandoned: string[] } | void>;
+  log?: ShutdownLogger;
 }): Promise<{
   hotRestart: TPreparation | null;
   preparationError: unknown;
   waitedForSchedulerIdle: boolean;
+  abandonedSchedulerSweeps: string[];
 }> {
   let hotRestart: TPreparation | null = null;
   let preparationError: unknown = null;
+  let abandonedSchedulerSweeps: string[] = [];
 
   // The signal handler stops the scheduler before entering this coordinator.
   // Quiesce any callback that was already in flight before querying running
   // rows for the shutdown snapshot, otherwise a late queue claim can create a
   // run that is absent from both the snapshot and the selective drain set.
-  await input.waitForHeartbeatSchedulerIdle();
+  //
+  // A wait that gives up is reported, not thrown. The snapshot is still taken:
+  // a run created by a sweep that was still holding the process is a run the
+  // reaper picks up, which is the same outcome as a run created a millisecond
+  // later, and refusing to snapshot at all would leave every run in the table
+  // untouched by a stop that did happen.
+  const idle = await input.waitForHeartbeatSchedulerIdle();
+  if (idle && idle.idled === false) {
+    abandonedSchedulerSweeps = idle.abandoned;
+    input.log?.warn(
+      { signal: input.signal, abandonedSchedulerSweeps: abandonedSchedulerSweeps },
+      "continuing shutdown with execution-control sweeps still in flight",
+    );
+  }
 
   if (input.prepareHotRestartShutdown) {
     try {
@@ -270,5 +518,6 @@ export async function coordinateHeartbeatSchedulerShutdown<
     hotRestart,
     preparationError,
     waitedForSchedulerIdle: true,
+    abandonedSchedulerSweeps,
   };
 }

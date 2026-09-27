@@ -112,20 +112,51 @@ export function buildSystemdNotifyEnv(
 }
 
 /**
+ * The ceiling on one notify, and why the ceiling is the whole point of the
+ * `timeout` option below.
+ *
+ * `systemd-notify` is a single `sendmsg` to a unix datagram socket; it was
+ * measured at 4 ms on this host. Anything that has not answered in
+ * `SYSTEMD_NOTIFY_TIMEOUT_MS` is not slow, it is wedged — a hung child, a
+ * `PATH` lookup on a stalled mount, a fork that cannot be reaped. A notify is
+ * also the *first* thing `shutdown()` awaits, before the scheduler latch and
+ * before every drain, so an unbounded wait here is an unbounded wait on the
+ * whole shutdown: the unit is already stopping, `TimeoutStopSec` is already
+ * counting, and the process sits there until systemd SIGKILLs the cgroup. That
+ * is the production signature of the 2026-09-27 control-plane stops,
+ * reproduced on a throwaway unit with no external actor and automated in
+ * `server/src/__tests__/notify-stop-hang-probe.test.ts`.
+ *
+ * So the wait is bounded twice over: `execFile`'s own `timeout` (which signals
+ * the child, unlike a bare race that leaks it) and the `Promise.race` in
+ * `notify()` (which also covers binary resolution and a child that ignores
+ * `SIGTERM`). A dropped datagram costs a stale `STOPPING=1`/`READY=1`; a
+ * dropped `process.exit(0)` costs the unit a `TimeoutStopSec` of darkness and
+ * every in-flight run in the cgroup. The trade is not close.
+ */
+export const SYSTEMD_NOTIFY_TIMEOUT_MS = 2_000;
+
+/**
  * Run the notifier and report whether systemd took the datagram.
  *
  * The exit code is not the acceptance signal — `systemd-notify` exits 0 for a
  * datagram a `NotifyAccess=main` unit discards, which is how a bad setting reads
  * as a green probe. The boolean is the best answer this process can get, and it
  * is why the setting is not the setting.
+ *
+ * A timeout resolves `false` on the callback, exactly as a spawn failure does.
+ * The caller cannot tell "systemd refused it" from "the notifier never
+ * answered", and does not need to: both mean the unit did not take the
+ * datagram, and neither is a reason to keep the shutdown waiting.
  */
 export async function runSystemdNotifyBinary(
   binary: string,
   args: string[],
   env: NodeJS.ProcessEnv,
+  timeoutMs: number = SYSTEMD_NOTIFY_TIMEOUT_MS,
 ): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
-    execFile(binary, args, { windowsHide: true, env }, (error) => resolve(!error));
+    execFile(binary, args, { windowsHide: true, env, timeout: timeoutMs }, (error) => resolve(!error));
   });
 }
 
@@ -135,6 +166,48 @@ export type SystemdNotifierDeps = {
   /** The notifier binary, resolved once per process. */
   resolveBinary: () => Promise<string>;
   run: typeof runSystemdNotifyBinary;
+  /**
+   * The ceiling on the whole notify, binary resolution included. Defaults to
+   * `SYSTEMD_NOTIFY_TIMEOUT_MS`.
+   */
+  timeoutMs?: number;
+};
+
+/**
+ * Race `work` against a deadline, and make the deadline stick.
+ *
+ * The timer is deliberately not `unref`'d, for the same reason the three
+ * deadlines in `server/src/shutdown.ts` are not: an unreferenced timer is
+ * skipped entirely whenever the event loop would otherwise be empty, which is
+ * exactly the state a process is in once its last handle is gone. A deadline
+ * that can be skipped is not a deadline.
+ *
+ * That is not a theoretical concern here, and it is the reason this deadline
+ * exists at all. `execFile`'s own `timeout` only bounds the *child*, and only
+ * once `run()` has been reached. The `resolveBinary()` await above it is an
+ * `fs.access` chain over `PATH` — the one wedging mechanism this module's own
+ * docs name — and on a process that has already closed its listener it is the
+ * only thing left. `unref`'d, that promise never settles and the loop empties.
+ * In `shutdown()`'s real shape — an `await` inside a `void`-ed function — node
+ * exits **0** with the notify unresolved: a clean exit code and a unit that
+ * looks like it stopped, while `TimeoutStopSec` is still counting.
+ *
+ * The cost of holding the reference is at most `timeoutMs` of process lifetime
+ * on a path that is already failing. That is not a close trade against an
+ * unbounded wait.
+ */
+const withNotifyTimeout = async <T>(timeoutMs: number, onTimeout: () => T, work: Promise<T>) => {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(onTimeout()), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 };
 
 /**
@@ -148,17 +221,21 @@ export function createSystemdNotifier(overrides: Partial<SystemdNotifierDeps> = 
   const resolveBinary =
     overrides.resolveBinary ??
     (() => (resolvedBinary ??= resolveSystemdNotifyBinary()));
+  const timeoutMs = overrides.timeoutMs ?? SYSTEMD_NOTIFY_TIMEOUT_MS;
 
   return async function notify(args: string[]): Promise<boolean> {
-    const notifySocket = (overrides.notifySocket ?? (() => process.env.NOTIFY_SOCKET))()?.trim();
-    if (!notifySocket) return false;
-    const binary = await resolveBinary();
-    const run = overrides.run ?? runSystemdNotifyBinary;
-    return await run(
-      binary,
-      args,
-      buildSystemdNotifyEnv(notifySocket, { needsPathLookup: binary === SYSTEMD_NOTIFY_BARE_NAME }),
-    );
+    return await withNotifyTimeout(timeoutMs, () => false, (async () => {
+      const notifySocket = (overrides.notifySocket ?? (() => process.env.NOTIFY_SOCKET))()?.trim();
+      if (!notifySocket) return false;
+      const binary = await resolveBinary();
+      const run = overrides.run ?? runSystemdNotifyBinary;
+      return await run(
+        binary,
+        args,
+        buildSystemdNotifyEnv(notifySocket, { needsPathLookup: binary === SYSTEMD_NOTIFY_BARE_NAME }),
+        timeoutMs,
+      );
+    })());
   };
 }
 
