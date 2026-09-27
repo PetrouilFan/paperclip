@@ -1338,6 +1338,16 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/join-requests",
   "POST /api/companies/{companyId}/join-requests/{requestId}/approve",
   "POST /api/companies/{companyId}/join-requests/{requestId}/reject",
+
+  // The three approval decision routes call assertBoard(req) before anything
+  // else, so an agent actor gets 403. Declaring them board_or_agent told an
+  // agent reader they were agent-callable, and it was wrong on both counts
+  // (x-paperclip-authorization and the AgentBearerAuth security entry the
+  // actor level implies). See server/src/__tests__/approvals-authorization-contract.test.ts,
+  // which fails if this list and approvals.ts drift apart again.
+  "POST /api/approvals/{id}/approve",
+  "POST /api/approvals/{id}/reject",
+  "POST /api/approvals/{id}/request-revision",
   "GET /api/companies/{companyId}/members",
   "PATCH /api/companies/{companyId}/members/{memberId}",
   "PATCH /api/companies/{companyId}/members/{memberId}/role-and-grants",
