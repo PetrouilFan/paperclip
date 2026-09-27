@@ -55,14 +55,6 @@ describe("runner API catalog", () => {
     expect(runnerApiOperation("POST /api/companies/{companyId}/agent-hires").dedicatedTools).toEqual(["hire_agent"]);
     expect(runnerApiOperation("POST /api/companies/{companyId}/agent-hires").dedicatedToolGuidance).toContain("inherits the caller's native runtime");
   });
-  it.each(runnerApiCatalog().filter(operation => operation.transport === "rest"))("resolves the catalog route $operationId inside the bound origin", operation => {
-    const pathParams = Object.fromEntries(operation.parameters.filter(parameter => parameter.in === "path").map(parameter => [parameter.name, parameter.name === "companyId" ? context.companyId : "fixture-id"]));
-    const url = runnerApiUrl(operation, { operationId: operation.operationId, pathParams }, context, "https://paperclip.test");
-    expect(url.origin).toBe("https://paperclip.test");
-    expect(url.pathname).not.toContain("{");
-    expect(operation.responses).toBeDefined();
-    expect(operation.authorization.actor).toBeTruthy();
-  });
   it.each(
     runnerApiCatalog().filter((operation) => operation.transport === "rest"),
   )(
@@ -98,7 +90,24 @@ describe("runner API catalog", () => {
       searchRunnerApi({ query: "GET /api/companies/{companyId}/issues" })
         .results[0].dedicatedTools,
     ).toContain("search_tasks");
-    expect(searchRunnerApi({ query: "nothing-zzzzzzzzzz" }).total).toBe(0);
+    // Every token of the probe must be a token the catalog never uses, because
+    // searchRunnerApi scores every token it can find. An earlier probe,
+    // "nothing-zzzzzzzzzz", was only nonsense in its distinguishing half: it
+    // carried the ordinary word "nothing", and the issues-count description ends
+    // in "they mean nothing here", so the probe matched that one operation and
+    // this assertion failed on any commit that wrote that sentence. A probe
+    // that reads like English is a probe that breaks when the prose changes.
+    expect(searchRunnerApi({ query: "qqzzz-xvvv-4417" }).total).toBe(0);
+  });
+  it("keeps real matches when the query also carries a term the catalog never contains", () => {
+    // searchRunnerApi is an OR ranker, on purpose. Natural-language queries
+    // carry filler words that match nothing ("list my open issues"), and an AND
+    // rule would answer those with zero results. Do not tighten it into AND
+    // without a recall evaluation over the whole catalog.
+    const results = searchRunnerApi({ query: "list issues zqxjwvb" }).results;
+    expect(results.map((entry) => entry.operationId)).toContain(
+      "GET /api/companies/{companyId}/issues",
+    );
   });
   it("paginates without duplicates and rejects stale or mismatched cursors", () => {
     const first = searchRunnerApi({ query: "project", limit: 1 });
