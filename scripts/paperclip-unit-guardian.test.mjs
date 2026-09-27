@@ -153,7 +153,7 @@ test("the documented incident matches the measured reproduction", () => {
 function loadProbe() {
   const fn = script.match(/^pid_is_stopped\(\) \{[\s\S]*?^\}/m);
   assert.ok(fn, "could not extract pid_is_stopped from the guardian");
-  const dir = mkdtempSync(join(tmpdir(), "unguard-"));
+  const dir = mkdtempSync(join(tmpdir(), "guardian-probe-"));
   const helper = join(dir, "probe.sh");
   writeFileSync(helper, `#!/usr/bin/env bash\n${fn[0]}\n"$@"\n`);
   execFileSync("chmod", ["+x", helper]);

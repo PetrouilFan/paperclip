@@ -23,7 +23,7 @@ rm -f "$PROBE_STATE"/guardian.log "$PROBE_STATE"/freeze-count
 
 # The healing logic under test, byte-identical to what is installed, with only the
 # unit name and the state directory redirected.
-sed -e 's|^UNIT="paperclipai.service"|UNIT="unguard-heal.service"|' \
+sed -e 's|^UNIT="paperclipai.service"|UNIT="guardian-heal-probe.service"|' \
     -e "s|\$HOME/.local/state/paperclip-unit-guardian|$PROBE_STATE|g" \
     "$GUARDIAN" > "$SCRATCH/guardian-probe.sh"
 chmod +x "$SCRATCH/guardian-probe.sh"
@@ -42,7 +42,7 @@ D="$HOME/.config/systemd/user"
 #     cannot drain, so a stop request runs out TimeoutStopSec and systemd
 #     SIGKILLs the cgroup. That is the 00:50:01 -> 01:07:04 chain, reproduced.
 echo "== leg 1: freeze wedge on a throwaway unit (the failure class) =="
-U1=unguard-freeze.service
+U1=guardian-freeze-probe.service
 cat > "$D/$U1" <<'UNIT'
 [Unit]
 Description=frozen-cgroup wedge probe
@@ -86,7 +86,7 @@ rm -f "$D/$U1"; systemctl --user daemon-reload
 
 # --- Leg 2: the guardian's step 6 resumes a frozen main PID.
 echo "== leg 2: guardian step 6 resumes a frozen main PID =="
-U2=unguard-heal.service
+U2=guardian-heal-probe.service
 cat > "$D/$U2" <<'UNIT'
 [Unit]
 Description=guardian heal probe
