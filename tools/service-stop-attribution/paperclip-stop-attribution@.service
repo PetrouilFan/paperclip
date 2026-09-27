@@ -1,0 +1,31 @@
+# A watcher for one unit's stops, as a user unit.
+#
+#   cp paperclip-stop-attribution@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now paperclip-stop-attribution@paperclipai.service
+#
+# It only reads. It appends to the ledger and exits non-zero if the journal
+# child dies, so Restart=always brings the watcher back rather than leaving the
+# ledger silently unwatched.
+#
+# The instance is the unit to watch, so the ledger covers whatever the board
+# runs. Note what this unit must NOT do: declare `Type=notify`, or
+# `NotifyAccess=`, or inherit a NOTIFY_SOCKET it then hands on. It is a plain
+# `Type=simple` process that never sends a notification.
+[Unit]
+Description=Record stops of %i into a durable per-stop ledger
+Documentation=file:%h/.paperclip/instances/default/libexec/stop-attribution/README.md
+After=default.target
+
+[Service]
+Type=simple
+Environment=PAPERCLIP_HOME=%h/.paperclip
+ExecStart=/usr/bin/env node %h/.paperclip/instances/default/libexec/stop-attribution/bin/service-stop-attribution.mjs watch --unit %i
+Restart=always
+RestartSec=10
+# The watcher holds one journalctl child and a bounded in-memory tail. This is
+# a ceiling on a mistake, not an expectation.
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target
