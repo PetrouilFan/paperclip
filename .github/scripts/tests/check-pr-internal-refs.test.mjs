@@ -53,6 +53,7 @@ const DECLARED_FIXTURE_IDS = new Set([
   'PET-9003',
   'PET9003',
   'PET-9004',
+  'PET-9005',
 ]);
 
 /**
@@ -749,14 +750,114 @@ test('the address rule cannot fire on a branch authority, because git forbids on
   assert.equal(bare.passed, true, JSON.stringify(bare.failures, null, 2));
 });
 
-test('the commit-subject scan reads the subject, not the body of the message', () => {
-  // A long commit body is prose the author wrote for `git log`; the rule that
-  // survives the merge is the subject line, and that is the line checked here.
+test('a commit body is authored text, so both halves of the rule apply to it', () => {
+  // The subject and the body are separate surfaces with separate remedies, so
+  // they are reported separately and an id in both is two findings.
   const result = checkInternalRefs({
     ...CLEAN,
-    commits: [{ commit: { message: 'fix(api): survive a restart\n\ncurl http://localhost:3100/api/health\n' } }],
+    commits: [
+      { sha: 'aaa11111', commit: { message: 'fix(api): survive a restart\n\nCarries on from PET-9005 and the\nplan in /PET/issues/PET-9005.\n' } },
+    ],
+  });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  const joined = result.failures.join('\n');
+  assert.match(joined, /A commit message body carries/);
+  assert.match(joined, /PET-9005/);
+  // The subject was clean, so the subject surface must not be blamed.
+  assert.doesNotMatch(joined, /A commit subject carries/);
+  // And the remedy has to be the one that fits a body.
+  assert.match(joined, /Edit the commit message/);
+});
+
+test('an address in a commit body is a leak too, and the body is not a diff line', () => {
+  // The gate's own stated principle: "Authored text is where the address is a
+  // leak; a diff line is where it is usually the subject matter." A commit
+  // body is authored text, so the address half applies even though the same
+  // string in a diff line is left alone.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'bbb22222', commit: { message: 'fix(api): survive a restart\n\nReached at http://localhost:3100/api/health\n' } },
+    ],
+  });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  const joined = result.failures.join('\n');
+  assert.match(joined, /A commit message body carries/);
+  assert.match(joined, /localhost/);
+});
+
+test('the same string in a diff line is still left alone', () => {
+  // The control for the test above: if this ever starts failing, the diff
+  // surface has started reading like authored text, and the gate is born
+  // failing on 664 files of correct code.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [
+      {
+        filename: 'server/src/e2e/rebind.test.ts',
+        changes: 2,
+        patch: '@@ -1 +1 @@\n-await http.get("http://127.0.0.1:8099/v1")\n+await http.get(baseUrl)\n',
+      },
+    ],
   });
   assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('an id in the subject is one finding, not one per surface', () => {
+  // The body scan uses `lines.slice(1)`, so a subject id is never re-reported
+  // as a body id. An author who fixed the subject and got two paragraphs
+  // learns to skip the gate.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ sha: 'ccc33333', commit: { message: 'fix(issues): a blocker edge (PET-9005)\n\nNo id down here.\n' } }],
+  });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  const joined = result.failures.join('\n');
+  assert.match(joined, /A commit subject carries/);
+  assert.doesNotMatch(joined, /A commit message body carries/);
+  assert.equal((joined.match(/A commit (?:subject|message body) carries/g) ?? []).length, 1);
+});
+
+test('a commit message that is only a subject is not scanned twice', () => {
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ sha: 'ddd44444', commit: { message: 'fix(api): survive a restart' } }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('an unreadable commit list fails closed instead of reporting a clean scan', () => {
+  // The commit fetch is allowed to fail so a transient 5xx cannot take down the
+  // gates that block. That makes an empty list ambiguous, and the ambiguous
+  // reading must not be the permissive one.
+  const result = checkInternalRefs({ ...CLEAN, commits: [], commitsUnavailable: true });
+  assert.equal(result.passed, false);
+  const joined = result.failures.join('\n');
+  assert.match(joined, /commit list could not be read/);
+  assert.match(joined, /not a clean scan/);
+  assert.match(joined, /Do not read `passed: true`/);
+});
+
+test('an empty commit list from a healthy fetch is not a failure', () => {
+  // The counterpart, so the fail-closed leg cannot be satisfied by passing
+  // `commitsUnavailable: true` on every call and disabling the surface.
+  const result = checkInternalRefs({ ...CLEAN, commits: [] });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('an unavailable commit list still scans the surfaces it can read', () => {
+  // Failing closed must not become failing blind: the title, body, branch and
+  // diff are all still read, and a leak in one of them is still reported.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    prTitle: 'fix(issues): a blocker edge (PET-9005)',
+    commits: [],
+    commitsUnavailable: true,
+  });
+  assert.equal(result.passed, false);
+  const joined = result.failures.join('\n');
+  assert.match(joined, /The PR title carries `PET-9005`/);
+  assert.match(joined, /commit list could not be read/);
 });
 
 test('the address rule reports the address, and one finding once per surface', () => {

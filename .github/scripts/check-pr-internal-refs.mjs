@@ -104,9 +104,9 @@
  *
  * CONTRIBUTING.md's section also bans `localhost`, private-IP and tailnet URLs,
  * and that rule *is* checked here — but only in the text an author writes: the
- * PR title, the description, the branch name, the commit subjects. It is
- * deliberately not applied to the diff, and the difference is the whole
- * design.
+ * PR title, the description, the branch name, the commit subjects and the
+ * commit message bodies. It is deliberately not applied to the diff, and the
+ * difference is the whole design.
  *
  * The evidence for the restriction is the measurement this file's identifier
  * half already records: `\b(localhost|127\.0\.0\.1)` matches 664 files on
@@ -141,7 +141,11 @@
  * - a changed file reports line changes but carries no patch to scan;
  * - a patch hunk is shorter than its own header declares (GitHub truncates
  *   large diffs and the truncation is not flagged anywhere in the payload);
- * - the changed-file list reached GitHub's 3000-file cap.
+ * - the changed-file list reached GitHub's 3000-file cap;
+ * - the commit list could not be fetched, so the commit-message surface was
+ *   never read. The fetch is optional so a transient 5xx cannot take down the
+ *   gates that do block, which is right; reading its failure as "no
+ *   references found" would be the gate answering about text it never saw.
  *
  * A gate that answers "passed" because it could not look is worse than no gate,
  * because it is evidence.
@@ -605,7 +609,9 @@ export function patchIsComplete(patch) {
  * @param {string} input.prTitle
  * @param {string} input.prBody
  * @param {string} input.prBranch
- * @param {Array<{commit?: {message?: string}}>} [input.commits]
+ * @param {Array<{commit?: {message?: string}, sha?: string}>} [input.commits]
+ * @param {boolean} [input.commitsUnavailable]  the commit fetch failed; the
+ *   commit-message surface was therefore not scanned at all
  * @param {Array<object>} [input.files]  entries of `/pulls/{n}/files`
  * @param {string|string[]|undefined} [input.prefixes]
  * @param {string|string[]|undefined} [input.productOwnedPrefixes]
@@ -616,6 +622,7 @@ export function checkInternalRefs({
   prBody = '',
   prBranch = '',
   commits = [],
+  commitsUnavailable = false,
   files = [],
   prefixes,
   productOwnedPrefixes,
@@ -629,6 +636,24 @@ export function checkInternalRefs({
   const { separated, compact, link } = buildMatchers(resolved);
   const prefixLabel = resolved.map((p) => `${p}-<number>`).join(', ');
   const failures = [];
+
+  // A surface the run could not read is not a surface that is clean. The
+  // commit list is fetched separately from the pull payload and is allowed to
+  // fail, so an empty list is ambiguous: it means either "this pull request
+  // has no commits", which cannot happen, or "the fetch failed". Reporting
+  // `passed: true` off the second reading is the one thing this gate must
+  // never do — it is a claim about text the run never saw.
+  //
+  // This is the same principle as the truncated-patch and 3000-file-cap
+  // handling below, which already refuse to claim a clean scan.
+  if (commitsUnavailable) {
+    failures.push(
+      'The commit list could not be read, so the commit-message surface was not scanned and this result is not a ' +
+      'clean scan. The `/pulls/{n}/commits` fetch is allowed to fail so that a transient 5xx cannot take down ' +
+      'the gates that do block; the cost is that this gate then has nothing to read. Re-run the gate once the ' +
+      'API is reachable. Do not read `passed: true` here as "no internal references found".'
+    );
+  }
 
   const report = (surface, location, hits, extra = '') => {
     const listed = [...new Set(hits)].slice(0, 8).map((h) => `\`${h}\``).join(', ');
@@ -748,10 +773,33 @@ export function checkInternalRefs({
   // is how a branch name separates its words, so reading `-8099-` as a port
   // would mean matching most names with three digits in them.
 
-  // --- Surface 4: commit subjects ----------------------------------------
+  // --- Surface 4: commit messages, subject and body -----------------------
   // A squash collapses the branch into the PR title, but a merge or a rebase
-  // preserves these subjects, and a reviewer reading `git log` before merging
-  // reads them today.
+  // preserves these messages whole, and a reviewer reading `git log` before
+  // merging reads the body today, not just the subject.
+  //
+  // The body is scanned, and the two halves of the rule both apply to it. The
+  // header's own principle says the reason: "Authored text is where the
+  // address is a leak; a diff line is where it is usually the subject matter."
+  // A commit body is authored text by any reading — it is not a test fixture
+  // and not a diff line — so an identifier *or* an instance address in one is
+  // a leak on the same terms as the same string in the subject.
+  //
+  // This is not hypothetical. The three identifier literals that the gate
+  // reported `passed: true` alongside sat in commit bodies on the branch that
+  // shipped this gate, and the gate could not see them, because it read
+  // `split('\n')[0]` and stopped there.
+  //
+  // Subject and body are reported as separate surfaces so the remedy matches
+  // the defect: a subject is reworded with `git rebase -i`, and a body is
+  // edited in place on the commit. An author who fixed the id in their subject
+  // and got told to reword the subject learns to skip the gate.
+  const SUBJECT_REMEDY =
+    'Rewrite the subject (`git rebase -i`, `reword`); a merged subject is permanent history.';
+  const BODY_REMEDY =
+    'Edit the commit message on the commit itself (`git rebase -i`, `reword`, or the "Edit" button on ' +
+    'the commit page); a merged message is permanent history.';
+
   const commitHits = [];
   const commitLocations = [];
   for (const commit of commits ?? []) {
@@ -764,18 +812,45 @@ export function checkInternalRefs({
     commitLocations.push(firstLine.trim().slice(0, 80));
   }
   if (commitHits.length > 0) {
-    report('A commit subject', commitLocations[0], commitHits,
-      'Rewrite the subject (`git rebase -i`, `reword`); a merged subject is permanent history.');
+    report('A commit subject', commitLocations[0], commitHits, SUBJECT_REMEDY);
   }
   for (const commit of commits ?? []) {
     const message = commit?.commit?.message;
     if (typeof message !== 'string') continue;
     const firstLine = message.split('\n')[0];
-    unknownReport('A commit subject', firstLine.trim().slice(0, 80), firstLine, owned, [],
-      'Rewrite the subject (`git rebase -i`, `reword`); a merged subject is permanent history.');
+    const location = firstLine.trim().slice(0, 80);
+    unknownReport('A commit subject', location, firstLine, owned, [], SUBJECT_REMEDY);
     if (findInstanceHosts(firstLine).length > 0) {
-      hostReport('A commit subject', firstLine.trim().slice(0, 80), firstLine,
-        'Rewrite the subject (`git rebase -i`, `reword`); a merged subject is permanent history.');
+      hostReport('A commit subject', location, firstLine, SUBJECT_REMEDY);
+    }
+  }
+
+  // The body, on both halves. `lines.slice(1)` deliberately excludes the
+  // subject, so one identifier in the subject is one finding and not two.
+  const commitBodyHits = [];
+  const commitBodyLocations = [];
+  for (const commit of commits ?? []) {
+    const message = commit?.commit?.message;
+    if (typeof message !== 'string') continue;
+    const body = message.split('\n').slice(1).join('\n');
+    if (!body.trim()) continue;
+    const hits = [...findAll(body, separated), ...findAll(body, compact)];
+    if (hits.length === 0) continue;
+    commitBodyHits.push(...hits);
+    commitBodyLocations.push(`${commit?.sha ? String(commit.sha).slice(0, 8) : 'a commit'}: ${body.trim().slice(0, 72)}`);
+  }
+  if (commitBodyHits.length > 0) {
+    report('A commit message body', commitBodyLocations[0], commitBodyHits, BODY_REMEDY);
+  }
+  for (const commit of commits ?? []) {
+    const message = commit?.commit?.message;
+    if (typeof message !== 'string') continue;
+    const body = message.split('\n').slice(1).join('\n');
+    if (!body.trim()) continue;
+    const location = `${commit?.sha ? String(commit.sha).slice(0, 8) : 'a commit'}: ${body.trim().slice(0, 72)}`;
+    unknownReport('A commit message body', location, body, owned, [], BODY_REMEDY);
+    if (findInstanceHosts(body).length > 0) {
+      hostReport('A commit message body', location, body, BODY_REMEDY);
     }
   }
 
@@ -873,6 +948,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     prBody: process.env.PR_BODY ?? '',
     prBranch: process.env.PR_BRANCH ?? '',
     commits: JSON.parse(process.env.PR_COMMITS ?? '[]'),
+    commitsUnavailable: process.env.PR_COMMITS_UNAVAILABLE === '1',
     files: JSON.parse(process.env.PR_FILES ?? '[]'),
     prefixes: process.env.INTERNAL_REF_PREFIXES,
     productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,

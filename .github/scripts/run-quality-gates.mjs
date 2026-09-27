@@ -167,10 +167,19 @@ async function main() {
   // cannot fail a PR by design, so it must not be able to fail the workflow by
   // accident either. Sharing the Promise.all above would let one transient
   // 5xx on this request take down every gate, including the ones that block.
+  //
+  // The fetch staying optional does not make the surface optional. The
+  // internal-reference gate reads commits, and an empty list it cannot
+  // distinguish from "the fetch failed" would let it report `passed: true`
+  // about text it never saw. So the failure is recorded and handed to that
+  // gate, which fails closed on it; the co-author lookup still gets to be
+  // silent, because it is informational and has no verdict to lose.
   let commits = [];
+  let commitsUnavailable = false;
   try {
     commits = await fetchAllPullRequestCommits(ghFetch, GH_REPO, prNumber, GH_TOKEN);
   } catch (error) {
+    commitsUnavailable = true;
     console.error(`co-author lookup skipped: ${error.message}`);
   }
 
@@ -205,12 +214,14 @@ async function main() {
   // lookup: `commits` is populated by a fetch that is allowed to fail, and a
   // gate that needs it must see the empty list rather than never run at all.
   // On an empty list this gate still scans the title, the body, the branch and
-  // the whole diff — the commit-subject leg is the only thing it loses.
+  // the whole diff — the commit-message leg is the only thing it loses, which
+  // is why `commitsUnavailable` makes it say so rather than pass quietly.
   const internalRefsResult = checkInternalRefs({
     prTitle,
     prBody,
     prBranch: branch,
     commits,
+    commitsUnavailable,
     files,
     prefixes: process.env.INTERNAL_REF_PREFIXES,
     productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,
