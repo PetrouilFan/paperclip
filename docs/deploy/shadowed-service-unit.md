@@ -519,8 +519,12 @@ Two consequences, and they pull in the opposite direction from the obvious one:
    some other unit is talking to itself.
 2. **The only thing that matters is which cgroup the sender is in.** There is no
    dangerous socket; there is a dangerous *position*. A probe is safe in a
-   throwaway unit and unsafe everywhere else, including in your own terminal
-   (`user@1000.service`) and in an agent run.
+   throwaway unit and unsafe everywhere else — including in an agent run
+   (`app.slice/paperclipai.service`) and in your own terminal. A terminal's exact
+   position depends on how you logged in: a plain login session puts it in
+   `user@1000.service`, and a desktop session puts it in a per-application scope
+   (`app-org.kde.konsole-2142.scope`). Both are refused, for different reasons, and
+   the guard prints which one applies.
 
 ### The supported way to send one
 
@@ -547,14 +551,60 @@ stays `activating` until it sends `READY=1`, which the guard refuses — so it w
 fail on `TimeoutStartSec` every time. `Type=exec` with `NotifyAccess=all` is live
 immediately and accepts a `STATUS=` at any moment.
 
-The guard also refuses `STOPPING=`, `RELOADING=`, `READY=`, `WATCHDOG=`,
-`WATCHDOG_USEC=` and `EXTEND_TIMEOUT_USEC=` with no override, so wrapping a probe
-buys a throwaway unit and not a licence to stop anything.
+The guard sends only `STATUS=`, `ERRNO=` and `BUSERROR=`, and refuses every other
+field with no override, so wrapping a probe buys a throwaway unit and not a licence
+to change anything about the unit that sent it. It is an **allowlist**, not a list
+of known-bad fields, and the reason is measured: an earlier version named
+`STOPPING=`, `RELOADING=`, `READY=`, `WATCHDOG=`, `WATCHDOG_USEC=` and
+`EXTEND_TIMEOUT_USEC=`, and two state-changing fields were missing from it.
+`MAINPID=` re-points a unit's recorded main process — a throwaway unit's `MainPID`
+went 226683 → 226685 after one probe wrote it — which is exactly the process a stop
+signals under `KillMode=process` (rule 6 below). `NOTIFYACCESS=` re-opens the
+unit's own notify access mid-flight, which is the setting this whole section is
+about. Only refusing the fields nobody thought of holds up over time.
+
+### What the guard's own limits are, so nobody mistakes it for a chokepoint
+
+It is a guard on a script, and a script's guard is worth exactly what its input is
+worth. Two properties are load-bearing, and the first version of this guard got both
+of them wrong in ways that read as security properties in the file they lived in:
+
+- **It must not take its cgroup from a file the caller named.** The sender's cgroup
+  comes from `/proc/self/cgroup`, and the control unit's from
+  `/proc/$(systemctl --user show paperclipai.service -p MainPID --value)/cgroup`.
+  The first version read the sender's cgroup *file* from the environment, so a
+  process inside the live unit could name a file it had written a moment earlier and
+  get `ALLOWED`.
+- **It must not take its ownership proof from a directory.** "Is this unit one
+  systemd created?" was asked as `[ -e /run/user/$(id -u)/systemd/transient/$u ]`.
+  That directory is `drwxr-xr-x` and owned by you, so a single `mkdir` of
+  `paperclipai.service` made the guard print
+  `paperclipai.service (throwaway, safe to send from)` and exit 0. A bare existence
+  test is not a fact about the world. It is now asked of systemd, and confirmed by
+  the unit's own `MainPID` being a running process in the sender's cgroup.
+
+Both were replayed against the shipped guard on this host on 2026-09-27, with the
+forged directory and both environment variables set at once: still refused, still
+naming the unit, and the control plane's `StatusText` byte-identical afterwards.
+That replay is part F of `scripts/paperclip-notify-probe-proof.sh`, so it is a check
+rather than a story.
+
+There is a fourth position worth knowing about: a **session scope** cannot be
+verified at all, because systemd reports no `MainPID` for a scope. The guard refuses
+it as unprovable. Note that a scope *does* have an entry in the transient runtime
+directory, so the existence test above used to call it disposable — it is not, and
+`UnitFileState=transient` does not separate the two cases either, because both a
+throwaway unit and a scope report `transient` with an empty `SourcePath`.
 
 `scripts/paperclip-notify-probe-proof.sh` is the end-to-end proof against a real
-user manager; `scripts/paperclip-notify-probe.test.mjs` is the contract suite and
-runs in the PR gate. The proof script re-demonstrates the attribution table above
-on whatever host it runs on, so neither has to be taken on trust.
+user manager — A and F are the refusals, B the allowed position, D and E the field
+refusals, C the byte-comparison on the control plane at the end. It re-demonstrates
+the attribution table above on whatever host it runs on, so none of this has to be
+taken on trust. `scripts/paperclip-notify-probe.test.mjs` is the contract suite and
+runs in the PR gate; it needs no manager and no root, because the decision is a pure
+function of four facts and `selftest` hands it those four as arguments. The proof
+script is what proves the attribution claim; the contract suite is what proves the
+decision. Neither alone is the other.
 
 **This is a mitigation, not the fix.** The two durable halves are the server-side
 scrub in `sanitizeInheritedPaperclipEnv`
