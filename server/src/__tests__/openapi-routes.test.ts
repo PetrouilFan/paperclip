@@ -743,6 +743,22 @@ describe("openapi routes", () => {
         variant.properties.payload.properties?.resolverPolicy,
         `${kind} payload does not document a policy`,
       ).toBeUndefined();
+      // The read names must never appear on a request. `requestedResolverPolicy`
+      // is the spelling the response object carries, so a caller copying a
+      // response field into the next create body reaches for it; publishing it
+      // as a request property is the half of the bug the 400 cannot catch,
+      // because a client generated from the spec would then send it by
+      // construction.
+      for (const readName of ["requestedResolverPolicy", "effectiveResolverPolicy"]) {
+        expect(
+          variant.properties[readName],
+          `${kind} must not publish ${readName} as a request field`,
+        ).toBeUndefined();
+        expect(
+          variant.properties.payload?.properties?.[readName],
+          `${kind} payload must not publish ${readName}`,
+        ).toBeUndefined();
+      }
     }
     expect([...kinds].sort()).toEqual([
       "ask_user_questions",
@@ -751,6 +767,22 @@ describe("openapi routes", () => {
       "request_item_verdicts",
       "suggest_tasks",
     ]);
+  });
+
+  // The published body is generated from the zod schema, so the field list can
+  // never be wrong. The prose around it can: the description is the only place
+  // a caller learns that the read name is refused rather than dropped, which is
+  // the sentence that turns a 400 into a diagnosis.
+  it("states the interaction create write name and the response-only read names", () => {
+    const spec: any = buildOpenApiSpec();
+    const description: string =
+      spec.paths["/api/issues/{id}/interactions"].post.description ?? "";
+
+    expect(description).toContain("The write field is `resolverPolicy`");
+    expect(description).toContain("`requestedResolverPolicy`");
+    expect(description).toContain("`effectiveResolverPolicy`");
+    expect(description).toMatch(/response-only/i);
+    expect(description).toMatch(/400/);
   });
 
   it("covers the mounted server routes exactly", () => {

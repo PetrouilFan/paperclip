@@ -696,6 +696,51 @@ describe("issue thread interaction schemas", () => {
     expect(result.error.issues[0].message).toContain("requestedResolverPolicy");
   });
 
+  // `requestedResolverPolicy` is the read spelling of the write field
+  // `resolverPolicy`, and it is the name a caller reaches for because it is
+  // what the response object carries. Every kind carries its own root object
+  // here, so a root that is closed for one kind has to be closed for all of
+  // them: a policy that drops to the `anyone` default is a decision addressed
+  // to the board answered by whichever agent raised it.
+  it("rejects the response-only resolver policy name on every kind", () => {
+    const readNames = ["requestedResolverPolicy", "effectiveResolverPolicy"];
+    for (const [kind, payload] of Object.entries(minimalValidPayloads)) {
+      for (const readName of readNames) {
+        const result = createIssueThreadInteractionSchema.safeParse({
+          kind,
+          [readName]: "human_only",
+          payload,
+        });
+        expect(result.success, `${kind} accepted ${readName}`).toBe(false);
+        if (result.success) continue;
+        expect(result.error.issues[0].code).toBe("unrecognized_keys");
+        expect(result.error.issues[0].message).toContain(readName);
+      }
+    }
+  });
+
+  // The close is only useful if the write field still goes through, for every
+  // kind, under every spelling the schema advertises on create.
+  it("still accepts the write name on every kind", () => {
+    for (const [kind, payload] of Object.entries(minimalValidPayloads)) {
+      for (const policy of ISSUE_THREAD_INTERACTION_CANONICAL_RESOLVER_POLICIES) {
+        const result = createIssueThreadInteractionSchema.safeParse({
+          kind,
+          resolverPolicy: policy,
+          payload,
+        });
+        expect(
+          result.success,
+          `${kind} rejected resolverPolicy=${policy}: ${JSON.stringify(result.error?.issues)}`,
+        ).toBe(true);
+        if (!result.success) continue;
+        // The parsed value is what gets written, so assert it survived rather
+        // than trusting the accept.
+        expect((result.data as { resolverPolicy: string }).resolverPolicy).toBe(policy);
+      }
+    }
+  });
+
   it("keeps the per-kind payload schemas lenient so stored rows still parse", () => {
     // The read paths call these schemas directly on historical rows. A stored
     // payload written by an older build may carry keys this build no longer

@@ -739,6 +739,58 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  // The write field is `resolverPolicy`; `requestedResolverPolicy` and
+  // `effectiveResolverPolicy` are the spellings the response object carries, so
+  // a caller copying one out of a response into the next create body reaches
+  // for them. Before the create schemas were strict that came back 201 with the
+  // policy dropped to the `anyone` default, which is how a decision addressed to
+  // the board ended up answerable by the agent that raised it. Every kind has to
+  // refuse it, because every kind carries its own root object.
+  it("returns 400 when a create body uses a response-only resolver policy name", async () => {
+    const app = await createApp();
+    const minimalValidPayloads: Record<string, Record<string, unknown>> = {
+      suggest_tasks: { version: 1, tasks: [{ clientKey: "a", title: "Do the thing" }] },
+      ask_user_questions: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Which one?",
+            selectionMode: "single",
+            options: [{ id: "o1", label: "This one" }],
+          },
+        ],
+      },
+      request_confirmation: { version: 1, prompt: "Proceed?" },
+      request_checkbox_confirmation: {
+        version: 1,
+        prompt: "Pick the ones to keep",
+        options: [{ id: "o1", label: "Keep this" }],
+      },
+      request_item_verdicts: {
+        version: 1,
+        prompt: "Review the items",
+        items: [{ id: "i1", label: "The first item" }],
+      },
+    };
+
+    for (const [kind, payload] of Object.entries(minimalValidPayloads)) {
+      for (const readName of ["requestedResolverPolicy", "effectiveResolverPolicy"]) {
+        const res = await request(app)
+          .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+          .send({ kind, [readName]: "human_only", payload });
+
+        expect(res.status, `${kind} accepted ${readName}`).toBe(400);
+        // The 400 has to name the key, or the author cannot tell a refused
+        // field from a misspelled one and will go looking in the payload.
+        expect(JSON.stringify(res.body)).toContain(readName);
+      }
+    }
+    // Nothing may reach the service: a 400 that still inserted a row would
+    // leave the card answerable by the default audience.
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
   it("returns 400 for agent-addressed tool-action confirmations", async () => {
     const app = await createApp();
     const res = await request(app)

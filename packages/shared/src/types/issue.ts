@@ -1556,8 +1556,24 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   summary?: string | null;
   status: IssueThreadInteractionStatus;
   continuationPolicy: IssueThreadInteractionContinuationPolicy;
-  /** @deprecated Read requestedResolverPolicy. Kept for API compatibility. */
+  /**
+   * Response alias of `requestedResolverPolicy`, and the name the create body
+   * uses: `POST /api/issues/{id}/interactions` writes this field as
+   * `resolverPolicy`, at the top level of the body.
+   *
+   * @deprecated As a *read* name, prefer `requestedResolverPolicy`. To set a
+   * policy on create, send `resolverPolicy` — this field's own name. Sending
+   * `requestedResolverPolicy` instead is a 400, not a dropped field.
+   */
   resolverPolicy: IssueThreadInteractionCanonicalResolverPolicy;
+  /**
+   * The create-time policy, snapshotted on the row. `requestedResolverPolicy`
+   * and `effectiveResolverPolicy` are response-only names; the create body is
+   * closed, so either one sent there is a 400 that names the field. That is
+   * deliberate: a create body that carried `requestedResolverPolicy` used to be
+   * accepted with 201, silently stored as `anyone`, and left a decision
+   * addressed to the board answerable by the agent that raised it.
+   */
   requestedResolverPolicy: IssueThreadInteractionCanonicalResolverPolicy;
   effectiveResolverPolicy: IssueThreadInteractionCanonicalResolverPolicy;
   resolverPolicyProvenance: IssueThreadInteractionResolverPolicyProvenance;
