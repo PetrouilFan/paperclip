@@ -3432,6 +3432,32 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+/**
+ * systemd's own IPC handles are an operator capability, not run configuration.
+ * A run child that holds NOTIFY_SOCKET can send STOPPING=1 to the control
+ * plane's unit and stop the server mid-flight, and the LISTEN_* triple hands it
+ * the unit's socket-activated file descriptors instead. Neither has any use
+ * inside a run.
+ *
+ * This holds regardless of the unit's NotifyAccess= setting; the unit-side
+ * NotifyAccess=main is the other half of the same fix.
+ *
+ * It applies to a *merged* environment, not only to an inherited one. A caller
+ * that spreads `process.env` into its own `env` argument reintroduces the keys
+ * after any inherited-base scrub has run, so scrubbing the inherited base alone
+ * is not sufficient. The four keys are dropped from whatever the merged
+ * environment holds, which is the invariant: no run child is ever handed a
+ * notify socket, whether it was inherited, configured, or both.
+ */
+export function stripSystemdIpcEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const stripped: NodeJS.ProcessEnv = { ...env };
+  delete stripped.NOTIFY_SOCKET;
+  delete stripped.LISTEN_PID;
+  delete stripped.LISTEN_FDS;
+  delete stripped.LISTEN_FDNAMES;
+  return stripped;
+}
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
@@ -3444,18 +3470,7 @@ export function sanitizeInheritedPaperclipEnv(
     if (key === "PAPERCLIP_LISTEN_PORT") continue;
     delete env[key];
   }
-  // systemd's own IPC handles are an operator capability, not run
-  // configuration. A run child that inherits NOTIFY_SOCKET can send STOPPING=1
-  // to the control plane's unit and stop the server mid-flight, and the
-  // LISTEN_* triple hands it the unit's socket-activated file descriptors
-  // instead. Neither has any use inside a run, so neither is inherited. This
-  // holds regardless of the unit's NotifyAccess= setting; the unit-side
-  // NotifyAccess=main is the other half of the same fix.
-  delete env.NOTIFY_SOCKET;
-  delete env.LISTEN_PID;
-  delete env.LISTEN_FDS;
-  delete env.LISTEN_FDNAMES;
-  return env;
+  return stripSystemdIpcEnv(env);
 }
 
 export function defaultPathForPlatform() {
@@ -4638,10 +4653,22 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
-    const rawMerged: NodeJS.ProcessEnv = {
+    // The spawn boundary, and the only place both inputs to the child's
+    // environment are known at once. `opts.env` is spread *after* the
+    // sanitized inherited base, so any caller that builds its `env` from
+    // process.env — a `models`/`engine` discovery probe, an adapter that
+    // forwards the server's context — reintroduces the unit's systemd IPC
+    // handles here, past the inherited-base scrub. Scrubbing the merged result
+    // instead covers every current call site with one edit, covers a future
+    // adapter that passes a process.env-derived `env`, and is what makes the
+    // guarantee "no run child is handed a notify socket" rather than "no run
+    // child inherits one". Everything downstream of this line — ensurePathInEnv,
+    // command resolution, the sandbox target, and the spawn itself — reads the
+    // already-scrubbed object.
+    const rawMerged: NodeJS.ProcessEnv = stripSystemdIpcEnv({
       ...sanitizeInheritedPaperclipEnv(process.env),
       ...opts.env,
-    };
+    });
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
     // don't refuse to start with "cannot be launched inside another session".
