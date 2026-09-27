@@ -351,27 +351,18 @@ function renderTrailer({ name, email }) {
  *   this gate read no trailers at all and must not report a clean scan
  * @returns {{passed: boolean, failures: string[], informational: string[]}}
  */
-export function checkCoauthors(commits, prAuthor, { commitsUnavailable = false } = {}) {
-  if (commitsUnavailable) {
-    // The gate has a verdict now, so it cannot be the one gate that stays silent
-    // about a fetch it did not get. This is the same trade the internal-reference
-    // gate makes on the same request, and the same cost: a transient 5xx turns
-    // this one result red until the gate is re-run. Reported as a failure rather
-    // than a pass because "no trailer on this branch" is a claim this run did not
-    // earn, and a defective trailer passing quietly is the defect this half of
-    // the gate exists to catch.
-    return {
-      passed: false,
-      failures: [
-        'The commit list could not be read, so no `Co-Authored-By` trailer on this branch was checked and this ' +
-        'result is not a clean scan. The `/pulls/{n}/commits` fetch is allowed to fail so a transient 5xx cannot ' +
-        'take down the gates that do block; the cost is that this gate then has nothing to read. Re-run the gate ' +
-        'once the API is reachable. Do not read `passed: true` here as "every trailer on this branch is accepted".',
-      ],
-      informational: [],
-    };
-  }
-
+/**
+ * Who a squash merge of this branch would drop, and which of them are names
+ * whose credit rests on nothing but the committing tree's git config.
+ *
+ * The reporting half lives in `checkCoauthors`. This is the question both that
+ * gate and the post-merge audit need answered identically.
+ *
+ * @param {Array<object>} [commits]  entries of `/pulls/{n}/commits`
+ * @param {string} prAuthor  the PR author's login
+ * @returns {{contributors: Map, collisions: Map, unverified: object[]}}
+ */
+export function collectCoauthors(commits, prAuthor) {
   const author = (prAuthor ?? '').toLowerCase();
   const contributors = new Map();
   // Emails already accounted for, mapped to the display name credited for them.
@@ -401,12 +392,6 @@ export function checkCoauthors(commits, prAuthor, { commitsUnavailable = false }
   // put a verified address for the same person two lines up.
   const unverified = [];
   const unverifiedIds = new Set();
-  // Rejected trailers the branch already carries, keyed on the rendered line,
-  // each with the commit count behind it. A count rather than a bare list,
-  // because one bad line re-authored across a branch is the common case and the
-  // author needs to know whether they are looking at one commit or five.
-  const rejected = new Map();
-
   for (const entry of commits ?? []) {
     const login = entry?.author?.login ?? null;
     const gitName = entry?.commit?.author?.name ?? null;
@@ -535,9 +520,37 @@ export function checkCoauthors(commits, prAuthor, { commitsUnavailable = false }
       trailer: machineIdentity ? SANCTIONED_TRAILER : `Co-Authored-By: ${displayName} <${email}>`,
       name: displayName,
       machine: machineIdentity,
+      // Every address this contributor is reachable at, not just the one rendered
+      // above. A commit GitHub matched to an account is written with the
+      // author's real address, and the trailer deliberately replaces it with the
+      // account's no-reply form so the credit links to a profile — which means a
+      // squash that kept the original address credits the same person and reads,
+      // to anything matching on address alone, as somebody who was never on the
+      // branch. Additive and unread by `checkCoauthors`; a post-merge audit needs
+      // it to tell that apart from a real loss.
+      emails: new Set([emailKey, email.toLowerCase()].filter(Boolean)),
+      // The address the commit was actually written with, kept beside the line
+      // above because a machine identity's line replaces it. A post-merge report
+      // has to name the real author to be actionable; handing it the house
+      // identity it was normalised to would name nobody in particular, which is
+      // the failure the whole file is written against.
+      gitAddress: gitEmail ?? '',
     });
   }
 
+  return { contributors, collisions, unverified };
+}
+
+/**
+ * The `Co-Authored-By` trailers this branch already carries that the
+ * contribution rules do not accept, keyed on the rendered line.
+ *
+ * A second pass over the same commits, for the reason in `checkCoauthors`: the
+ * collection loop above is deciding who a squash would drop, and a defective
+ * trailer is a different question with different exclusions.
+ */
+function readRejectedTrailers(commits) {
+  const rejected = new Map();
   // The second question, and a second pass on purpose. The loop above skips the
   // PR author's own commits and bots on the way to deciding who a squash would
   // drop; a rejected trailer is a different question and has no such exclusion.
@@ -565,6 +578,42 @@ export function checkCoauthors(commits, prAuthor, { commitsUnavailable = false }
     }
   }
 
+  return rejected;
+}
+
+export function checkCoauthors(commits, prAuthor, { commitsUnavailable = false } = {}) {
+  if (commitsUnavailable) {
+    // The gate has a verdict now, so it cannot be the one gate that stays silent
+    // about a fetch it did not get. This is the same trade the internal-reference
+    // gate makes on the same request, and the same cost: a transient 5xx turns
+    // this one result red until the gate is re-run. Reported as a failure rather
+    // than a pass because "no trailer on this branch" is a claim this run did not
+    // earn, and a defective trailer passing quietly is the defect this half of
+    // the gate exists to catch.
+    return {
+      passed: false,
+      failures: [
+        'The commit list could not be read, so no `Co-Authored-By` trailer on this branch was checked and this ' +
+        'result is not a clean scan. The `/pulls/{n}/commits` fetch is allowed to fail so a transient 5xx cannot ' +
+        'take down the gates that do block; the cost is that this gate then has nothing to read. Re-run the gate ' +
+        'once the API is reachable. Do not read `passed: true` here as "every trailer on this branch is accepted".',
+      ],
+      informational: [],
+    };
+  }
+
+  // The collection half is a separate export because the post-merge audit in
+  // `audit-merge-attribution.mjs` has to ask the same question this file asks
+  // and get the same answer. Re-deriving "who would a squash drop" here would be
+  // a second copy of the skip rules — bots, the pull request author's own commit,
+  // a nameless commit — and a second copy is a second thing to keep correct.
+  const { contributors, collisions, unverified } = collectCoauthors(commits, prAuthor);
+  // The second question, and a second pass on purpose. The collection loop skips
+  // the PR author's own commits and bots on the way to deciding who a squash
+  // would drop; a rejected trailer is a different question and has no such
+  // exclusion. The most common instance is the PR author's own commit carrying
+  // someone else's machine identity, which that loop never sees.
+  const rejected = readRejectedTrailers(commits);
   const informational = [];
 
   if (contributors.size > 0) {
