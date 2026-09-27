@@ -253,11 +253,14 @@ paperclipai update
 paperclipai update --latest|--canary|--version <version>
 paperclipai update --rollback
 paperclipai upgrade
-paperclipai uninstall
+paperclipai uninstall [--force]
 ```
 
 `upgrade` aliases `update`. `uninstall` removes managed code and the shim but
-preserves instance data under `~/.paperclip/instances/`. See
+preserves instance data under `~/.paperclip/instances/`. It also removes an
+installed background service, and it refuses rather than remove a service
+definition it cannot show is its own. See "Onboarding And Service Management"
+for the refusals and for `--force`. See
 `doc/INSTALLING.md` for installation methods, security notes, PATH setup, and
 the complete update and rollback behavior.
 
@@ -277,7 +280,7 @@ Service lifecycle commands remain under the `service` namespace:
 
 ```sh
 paperclipai service install [--no-start-now] [--no-start-on-login]
-paperclipai service uninstall
+paperclipai service uninstall [--force]
 paperclipai service start
 paperclipai service stop
 paperclipai service restart [--wait]
@@ -289,8 +292,30 @@ Every service verb supports `--instance <id>` and `--json`. Linux and WSL2 use
 a systemd user unit when available; macOS uses a LaunchAgent. Unsupported
 environments receive foreground `paperclipai run` guidance.
 
+`paperclipai uninstall` also accepts `--force`.
+
+`uninstall` removes the unit file only. It refuses, before it changes anything
+on the host, in three cases:
+
+- The definition does not record this instance's `PAPERCLIP_INSTANCE_ID` and
+  `PAPERCLIP_HOME`. The path comes from the home directory and the unit name
+  from the instance id, so a test, a script, or an agent that shares the
+  operator account resolves the same path as the `default` instance. The home is
+  what tells two such callers apart.
+- A systemd drop-in directory holds files. Drop-in files are not removed, and
+  systemd stops loading the directory once the parent unit is gone. Removing the
+  unit would orphan them silently, and the next `service install` would write a
+  unit without any of their settings.
+- The unit is running and cannot be stopped.
+
+`--force` overrides the first two. It is per-call and is never stored. Read the
+refusal message before using it: the file at that path is not always the unit
+you think it is.
+
 `paperclipai doctor` includes managed-install and service-health diagnostics in
-addition to configuration, storage, database, logging, and port checks.
+addition to configuration, storage, database, logging, and port checks. It also
+reports a systemd drop-in directory that no longer has a unit. That result is a
+warning, and it never blocks startup.
 
 ## Deployment Modes
 

@@ -6,6 +6,7 @@ import { readInstallManifest, resolveInstallStorePaths } from "../install-store.
 import {
   detectServiceManager,
   isExecutableFile,
+  listDropInFiles,
   resolveServiceShimPath,
   type ServiceManagerDetection,
 } from "../services/service-manager.js";
@@ -74,6 +75,35 @@ async function collectServiceHealthChecks(
 
   const manager = detection.manager;
   const status = await manager.status();
+
+  // Checked before the `!status.installed` early return, because that is exactly
+  // the state an orphaned drop-in directory produces: `uninstall()` removes the
+  // unit file and leaves `<unit>.d/` behind, systemd stops loading a drop-in dir
+  // once the parent unit is gone, and the doctor would otherwise report
+  // "Not installed (optional)" — a clean result describing a host that is about
+  // to lose every override it depends on at the next `service install`.
+  //
+  // `warn`, never `fail`: `commands/run.ts` refuses to bind the port on a `fail`,
+  // so a fail here could take the instance offline over a configuration smell.
+  const orphanedDropIns = manager.dropInDirectory
+    ? await listDropInFiles(manager.dropInDirectory)
+    : [];
+  if (orphanedDropIns.length > 0 && !status.installed) {
+    return [
+      {
+        name: "Background service",
+        status: "pass",
+        message: `Not installed for instance ${instanceId} (optional)`,
+      },
+      {
+        name: "Orphaned service drop-ins",
+        status: "warn",
+        message: `${manager.dropInDirectory} holds ${orphanedDropIns.length} drop-in file${orphanedDropIns.length === 1 ? "" : "s"} (${orphanedDropIns.join(", ")}) for a unit that is not installed, so systemd is not loading them`,
+        repairHint: `Re-run \`paperclipai service install --instance ${instanceId}\` to restore the unit these overrides belong to, or move ${manager.dropInDirectory} aside if the service is being removed for good`,
+      },
+    ];
+  }
+
   if (!status.installed) {
     return [
       {

@@ -34,6 +34,7 @@ function supportedDetection() {
       instanceId: "default",
       serviceName: "paperclipai.service",
       definitionPath: "/tmp/paperclipai.service",
+      dropInDirectory: null,
       renderDefinition: () => "unit",
       install: vi.fn(async () => ({ changed: true })),
       uninstall: vi.fn(async () => undefined),

@@ -338,13 +338,15 @@ export function registerServiceCommands(program: Command): void {
       output({ installed: true, changed: result.changed, platform: manager.platform, serviceName: manager.serviceName, definitionPath: manager.definitionPath, lingerEnabled }, opts.json);
     });
 
-  common(service.command("uninstall").description("Stop, disable, and remove the background service")).action(async (opts) => {
-    const manager = await resolveManager(opts); if (!manager) return;
-    await manager.uninstall();
-    const status = await manager.status();
-    if (status.installed || status.active) throw new Error(`${manager.serviceName} is still loaded after uninstall.`);
-    output({ uninstalled: true, serviceName: manager.serviceName }, opts.json);
-  });
+  common(service.command("uninstall").description("Stop, disable, and remove the background service"))
+    .option("--force", "Remove the definition even when it is not provably this instance's unit, or when drop-ins the CLI did not create are present", false)
+    .action(async (opts) => {
+      const manager = await resolveManager(opts); if (!manager) return;
+      await manager.uninstall({ force: opts.force === true });
+      const status = await manager.status();
+      if (status.installed || status.active) throw new Error(`${manager.serviceName} is still loaded after uninstall.`);
+      output({ uninstalled: true, serviceName: manager.serviceName }, opts.json);
+    });
 
   for (const verb of ["start", "stop"] as const) {
     common(service.command(verb).description(`${verb === "start" ? "Start" : "Stop"} the background service`)).action(async (opts) => {

@@ -16,6 +16,15 @@ type UninstallDependencies = {
   detectServiceManager: typeof detectServiceManager;
   platform: NodeJS.Platform;
   userHomeDir: string;
+  /**
+   * Carry on past the service manager's ownership and drop-in refusals.
+   *
+   * Default off, and deliberately not persisted: a refusal here means the unit
+   * about to be deleted may not be the one this CLI installed, or that overrides
+   * the CLI never wrote would be orphaned. Both are silent afterwards, so the
+   * default has to be the slow answer.
+   */
+  force?: boolean;
 };
 
 function otherServiceDefinitions(platform: NodeJS.Platform, userHomeDir: string, instanceId: string): string[] {
@@ -64,7 +73,11 @@ export async function uninstallCommand(
   }
   if (detection.supported) {
     const status = await detection.manager.status();
-    if (status.installed || status.active) await detection.manager.uninstall();
+    // A refusal from the service manager aborts the whole command, before the
+    // shim and the install store are touched. Half-removing a CLI while the
+    // service it manages is still registered leaves the unit enabled against a
+    // command that no longer exists.
+    if (status.installed || status.active) await detection.manager.uninstall({ force: dependencies.force === true });
   }
 
   const paths = resolveInstallStorePaths();
