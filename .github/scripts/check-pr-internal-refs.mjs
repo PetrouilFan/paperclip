@@ -382,9 +382,14 @@
  * produces a failure, never a pass:
  *
  * - the prefix list resolves to nothing, or holds a malformed entry;
- * - a changed file reports line changes but carries no patch to scan;
+ * - a changed file reports line changes but carries no patch to scan, and the
+ *   published content of that file did not arrive either. Both readers are
+ *   tried before the gate gives up on a file, and a file it can read by either
+ *   one is scanned rather than refused — see "Two readers, one rule" for why the
+ *   second reader is a read and not an exemption;
  * - a patch hunk is shorter than its own header declares (GitHub truncates
- *   large diffs and the truncation is not flagged anywhere in the payload);
+ *   large diffs and the truncation is not flagged anywhere in the payload), and
+ *   the whole-file read did not arrive to cover the part that was cut;
  * - the changed-file list reached GitHub's 3000-file cap;
  * - the commit list could not be fetched, so the commit-message surface was
  *   never read. The fetch is optional so a transient 5xx cannot take down the
@@ -398,6 +403,52 @@
  *
  * A gate that answers "passed" because it could not look is worse than no gate,
  * because it is evidence.
+ *
+ * ## Two readers, one rule
+ *
+ * Failing closed is not the same as refusing to read. The rule above is about
+ * the gate's *knowledge* of a file, not about which HTTP call it is allowed to
+ * make, and for most of this gate's life it conflated the two: a changed file
+ * GitHub declined to produce a patch for was reported unscannable, full stop,
+ * however readable the file plainly was.
+ *
+ * The cost was not hypothetical and it was not confined to one file class. A
+ * drizzle migration snapshot is ~1.3 MB and ~48k changed lines, GitHub returns
+ * `patch: null` for a file that size, and `AGENTS.md` section 6 tells every
+ * contributor that a data-model change means running the generator — so the gate
+ * refused to certify *every correct schema change on this fork*, and the
+ * failure it reported ("this gate cannot certify this diff") was true and
+ * useless at the same time. The obvious repairs all make the gate weaker in
+ * exchange for the file being let through: a glob in `ALLOWLIST` (a trust grant
+ * on a path, with a filename that changes every migration so the entry rots at
+ * the next one), a blanket "generated files are fine" rule, or trusting the
+ * generator's output rather than the bytes.
+ *
+ * So the gate grew a second reader instead of an exemption. When a patch is
+ * missing or truncated, the caller fetches the file's content at the head
+ * commit and hands it over, and the gate scans *that* — the whole file, in
+ * full, with the same matchers, redacting the same way. Nothing is exempted
+ * because of what a file is called or where it sits; a `PET-<number>` inside a
+ * migration snapshot is still a finding, which is a claim the shape-proof
+ * approach can only make and this one makes by having looked.
+ *
+ * The properties that matter, and each is enforced by a test that fails if it is
+ * dropped:
+ *
+ * - **No verdict changes on a file that was already scannable.** The fallback
+ *   only runs where the gate would otherwise have emitted "unscannable", so
+ *   every patch-bearing file keeps the patch-only, added-lines-only answer it
+ *   gave before.
+ * - **It fails closed when the second read does not arrive.** No content, a
+ *   payload over `MAX_SCANNED_FILE_BYTES`, or a payload carrying a NUL all land
+ *   the file back in `unscannable`. A fetch that is allowed to fail therefore
+ *   cannot turn a red into a green by being unavailable; it can only leave the
+ *   verdict where it was.
+ * - **It is a whole-file read, and says so.** Every line counts where the patch
+ *   path counts added lines, because a whole file cannot say which lines this
+ *   pull request added — and a pull request that publishes a file publishes all
+ *   of it. The asymmetry is toward reporting, which is the direction the
+ *   fail-closed rule already commits to.
  */
 import { fileURLToPath } from 'node:url';
 
@@ -437,6 +488,25 @@ export const MAX_PR_FILES = 3000;
  * above carries 13 comments across all three comment endpoints.
  */
 export const MAX_PR_COMMENTS = 3000;
+
+/**
+ * The ceiling on a whole-file read used to stand in for a patch that did not arrive.
+ *
+ * The gate has two readers for a changed file — the unified diff GitHub returns
+ * in `patch`, and the file's content at the head commit — and it used to have
+ * only the first. So a file GitHub declines to produce a patch for was reported
+ * as unscannable no matter how readable it actually is, and the honest verdict
+ * ("this gate cannot certify this diff") became the verdict on every correct
+ * change that added a large generated file. A drizzle migration snapshot is
+ * 1.3 MB and about 48k changed lines, so that is every data-model change.
+ *
+ * The bound is on the *fallback* read only, and it fails closed like every other
+ * bound here: a file above it stays unscannable rather than being sampled. It
+ * sits far above any file in this repository's history that a patch would not
+ * cover, and the number is quoted in the failure text so an author who hits it
+ * knows the split is a real one rather than a silent limit.
+ */
+export const MAX_SCANNED_FILE_BYTES = 4_000_000;
 
 /**
  * The signature the gate stamps on its own report, and the logins it posts as.
@@ -507,6 +577,22 @@ export const ALLOWLIST = [
     reason: 'The rule text itself: the PR template repeats the banned shapes in its "do not include" section.',
   },
 ];
+
+/**
+ * The ALLOWLIST reduced to the entries that actually exempt anything.
+ *
+ * An entry needs both a `path` and a `reason` to exempt a file, because a
+ * reason-less entry is itself reported as a failure — an exemption nobody can
+ * review is not an exemption. That makes "which paths are exempt" a function of
+ * the module constant rather than something each caller re-derives, and three
+ * call sites need the same answer: the loop's `continue`, the whole-file fetch
+ * list, and the fetch caller's own default. Left as three expressions, one of
+ * them would eventually read the array and quietly restore an exemption that
+ * the mandatory-reason rule exists to prevent.
+ */
+function allowReasonsMap() {
+  return new Map(ALLOWLIST.filter((e) => e && e.path && e.reason).map((e) => [e.path, e.reason]));
+}
 
 /** Case-insensitive word boundary that also refuses to start inside a word. */
 const NOT_IN_WORD = String.raw`(?<![A-Za-z0-9_])`;
@@ -1039,6 +1125,97 @@ export function patchIsComplete(patch) {
 }
 
 /**
+ * Whether the diff scan will look inside this file at all.
+ *
+ * The two exemption lists and the loop's own `continue` are one decision, so they
+ * are one function here. It is also what keeps the whole-file fetch honest: an
+ * exempt file's content is never read by the gate, so fetching it would spend an
+ * API request and a 1.3 MB transfer on bytes the run then throws away. That is
+ * not a hypothetical on this repository — this gate's own test file is exempt,
+ * is 113,621 bytes, and arrives without a patch, so a fetch list that ignored
+ * the exemption would read the largest file in every pull request that edits
+ * this gate and discard it.
+ *
+ * The *name* of an exempt file is still scanned. That check sits above the
+ * exemption in the loop and needs no content, which is why this predicate is
+ * about the content read only.
+ *
+ * `allowed` is the same `Map` the loop builds rather than the raw `ALLOWLIST`,
+ * and the difference is load-bearing: an entry with no `reason` is itself
+ * reported as a failure a few lines away, and it must go on exempting nothing.
+ * Reading the array here would have made a malformed entry quietly restore an
+ * exemption, which is the one thing the "a reason is mandatory" rule exists to
+ * prevent.
+ */
+export function isContentExempt(filename, allowed = allowReasonsMap()) {
+  return SELF_EXEMPT_PATHS.includes(filename) || allowed.has?.(filename) === true;
+}
+
+/**
+ * Whether this changed file cannot be read from its patch alone.
+ *
+ * This is the gate's own test for "I will have to say unscannable", exported so
+ * the orchestrator can go and get the file instead of re-deriving the rule. The
+ * two answers have to be one answer: a caller that re-implemented this predicate
+ * would drift from the gate, and the drift would be silent in the safe-looking
+ * direction — a file the gate considers readable but the fetch skipped, which is
+ * the current behaviour, reappearing under a new name.
+ *
+ * The two cases are the ones `patchIsComplete` and the null-patch branch already
+ * name: no patch at all where line changes are reported, and a patch that was
+ * cut short. A file with no patch and no line changes is a binary or a pure
+ * rename, which is a true negative and never needs a fetch.
+ */
+export function fileNeedsWholeContent(file) {
+  const changes = typeof file?.changes === 'number' ? file.changes : 0;
+  const patch = typeof file?.patch === 'string' ? file.patch : null;
+  if (patch === null) return changes > 0;
+  return !patchIsComplete(patch).complete;
+}
+
+/**
+ * The filenames in a changed-file list the gate will not be able to read.
+ *
+ * Deleted files are excluded and it is not an oversight: there is no content at
+ * the head commit for a path the pull request removes, so a fetch for one can
+ * only ever come back empty. A removal carries no added lines either, so there
+ * is nothing to scan and nothing to fail closed about.
+ *
+ * Content-exempt files are excluded for the reason `isContentExempt` gives: the
+ * gate will not look inside them, so reading them buys nothing.
+ */
+export function filesNeedingWholeContent(files, allowed = allowReasonsMap()) {
+  const names = [];
+  for (const file of files ?? []) {
+    const filename = file?.filename;
+    if (typeof filename !== 'string' || filename === '') continue;
+    if (file?.status === 'removed') continue;
+    if (isContentExempt(filename, allowed)) continue;
+    if (!fileNeedsWholeContent(file)) continue;
+    names.push(filename);
+  }
+  return names;
+}
+
+/**
+ * The file's content, if it is readable, in range, and shaped like text.
+ *
+ * Three refusals, each of which lands the caller back on "unscannable" rather
+ * than on a partial scan: no entry for this path, a payload above
+ * `MAX_SCANNED_FILE_BYTES`, and a payload carrying a NUL. The last is not
+ * paranoia — the content endpoint returns base64 for a path GitHub considers
+ * binary, and handing that to a UTF-8 text scan would produce a finding about
+ * base64 that means nothing, or a decode error in the middle of a gate run.
+ */
+export function wholeFileContent(fileContents, filename) {
+  const content = fileContents?.[filename];
+  if (typeof content !== 'string' || content === '') return null;
+  if (Buffer.byteLength(content, 'utf8') > MAX_SCANNED_FILE_BYTES) return null;
+  if (content.includes('\u0000')) return null;
+  return content;
+}
+
+/**
  * The one character a match is replaced with in anything this gate prints.
  *
  * U+2588 is a single UTF-16 code unit, which is what makes a mask of
@@ -1102,9 +1279,14 @@ export function redactMatches(text, hits) {
  * @param {boolean} [input.commitsUnavailable]  the commit fetch failed; the
  *   commit-message surface was therefore not scanned at all
  * @param {Array<object>} [input.files]  entries of `/pulls/{n}/files`
+ * @param {Record<string, string>} [input.fileContents]  the published content of
+ *   the files in `files` whose patch the API did not deliver, keyed by
+ *   `filename`. The second reader; see `filesNeedingWholeContent` for which
+ *   files the caller is expected to have fetched, and the diff loop for what
+ *   happens when one is absent.
  * @param {string|string[]|undefined} [input.prefixes]
  * @param {string|string[]|undefined} [input.productOwnedPrefixes]
- * @returns {{passed: boolean, failures: string[]}}
+ * @returns {{passed: boolean, failures: string[], wholeFileScans: string[]}}
  */
 export function checkInternalRefs({
   prTitle = '',
@@ -1116,14 +1298,15 @@ export function checkInternalRefs({
   commentsUnavailable = false,
   commentLogins = [],
   files = [],
+  fileContents = {},
   prefixes,
   productOwnedPrefixes,
 } = {}) {
   const { prefixes: resolved, configError } = resolvePrefixes(prefixes);
-  if (configError) return { passed: false, failures: [configError] };
+  if (configError) return { passed: false, failures: [configError], wholeFileScans: [] };
 
   const { owned, configError: ownedError } = resolveProductOwnedPrefixes(productOwnedPrefixes);
-  if (ownedError) return { passed: false, failures: [ownedError] };
+  if (ownedError) return { passed: false, failures: [ownedError], wholeFileScans: [] };
 
   const { separated, compact, link } = buildMatchers(resolved);
   const prefixLabel = resolved.map((p) => `${p}-<number>`).join(', ');
@@ -1486,7 +1669,7 @@ export function checkInternalRefs({
   // and the commit body, each for the same reason reached separately. See the
   // header's "the address half stops before the commit body".
 
-  const allowReasons = new Map(ALLOWLIST.filter((e) => e && e.path && e.reason).map((e) => [e.path, e.reason]));
+  const allowReasons = allowReasonsMap();
   const allowless = ALLOWLIST.filter((e) => !e || !e.path || !e.reason);
   if (allowless.length > 0) {
     failures.push(
@@ -1505,6 +1688,35 @@ export function checkInternalRefs({
   const diffHits = [];
   const diffLocations = [];
   const unscannable = [];
+  // The files the patch could not carry, which the caller's whole-content read
+  // covered instead. Reported when something is found in one, so an author
+  // reading a finding in a file the gate admits it could not see as a diff knows
+  // the line it is pointed at is a line in the published file rather than in
+  // the change.
+  const wholeFileScans = [];
+
+  /**
+   * Scan a published file's whole content, and say so in the location.
+   *
+   * Every line counts, where the patch path counts only added lines, and the
+   * asymmetry is the safe direction: a whole-file read cannot know which lines
+   * this pull request added, and a file the pull request publishes publishes
+   * all of it. The only files that reach here are files the gate would otherwise
+   * have refused to certify, so this can turn a hard failure into a scan and
+   * never the reverse — no file that is scannable from its patch today changes
+   * verdict.
+   */
+  const scanWholeFile = (filename, content, reason) => {
+    wholeFileScans.push(filename);
+    for (const line of content.split('\n')) {
+      const hits = [...findAll(line, separated), ...findAll(line, link), ...findAll(line, compact)];
+      if (hits.length === 0) continue;
+      diffHits.push(...hits);
+      diffLocations.push(
+        `\`${filename}\` (${reason}): ${line.trim().slice(0, 72)}`
+      );
+    }
+  };
 
   for (const file of files ?? []) {
     const filename = file?.filename ?? '(unnamed)';
@@ -1520,24 +1732,46 @@ export function checkInternalRefs({
 
     // The gate and its test contain the literals they search for, and the rule
     // text has to quote the banned shapes to define them. Both are exempt from
-    // the *content* scan only: an id in a PR title still fails regardless.
-    if (allowReasons.has(filename) || SELF_EXEMPT_PATHS.includes(filename)) continue;
+    // the *content* scan only: an id in a PR title still fails regardless. The
+    // predicate is the exported one, so the whole-file fetch and this `continue`
+    // cannot disagree about which files are ever looked inside.
+    if (isContentExempt(filename, allowReasons)) continue;
 
     const changes = typeof file?.changes === 'number' ? file.changes : 0;
     const patch = typeof file?.patch === 'string' ? file.patch : null;
+    const whole = wholeFileContent(fileContents, filename);
 
     if (patch === null) {
       // No patch with no reported line changes is a binary file or a pure
       // rename: there is no text to scan, which is a true negative.
       if (changes > 0) {
-        unscannable.push(`${filename} (${changes} changed lines, no patch in the API response)`);
+        if (whole === null) {
+          unscannable.push(`${filename} (${changes} changed lines, no patch in the API response)`);
+        } else {
+          scanWholeFile(filename, whole, 'whole file, the patch was not delivered');
+        }
       }
       continue;
     }
 
     const completeness = patchIsComplete(patch);
     if (!completeness.complete) {
-      unscannable.push(`${filename} (patch truncated by the GitHub API)`);
+      if (whole === null) {
+        unscannable.push(`${filename} (patch truncated by the GitHub API)`);
+      } else {
+        // A cut-short patch is still worth reading — it is the start of the
+        // change — but only alongside the whole file, because a partial read is
+        // the case this gate refuses to certify.
+        for (const line of patch.split('\n')) {
+          if (!isAddedLine(line)) continue;
+          const hits = [...findAll(line, separated), ...findAll(line, link), ...findAll(line, compact)];
+          if (hits.length === 0) continue;
+          diffHits.push(...hits);
+          diffLocations.push(`${filename}: ${line.replace(/^\+/, '').trim().slice(0, 80)}`);
+        }
+        scanWholeFile(filename, whole, 'whole file, the patch was truncated');
+        continue;
+      }
     }
 
     for (const line of patch.split('\n')) {
@@ -1557,13 +1791,16 @@ export function checkInternalRefs({
   if (unscannable.length > 0) {
     failures.push(
       `The diff could not be completely scanned, so this gate cannot certify it. ` +
-      `${unscannable.length} changed file${unscannable.length === 1 ? '' : 's'} arrived without readable patch content: ` +
+      `${unscannable.length} changed file${unscannable.length === 1 ? '' : 's'} arrived without readable patch content ` +
+      'and this run could not read the published file either: ' +
       `${unscannable.slice(0, 5).map((u) => `\`${u}\``).join(', ')}${unscannable.length > 5 ? ` (and ${unscannable.length - 5} more)` : ''}. ` +
-      'Reported as a failure because "no internal references found" is a claim this run cannot make.'
+      'Reported as a failure because "no internal references found" is a claim this run cannot make. ' +
+      `A file larger than ${MAX_SCANNED_FILE_BYTES} bytes is not read whole, so a generated file at that size needs a smaller ` +
+      'form to be certifiable — split it, or reduce what the change publishes.'
     );
   }
 
-  return { passed: failures.length === 0, failures };
+  return { passed: failures.length === 0, failures, wholeFileScans };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -1576,6 +1813,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     comments: JSON.parse(process.env.PR_COMMENTS ?? '[]'),
     commentsUnavailable: process.env.PR_COMMENTS_UNAVAILABLE === '1',
     files: JSON.parse(process.env.PR_FILES ?? '[]'),
+    fileContents: JSON.parse(process.env.PR_FILE_CONTENTS ?? '{}'),
     prefixes: process.env.INTERNAL_REF_PREFIXES,
     productOwnedPrefixes: process.env.PRODUCT_OWNED_REF_PREFIXES,
   });

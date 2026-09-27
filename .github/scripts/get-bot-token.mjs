@@ -31,7 +31,12 @@ export function generateJWT(privateKey) {
 export const GH_FETCH_DEFAULT_TIMEOUT_MS = 15_000;
 
 export async function ghFetch(path, token, options = {}) {
-  const { timeoutMs = GH_FETCH_DEFAULT_TIMEOUT_MS, signal: externalSignal, ...fetchOptions } = options;
+  const {
+    timeoutMs = GH_FETCH_DEFAULT_TIMEOUT_MS,
+    signal: externalSignal,
+    raw = false,
+    ...fetchOptions
+  } = options;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error(`ghFetch timeout after ${timeoutMs}ms: ${path}`)), timeoutMs);
   const abortOnExternal = () => controller.abort(externalSignal?.reason);
@@ -52,7 +57,13 @@ export async function ghFetch(path, token, options = {}) {
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`GitHub API ${fetchOptions.method ?? 'GET'} ${path} → ${res.status}: ${text}`);
-    return JSON.parse(text);
+    // `raw` exists for the one media type whose body is not a JSON document:
+    // `application/vnd.github.raw` returns a file's bytes, and JSON.parse over
+    // a 1.3 MB migration snapshot would either throw on a truncated read or,
+    // worse, succeed on a prefix and hand the gate a document that is not the
+    // file. Callers that want the bytes ask for them by media type and get text
+    // back untouched; everything else keeps the parse it has always done.
+    return raw ? text : JSON.parse(text);
   } finally {
     clearTimeout(timer);
     if (externalSignal) externalSignal.removeEventListener('abort', abortOnExternal);

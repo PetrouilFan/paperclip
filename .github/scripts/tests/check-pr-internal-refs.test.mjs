@@ -8,10 +8,13 @@ import {
   DEFAULT_PRODUCT_OWNED_PREFIXES,
   MAX_PR_COMMENTS,
   MAX_PR_FILES,
+  MAX_SCANNED_FILE_BYTES,
   SELF_EXEMPT_PATHS,
   checkInternalRefs,
+  filesNeedingWholeContent,
   findInstanceHosts,
   findUnknownInternalRefs,
+  isContentExempt,
   isGateComment,
   maskInlineCodeSpans,
   patchIsComplete,
@@ -333,6 +336,367 @@ test('FAIL CLOSED: a changed file with line changes and no patch is a failure', 
   });
   assert.equal(result.passed, false);
   assert.match(result.failures.join('\n'), /without readable patch content/);
+});
+
+// ---------------------------------------------------------------------------
+// The second reader.
+//
+// The case below is the one that made this necessary, measured rather than
+// imagined: a drizzle migration snapshot added by `pnpm db:generate` is ~1.3 MB
+// and ~48k changed lines, GitHub returns `patch: null` for a file that size, and
+// `AGENTS.md` section 6 makes that file the normal outcome of a data-model
+// change. The gate's answer was "this gate cannot certify this diff" — true, and
+// identical for every correct schema change, which is how a correct gate earns a
+// reputation for being wrong.
+//
+// These tests pin the three properties that make the fix a read rather than an
+// exemption. If any of them is dropped, one of these fails.
+// ---------------------------------------------------------------------------
+
+/** The reported shape, so the fixture is not a hand-written approximation of it. */
+const snapshot = (...lines) =>
+  ['{', '  "version": "7",', '  "dialect": "postgresql",', '  "tables": {', ...lines, '  }', '}'].join('\n');
+
+test('a generated file with no patch is scanned whole, not refused', () => {
+  const clean = snapshot('    "t": { "columns": {} }');
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{
+      filename: 'packages/db/src/migrations/meta/0286_snapshot.json',
+      status: 'added',
+      changes: 48503,
+      additions: 48503,
+      deletions: 0,
+      patch: null,
+    }],
+    fileContents: { 'packages/db/src/migrations/meta/0286_snapshot.json': clean },
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+  assert.deepEqual(result.wholeFileScans, ['packages/db/src/migrations/meta/0286_snapshot.json']);
+});
+
+test('the whole-file read is a scan, not an exemption: an id in a snapshot still fails', () => {
+  // The reason this is a reader and not a shape proof. A proof that the file
+  // parses as a drizzle snapshot says the file is machine-generated; it does not
+  // look inside, and it cannot be made to. The reader looks, so a hand-typed
+  // identifier in a generated file is caught rather than argued about.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{
+      filename: 'packages/db/src/migrations/meta/0286_snapshot.json',
+      status: 'added',
+      changes: 48503,
+      patch: null,
+    }],
+    fileContents: {
+      'packages/db/src/migrations/meta/0286_snapshot.json': snapshot('    "note": "see PET-9001"'),
+    },
+  });
+  assert.equal(result.passed, false);
+  const joined = assertNoEcho(result, ['PET-9001']);
+  assert.match(joined, /The diff/);
+  // The location has to say the line came from the published file, or the author
+  // goes looking for a line the diff never showed them.
+  assert.match(joined, /whole file, the patch was not delivered/);
+});
+
+test('the whole-file read scans every line, not only the ones the change added', () => {
+  // A whole file cannot say which lines this pull request added. Counting the
+  // whole of it is the direction that reports, which is the same direction the
+  // fail-closed rule commits to everywhere else in this gate.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{
+      filename: 'packages/db/src/migrations/meta/0286_snapshot.json',
+      status: 'added',
+      changes: 48503,
+      patch: null,
+    }],
+    fileContents: {
+      'packages/db/src/migrations/meta/0286_snapshot.json': [
+        'context line that is unchanged and carries PET-9002',
+        '  "tables": {}',
+      ].join('\n'),
+    },
+  });
+  assert.equal(result.passed, false);
+  assertNoEcho(result, ['PET-9002']);
+});
+
+test('FAIL CLOSED: the second reader missing leaves the file unscannable', () => {
+  // The property that keeps this from being a hole. The supplementary fetch is
+  // allowed to fail, so an unavailable fetch must land exactly where the gate
+  // was before it existed — never on a pass.
+  const withoutContent = checkInternalRefs({
+    ...CLEAN,
+    files: [{
+      filename: 'packages/db/src/migrations/meta/0286_snapshot.json',
+      status: 'added',
+      changes: 48503,
+      patch: null,
+    }],
+  });
+  assert.equal(withoutContent.passed, false);
+  assert.match(withoutContent.failures.join('\n'), /without readable patch content/);
+  assert.deepEqual(withoutContent.wholeFileScans, []);
+
+  // Same verdict for every shape of "the read did not arrive", so a caller
+  // cannot pass a placeholder and read it as coverage.
+  for (const [label, fileContents] of [
+    ['empty string', { 'packages/db/src/migrations/meta/0286_snapshot.json': '' }],
+    ['wrong type', { 'packages/db/src/migrations/meta/0286_snapshot.json': 42 }],
+    ['null', { 'packages/db/src/migrations/meta/0286_snapshot.json': null }],
+    ['a different path', { 'some/other/file.json': snapshot() }],
+  ]) {
+    const result = checkInternalRefs({
+      ...CLEAN,
+      files: [{
+        filename: 'packages/db/src/migrations/meta/0286_snapshot.json',
+        status: 'added',
+        changes: 48503,
+        patch: null,
+      }],
+      fileContents,
+    });
+    assert.equal(result.passed, false, `expected failure for ${label}`);
+  }
+});
+
+test('FAIL CLOSED: a file above the whole-file cap is refused rather than sampled', () => {
+  const oversize = 'x'.repeat(MAX_SCANNED_FILE_BYTES + 1);
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{ filename: 'fixtures/huge.txt', status: 'modified', changes: 10, patch: null }],
+    fileContents: { 'fixtures/huge.txt': oversize },
+  });
+  assert.equal(result.passed, false);
+  assert.deepEqual(result.wholeFileScans, []);
+  // The number is in the message, so an author who hits it can tell a real
+  // limit from a mysterious red.
+  assert.match(result.failures.join('\n'), new RegExp(String(MAX_SCANNED_FILE_BYTES)));
+});
+
+/**
+ * One NUL, written as an escape so this file stays text.
+ *
+ * It is a real character and not the two characters `\` and `0`, because the
+ * implementation's guard is `content.includes('\u0000')` and a fixture holding
+ * a spelled-out escape would not exercise it at all. It is a constant rather
+ * than an inline escape for the same reason the file is checked for stray NULs
+ * elsewhere: a literal one in a source file is invisible in review and breaks
+ * every tool that reads the file as text.
+ */
+const NUL = '\u0000';
+
+test('FAIL CLOSED: a payload carrying a NUL is not scanned as text', () => {
+  // The contents endpoint answers base64 for a path GitHub considers binary.
+  // Scanning that as UTF-8 would either raise mid-gate or report a finding about
+  // base64 that means nothing.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{ filename: 'ui/public/logo.png', status: 'modified', changes: 8, patch: null }],
+    fileContents: { 'ui/public/logo.png': `PNG${NUL.repeat(4)}${'A'.repeat(32)}` },
+  });
+  assert.equal(result.passed, false);
+  assert.deepEqual(result.wholeFileScans, []);
+});
+
+test('NO REGRESSION: a file with a readable patch is not read whole, and its verdict is unchanged', () => {
+  // The bound on the whole change. The fallback runs only where the gate would
+  // otherwise have refused a file, so every patch-bearing file keeps the
+  // patch-only, added-lines-only answer it gave before — including the case
+  // where a whole-file read would have *found* something and thereby changed a
+  // pass into a failure.
+  const files = [{ filename: 'server/src/routes/issues.ts', status: 'modified', changes: 2, patch: '@@ -1,1 +1,2 @@\n a\n+b\n' }];
+  const fileContents = { 'server/src/routes/issues.ts': 'PET-9003 lives on line 1 of this file\n' };
+
+  const plain = checkInternalRefs({ ...CLEAN, files });
+  const withContent = checkInternalRefs({ ...CLEAN, files, fileContents });
+
+  assert.equal(plain.passed, true, JSON.stringify(plain.failures, null, 2));
+  assert.equal(withContent.passed, true, JSON.stringify(withContent.failures, null, 2));
+  assert.deepEqual(withContent.wholeFileScans, []);
+  assert.deepEqual(withContent.failures, plain.failures);
+});
+
+test('a truncated patch is covered by the whole file when one arrives', () => {
+  const truncated = '@@ -10,2 +10,4 @@\n context\n+added one\n+added two\n';
+  const filename = 'server/src/routes/issues.ts';
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{ filename, status: 'modified', changes: 900, patch: truncated }],
+    fileContents: { [filename]: 'line one\nline two\nline three\nline four\n' },
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+  assert.deepEqual(result.wholeFileScans, [filename]);
+});
+
+test('a truncated patch is still read for what arrived, alongside the whole file', () => {
+  // The patch is the start of the change, so an id inside the delivered part is
+  // a finding whether or not the rest could be read.
+  const truncated = '@@ -10,2 +10,4 @@\n context\n+see PET-9004 for the shape\n+added two\n';
+  const filename = 'server/src/routes/issues.ts';
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{ filename, status: 'modified', changes: 900, patch: truncated }],
+    fileContents: { [filename]: 'line one\nline two\n' },
+  });
+  assert.equal(result.passed, false);
+  assertNoEcho(result, ['PET-9004']);
+});
+
+test('a deleted file is never asked to be read whole', () => {
+  // There is no content at the head commit for a path the pull request removes,
+  // so a fetch for one can only come back empty, and a removal carries no added
+  // lines to scan.
+  assert.deepEqual(
+    filesNeedingWholeContent([
+      { filename: 'doc/removed.md', status: 'removed', changes: 40, patch: null },
+      { filename: 'doc/kept.md', status: 'modified', changes: 40, patch: null },
+    ]),
+    ['doc/kept.md']
+  );
+});
+
+test('filesNeedingWholeContent asks for exactly the files the gate cannot read', () => {
+  // If this predicate drifts from the loop's, the fetch silently stops covering
+  // the file the gate is about to refuse. It is asserted against the gate's own
+  // behaviour rather than against a second copy of the rule.
+  const cases = [
+    [{ filename: 'a.txt', status: 'modified', changes: 4, patch: null }, true],
+    [{ filename: 'b.txt', status: 'modified', changes: 0, patch: null }, false],
+    [{ filename: 'c.txt', status: 'modified', changes: 2, patch: '@@ -1,1 +1,2 @@\n a\n+b\n' }, false],
+    [{ filename: 'd.txt', status: 'modified', changes: 2, patch: '@@ -1,2 +1,4 @@\n a\n+b\n' }, true],
+    [{ filename: 'e.txt', status: 'renamed', changes: 7, previous_filename: 'f.txt', patch: null }, true],
+  ];
+  for (const [file, expected] of cases) {
+    assert.deepEqual(
+      filesNeedingWholeContent([file]).length,
+      expected ? 1 : 0,
+      `mismatch for ${file.filename} status=${file.status}`
+    );
+    // Same answer, asked the other way: does the gate actually refuse it?
+    const result = checkInternalRefs({ ...CLEAN, files: [file] });
+    assert.equal(
+      result.passed,
+      !expected,
+      `${file.filename}: the predicate and the gate disagree about whether it is readable`
+    );
+  }
+  // A malformed entry is skipped rather than becoming a fetch for `(unnamed)`.
+  assert.deepEqual(filesNeedingWholeContent([{ status: 'modified', changes: 4, patch: null }]), []);
+  assert.deepEqual(filesNeedingWholeContent(undefined), []);
+});
+
+test('the gate names the file it read whole in the run log, not only in a finding', () => {
+  // The audit trail for a review: a file the gate admits it could not see as a
+  // diff has to be discoverable without a finding existing.
+  const filename = 'packages/db/src/migrations/meta/0286_snapshot.json';
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{ filename, status: 'added', changes: 48503, patch: null }],
+    fileContents: { [filename]: snapshot() },
+  });
+  assert.deepEqual(result.wholeFileScans, [filename]);
+});
+
+test('the reported case, at its reported size: a 1.3 MB snapshot is read, not refused', () => {
+  // The reproduction, at the scale it was reported. A drizzle migration snapshot
+  // on this fork is 1,380,194 bytes across 48,491 lines; the number is measured,
+  // not rounded, because "it is a big file" is exactly the claim that would be
+  // comfortable to hand-wave and the one that decides whether the whole-file read
+  // is viable in a gate's time budget.
+  //
+  // The snapshot's own filename changes with every migration, so this builds the
+  // bytes rather than reading one out of the tree — a fixture pinned to
+  // `0284_snapshot.json` would stop existing the day 0285 landed and the test
+  // would quietly stop testing the case it exists for.
+  const column = '        "created_at": { "name": "created_at", "type": "timestamp", "notNull": true }';
+  const lines = ['{', '  "version": "7",', '  "dialect": "postgresql",', '  "tables": {'];
+  let bytes = lines.reduce((n, l) => n + l.length + 1, 0);
+  let i = 0;
+  while (bytes < 1_380_000) {
+    const line = `    "public.table_${i}": { "columns": { ${column} } },`;
+    lines.push(line);
+    bytes += line.length + 1;
+    i += 1;
+  }
+  lines.push('  }', '}');
+  const content = lines.join('\n');
+  const filename = 'packages/db/src/migrations/meta/9000_snapshot.json';
+  const files = [{ filename, status: 'added', changes: 48503, additions: 48503, deletions: 0, patch: null }];
+
+  // Before the second reader existed, this is the verdict: true, and useless.
+  const refused = checkInternalRefs({ ...CLEAN, files });
+  assert.equal(refused.passed, false);
+  assert.match(refused.failures.join('\n'), /without readable patch content/);
+
+  const read = checkInternalRefs({ ...CLEAN, files, fileContents: { [filename]: content } });
+  assert.equal(read.passed, true, JSON.stringify(read.failures, null, 2));
+  assert.deepEqual(read.wholeFileScans, [filename]);
+
+  // The same bytes, with an identifier in one of the 20k generated lines, and it
+  // is found. This is the difference between reading the file and proving what
+  // shape it has: a shape proof has nothing to say about line 19,994.
+  const tampered = content.replace('"public.table_7": ', '"public.table_7": "see PET-9005", ');
+  assert.notEqual(tampered, content, 'the tamper must land on a real line');
+  const caught = checkInternalRefs({ ...CLEAN, files, fileContents: { [filename]: tampered } });
+  assert.equal(caught.passed, false);
+  assertNoEcho(caught, ['PET-9005']);
+});
+
+test('a content-exempt file is never fetched whole', () => {
+  // Found by running the shipped gate against this pull request's own diff: the
+  // compare payload reports `patch: null` for this test file, because it is
+  // 113,621 bytes. The gate exempts it, so it never looks inside — and a fetch
+  // list that ignored the exemption spent an API request and a 113 KB transfer
+  // on bytes the run then discarded. On a repository where the largest file in
+  // every pull request that edits this gate would be read and thrown away.
+  const exempt = '.github/scripts/tests/check-pr-internal-refs.test.mjs';
+  assert.equal(filesNeedingWholeContent([
+    { filename: exempt, status: 'modified', changes: 309, patch: null },
+  ]).length, 0);
+
+  // And the predicate the loop uses to skip the content is the same one.
+  assert.equal(isContentExempt(exempt), true);
+  assert.equal(isContentExempt('CONTRIBUTING.md'), true);
+  assert.equal(isContentExempt('packages/db/src/migrations/meta/0286_snapshot.json'), false);
+});
+
+test('the allowlist exempts a path only when it carries a reason', () => {
+  // A reason-less ALLOWLIST entry is reported as a failure, so it must go on
+  // exempting nothing. Reading the array instead of the reduced map would make a
+  // malformed entry quietly restore an exemption, which is the one thing the
+  // mandatory-reason rule exists to prevent — and it would be invisible, because
+  // the entry is still reported.
+  const allowed = new Map([['doc/rule.md', 'quotes the banned shapes']]);
+  assert.equal(isContentExempt('doc/rule.md', allowed), true);
+  assert.equal(isContentExempt('doc/rule.md', new Map()), false);
+
+  // The shipped ALLOWLIST agrees with the shipped exemption, entry for entry.
+  for (const entry of ALLOWLIST) {
+    const hasBoth = Boolean(entry?.path && entry?.reason);
+    assert.equal(
+      isContentExempt(entry.path),
+      hasBoth,
+      `${entry.path} is in ALLOWLIST but exempts ${hasBoth ? 'nothing' : 'the file'}`
+    );
+  }
+  for (const path of SELF_EXEMPT_PATHS) {
+    assert.equal(isContentExempt(path), true, `${path} is self-exempt but does not exempt`);
+  }
+});
+
+test('the clean-PR result shape is unchanged for a caller that only reads passed and failures', () => {
+  // The orchestrator consumes `.passed` and `.failures` and nothing else; the
+  // added field must not disturb that, and the two early-return paths must carry
+  // it too so a caller never has to guard for its absence.
+  assert.deepEqual(Object.keys(checkInternalRefs(CLEAN)).sort(), ['failures', 'passed', 'wholeFileScans']);
+  for (const bad of ['', ',,']) {
+    const result = checkInternalRefs({ ...CLEAN, prefixes: bad.split(',') });
+    assert.equal(result.passed, false);
+    assert.deepEqual(result.wholeFileScans, []);
+  }
 });
 
 test('a binary file or pure rename with no patch is a true negative', () => {

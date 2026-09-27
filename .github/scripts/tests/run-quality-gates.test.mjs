@@ -177,6 +177,38 @@ test('the comment surface is wired in, and its fetch is allowed to fail', () => 
   );
 });
 
+test('the second reader is wired in, and it cannot take the run down', () => {
+  // Four things have to be true together, and each is a way the read can be
+  // present in the file and dead in practice: the fetcher is imported, the gate
+  // names which files need it, the head commit is what it reads, and the result
+  // is handed to the gate.
+  //
+  // The head commit is the load-bearing part. A branch name resolves to whatever
+  // the branch points at *now*, so a re-read after a push could scan content the
+  // pull request never had — a gate reading a different commit than the one under
+  // review is a gate that cannot be reasoned about at all.
+  const source = readFileSync(fileURLToPath(new URL('../run-quality-gates.mjs', import.meta.url)), 'utf8');
+  assert.match(source, /import \{ fetchAllPullRequestFiles, fetchWholeFileContents \} from '\.\/fetch-pr-files\.mjs'/);
+  assert.match(source, /filesNeedingWholeContent\(files\)/);
+  assert.match(source, /pr\.head\?\.sha/);
+  assert.match(source, /^\s*fileContents,$/m);
+  // The predicate lives in the gate, not here. A second copy in the orchestrator
+  // would drift from the loop that consumes it, and the drift would be silent in
+  // the safe-looking direction: the gate refusing a file the fetch skipped.
+  assert.match(source, /filesNeedingWholeContent,/);
+  assert.doesNotMatch(source, /patch === null/);
+  // It is not inside the Promise.all with the gates that block, so a slow or
+  // failing read cannot take them down with it.
+  const gatesBlock = source.slice(source.indexOf('const [templateResult'), source.indexOf('internalRefsResult'));
+  assert.doesNotMatch(gatesBlock, /fetchWholeFileContents/);
+  assert.doesNotMatch(gatesBlock, /fetchWholeFileContents/);
+  // And it is awaited before the gate that consumes it, not after.
+  assert.ok(
+    source.indexOf('await fetchWholeFileContents(') < source.indexOf('const internalRefsResult'),
+    'the whole-file read completes before the gate that reads it',
+  );
+});
+
 test('the gate signature and login lists have exactly one definition', () => {
   // They moved into the gate module because the gate has to recognise its own
   // report, and importing the orchestrator to get them would be circular. Two
