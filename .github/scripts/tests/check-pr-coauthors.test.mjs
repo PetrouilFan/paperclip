@@ -403,11 +403,26 @@ test('checkCoauthors: does not call one account\'s git rename a shared identity'
 });
 
 test('checkCoauthors: still reports two unmatched agents on one address after the account guard', () => {
-  // The regression the account guard must not introduce. Gating the collision on
-  // `!contributors.has(key)` — the obvious form — silences THIS case, because an
-  // unmatched commit's key falls back to the address, so the second agent
-  // collides with the first on the key and the note never fires. That is the
-  // exact loss this issue was filed for, so the guard is on the login instead.
+  // The case this issue was filed for, kept as a pin on the behaviour itself.
+  //
+  // It does NOT discriminate the guard. It passes under the obvious form,
+  // `!contributors.has(key)`, too: an unmatched commit's key IS the address, so
+  // the second agent's key is already credited by the first and the note fires
+  // either way. An earlier version of this comment claimed the opposite and was
+  // wrong.
+  //
+  // The tests that do discriminate, all of which fail under that form — measured
+  // at 41 tests, 38 pass, these 3 fail — are, on the true positives it silences:
+  //   - `names both parties when two GitHub accounts share one git email`
+  //   - `does not name the premise as a local identity when one side is an account`
+  // and on the false positive it gains:
+  //   - `does not call one account's git rename a shared identity`
+  // The guard is `Boolean(login) && contributors.has(key)`, because what decides
+  // it is which key the de-dup is keyed on. `contributors.has(key)` is true
+  // precisely when the key de-dup is about to drop the commit, so its negation
+  // is true precisely when that de-dup would have kept it — every second,
+  // distinct contributor on a shared address, which is the loss this gate exists
+  // to prevent.
   const result = checkCoauthors(
     [unmatched('Agent A', 'agent@paperclip.local'), unmatched('Agent B', 'agent@paperclip.local')],
     'tonio-alucema'
@@ -583,4 +598,61 @@ test('checkCoauthors: reports an unshared second person rather than dropping the
   const trailers = result.informational[0].match(/Co-Authored-By:/g) ?? [];
   assert.equal(trailers.length, 2);
   assert.match(result.informational[0], /2 other contributors/);
+});
+
+test('checkCoauthors: scopes the unroutable claim to the address, not the identity', () => {
+  // The clause used to read "nothing outside the machine has ever seen this
+  // identity", which is false here: the same block emits a verified address for
+  // the same person two lines above. The address is what has no route.
+  const result = checkCoauthors(
+    [commit('alice', 'Alice', 'alice@paperclip.ing'), unmatched('Alice', 'a@box.local')],
+    'tonio-alucema'
+  );
+
+  const note = unverifiedNote(result);
+  assert.match(note, /no routable address, so nothing outside the machine has ever seen this address/);
+  assert.doesNotMatch(note, /seen this identity/);
+  // The verified address really is in the same block, which is what made the
+  // wider claim false.
+  assert.match(trailersNote(result), /alice@users\.noreply\.github\.com/);
+});
+
+test('checkCoauthors: flags every domain its comment cites, and stays quiet on the routable ones', () => {
+  // The docstring names these as unroutable, so each one has to keep flagging
+  // when the list is edited. `.lan` and `localdomain` are in the list for having
+  // no reservation and no root-zone entry, not for being reserved.
+  const local = [
+    'build@wt.local', 'build@wt.localhost', 'build@wt.test', 'build@wt.invalid',
+    'build@wt.example', 'build@wt.internal', 'build@wt.home.arpa', 'build@wt.lan',
+    'build@localdomain', 'build@nodots',
+  ];
+  for (const email of local) {
+    assert.match(unverifiedNote(checkCoauthors([unmatched('Someone', email)], 'tonio-alucema')) ?? '',
+      /no routable address/, `${email} is cited as unroutable, so it must flag`);
+  }
+
+  const routable = [
+    'jannes@example.com', 'jannes@example.org', 'jannes@company.co.uk',
+    'alice@users.noreply.github.com', 'dev@paperclip.ing',
+  ];
+  for (const email of routable) {
+    assert.equal(unverifiedNote(checkCoauthors([unmatched('Someone', email)], 'tonio-alucema')), undefined,
+      `${email} can route, so it must stay quiet`);
+  }
+});
+
+test('checkCoauthors: never stores an empty name, so the note cannot render undefined', () => {
+  // The `carried ? ... : named[0]` fallbacks are unreachable while every stored
+  // name is non-empty. This pins that, so they stay a defensive fallback rather
+  // than becoming the path a reader has to reason about.
+  const result = checkCoauthors(
+    [unmatched('   ', 'shared@box.local'), unmatched('Bob', 'shared@box.local')],
+    'tonio-alucema'
+  );
+
+  // The whitespace name falls back to the address's local part, and the list is
+  // sorted, so the fallback name reads first.
+  assert.match(collisionNote(result), /is credited to `Bob` and `shared`/);
+  assert.match(collisionNote(result), /only `shared` is carried above/);
+  for (const note of result.informational) assert.doesNotMatch(note, /undefined/);
 });

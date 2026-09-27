@@ -24,10 +24,14 @@
  * Two things that cost a contributor their credit are reported rather than
  * resolved, because neither has a correct answer this gate can compute:
  *
- * - A shared identity. When one address arrives under two different names, that
- *   is two people sharing a generic local identity as often as it is one person
- *   who changed their git config. De-duplicating is right; dropping the second
- *   name is still a lost attribution, so both spellings are named.
+ * - A shared identity. When one address arrives under two names that differ,
+ *   that is two people sharing a generic local identity as often as it is one
+ *   person who changed their git config. De-duplicating is right; dropping the
+ *   second name is still a lost attribution, so both spellings are named.
+ *   The one case this resolves rather than reports is when both commits
+ *   resolve to the same login: the de-dup there is collapsing one account, so
+ *   a name change under it is a config edit, and the note's remedy would add a
+ *   second trailer for a contributor who already has one.
  * - An unverified credit. A GitHub match proves an *address* belongs to an
  *   account; it says nothing about `user.name`, and the name is read out of
  *   whatever `git config` the committing tree carried either way. A per-agent
@@ -81,12 +85,14 @@ function noReplyEmail(login) {
 /**
  * Domains that cannot carry someone's mail, so an address in one is a machine
  * default rather than an identity anything outside the machine has verified.
- * `.local` is the mDNS name; `.localhost`, `.test` and `.invalid` are reserved
- * together (RFC 6761 §6); `.example` is RFC 2606; `.internal` is ICANN's
- * special-use list; `.home.arpa` is RFC 8375; `.lan` joined them in 2024; and
- * `localdomain` is the hostname Debian ships by default. A domain with no dot
- * at all is the same story. Longest alternatives first, so the anchored match
- * does not have to backtrack out of a shorter prefix.
+ * `.local` is the mDNS name (RFC 6762 §3); `.localhost`, `.test`, `.invalid` and
+ * `.example` are RFC 6761 §6; `home.arpa` is RFC 8375; and `.internal` is
+ * reserved from delegation by ICANN Board Resolution 2024.07.29.06 — a root-zone
+ * reservation, not a special-use designation, which is why it is not in IANA's
+ * special-use registry. `localdomain` is the hostname Debian ships by default
+ * and `.lan` is ad-hoc private use with no reservation and no root-zone entry
+ * (RFC 6762 Appendix G); both are unroutable for want of a reservation rather
+ * than by one. A domain with no dot at all is the same story.
  */
 const LOCAL_ONLY_DOMAIN =
   /\.(localdomain|localhost|local|internal|home\.arpa|test|invalid|example|lan)$/i;
@@ -123,7 +129,12 @@ export function checkCoauthors(commits, prAuthor) {
   // Emails already accounted for, mapped to the display name credited for them.
   // One person can appear both ways in the same branch — some commits matched to
   // their account, some authored with an email GitHub does not know — and keying
-  // on login alone would then emit two trailers for them.
+  // on login alone would then emit two trailers for them, so both keys are
+  // checked. That only collapses the pair when the unmatched commit carries the
+  // same address; a matched commit at one address and an unmatched commit at
+  // another still emits both. Pre-existing, and out of scope for the collision
+  // work — noted here so the next reader does not assume the guarantee is wider
+  // than the key it is keyed on.
   const seenEmails = new Map();
   // Addresses that arrived under more than one name, mapped to the name already
   // credited for them plus every name seen. Two people sharing one generic
@@ -133,10 +144,13 @@ export function checkCoauthors(commits, prAuthor) {
   const collisions = new Map();
   // Trailers whose credit rests on the committing tree's git config rather than
   // on anything GitHub verified, in the order first seen. Two reasons, because
-  // they are two different failures: an address nothing can route means the
-  // whole identity is a machine default, while a matched address with a name
-  // from the tree means the account is right and the label on it may belong to a
-  // stale worktree.
+  // they are two different failures: an address nothing can route means no mail
+  // has ever reached it and the address is a machine default, while a matched
+  // address with a name from the tree means the account is right and the label
+  // on it may belong to a stale worktree. Each reason is scoped to what its
+  // evidence covers — the address is unverified in the first case, the name in
+  // the second — because a matched commit in the same block may already have
+  // put a verified address for the same person two lines up.
   const unverified = [];
   const unverifiedIds = new Set();
 
@@ -268,6 +282,12 @@ export function checkCoauthors(commits, prAuthor) {
     // The carried party is named rather than called "the first": the trailer
     // block above is sorted, so "first" does not mean what a reader scanning
     // that list top-down takes it to mean.
+    //
+    // Both fallbacks below are unreachable. `carried` is seeded from a name that
+    // only reached `seenEmails` after the empty-name skip, and `names` is seeded
+    // with it, so neither list can hold an empty entry. They are kept so that a
+    // future change which stores an empty name degrades to naming a real party
+    // rather than rendering `undefined` into a note a merger pastes by hand.
     const carriedName = carried ? `\`${carried}\`` : `\`${named[0]}\``;
     informational.push(
       `\`${address}\` is credited to ${listNames(named)}, so only ${carriedName} is carried above. ` +
@@ -281,7 +301,7 @@ export function checkCoauthors(commits, prAuthor) {
     const one = unverified.length === 1;
     const reasons = unverified.map(({ id, reason }) =>
       reason === 'unroutable-address'
-        ? `\`${id}\` has no routable address, so nothing outside the machine has ever seen this identity`
+        ? `\`${id}\` has no routable address, so nothing outside the machine has ever seen this address`
         : `\`${id}\` is a GitHub account's own address, but the name on it is unverified`
     );
     informational.push(
