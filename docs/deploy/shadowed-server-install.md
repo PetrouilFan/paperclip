@@ -127,6 +127,8 @@ The two `no` columns under "run-bound fallback" and "shutdown latch" are not an 
 
 `node scripts/check-running-build-drift.mjs` reports all three columns for a given dist, and additionally prints the retained-original files, so "present" and "durably present" are never conflated. Its exit code covers the first column only, on purpose: a hand-edited install is a fact about the plane, not a deploy finding.
 
+It also holds its own manifest to account. Each fix names the commit that introduced it, and the check resolves that commit to confirm the fix is really there. A manifest that names a commit which never carried the fix is a bug in the check itself, so it exits `2` and says so — the same code it already used for an unreadable source tree, and never `1`. Run it from a full clone: a shallow checkout cannot read the named commits, so the check reports them as unverified rather than guessing.
+
 ```bash
 # What the server is actually running, fix by fix, plus whether a reinstall would undo it.
 node scripts/check-running-build-drift.mjs
