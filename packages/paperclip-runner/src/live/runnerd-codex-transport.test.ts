@@ -4326,7 +4326,7 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
     const within = async <T>(
       label: string,
       promise: Promise<T>,
-      timeout = 5_000,
+      timeout = 30_000,
     ) => {
       let timer: NodeJS.Timeout | undefined;
       try {
@@ -4343,6 +4343,18 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         if (timer !== undefined) clearTimeout(timer);
       }
     };
+    const ownerFailure = (
+      mode: string,
+      sourceEventId: string,
+      retired: { committedEvents: { eventType: string }[] },
+      live: { committedEvents: { eventType: string }[] },
+      found: readonly { label: string }[],
+    ) =>
+      `mode=${mode}: run.attached ${sourceEventId} must be committed by exactly ` +
+      `one authority, found ${found.length} on ` +
+      `[${found.map((entry) => entry.label).join(",") || "none"}]. ` +
+      `retired=[${retired.committedEvents.map((entry) => entry.eventType).join(",")}] ` +
+      `live=[${live.committedEvents.map((entry) => entry.eventType).join(",")}]`;
     const dead = (pid: number) => {
       try {
         process.kill(pid, 0);
@@ -4362,7 +4374,14 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
       ),
       stateDirectory,
       lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
-      runnerReconnectGraceMs: 5_000,
+      // This test asserts event ownership, not the reconnect fail-fast policy,
+      // so the production 5s default is not what is under test here. `lost-ack`
+      // drops the active runner and waits for it to re-activate, and a loaded
+      // 1000-test shard stretches that past 5s often enough to make the
+      // transport throw `native_runner_warm_transition_activation_pending`
+      // before any ownership assertion is reached. Give the activation real
+      // headroom; the deadline that matters to this test is the case timeout.
+      runnerReconnectGraceMs: 20_000,
     });
     const readRunner = async () =>
       JSON.parse(
@@ -4464,23 +4483,67 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         expect(rotations).toHaveLength(0);
         if (mode === "lost-ack") core.disconnectActiveRunner();
         releaseCommit();
-        await within("warm attach after old ACK", attachment, 10_000);
+        // Must outlast `runnerReconnectGraceMs` above, because the attach
+        // resolves only after the re-activated runner settles. The two windows
+        // are one budget: tightening either one alone just moves the failure
+        // from the transport's deadline to this gate.
+        await within("warm attach after old ACK", attachment, 30_000);
         expect(rotations).toHaveLength(1);
         const retired = rotations[0]!;
-        const attachedEvent = retired.committedEvents.find(
-          (entry) => entry.sourceEventId === heldEvent!.sourceEventId,
-        )!;
-        expect(attachedEvent.logicalEffectCount).toBe(1);
-        expect(retired.ackedSourceSeq).toBeGreaterThanOrEqual(
-          attachedEvent.sourceSeq,
+        const heldSourceEventId = heldEvent!.sourceEventId;
+        // `lost-ack` throws out of the awaited onCommittedEvent, so the commit
+        // that owns this event is the runner's *replay* delivery rather than
+        // the held one, and nothing orders that replay against
+        // rotateRunIdentity: whichever authority is current when the replay is
+        // processed is the one that owns the commit. The old test read the
+        // commit out of `retired` alone, a clone taken at the rotation, so the
+        // interleaving decided the result (attempt 1 and 2 of run 36267466815
+        // lost it, attempt 3 won it) and the loss surfaced as a TypeError on
+        // `undefined` rather than as a named failure. Assert the ownership
+        // invariant instead of the interleaving: exactly one authority commits
+        // the effect, once.
+        const owners = () =>
+          (
+            [
+              ["retired", retired],
+              ["live", core.store.state],
+            ] as const
+          ).flatMap(([label, state]) =>
+            state.committedEvents
+              .filter((entry) => entry.sourceEventId === heldSourceEventId)
+              .map((event) => ({ label, state, event })),
+          );
+        await vi.waitFor(
+          () =>
+            expect(
+              owners().length,
+              ownerFailure(
+                mode,
+                heldSourceEventId,
+                retired,
+                core.store.state,
+                owners(),
+              ),
+            ).toBe(1),
+          { timeout: 15_000, interval: 25 },
         );
+        const owner = owners()[0]!;
+        expect(owner.event.logicalEffectCount).toBe(1);
+        expect(owner.state.ackedSourceSeq).toBeGreaterThanOrEqual(
+          owner.event.sourceSeq,
+        );
+        // The old authority resumed, re-published its capabilities and its goal
+        // snapshot, and only then attached. Subsequence, not suffix: the attach
+        // commit itself may belong to the authority that took over.
+        const retiredTypes = retired.committedEvents.map((entry) => entry.eventType);
+        const resumedAt = retiredTypes.lastIndexOf("session.resumed");
         expect(
-          retired.committedEvents.slice(-4).map((entry) => entry.eventType),
+          retiredTypes.slice(resumedAt, resumedAt + 3),
+          `mode=${mode}: the old authority must publish its resume sequence in order before the attach. retired=[${retiredTypes.join(",")}]`,
         ).toEqual([
           "session.resumed",
           "session.capabilities.updated",
           "session.goal.snapshot",
-          "run.attached",
         ]);
         expect(
           retired.committedEvents.every(
@@ -4493,8 +4556,9 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         } else {
           expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(1);
         }
-        await vi.waitFor(async () =>
-          expect((await readRunner()).runId).toBe("run-warm-ack-next"),
+        await vi.waitFor(
+          async () => expect((await readRunner()).runId).toBe("run-warm-ack-next"),
+          { timeout: 10_000, interval: 50 },
         );
         const read = await within(
           "read under new authority",
@@ -4520,7 +4584,7 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         await within(
           "warm fixture close",
           bundle.transport.close(),
-          10_000,
+          30_000,
         ).catch(() => undefined);
         for (const handle of handles) {
           await durableControlPlane
@@ -4534,12 +4598,15 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
             expect(handle.processGroupId && dead(-handle.processGroupId)).toBe(
               true,
             );
-          });
+          }, { timeout: 10_000, interval: 50 });
         }
         if (providerPid && !dead(-providerPid))
           process.kill(-providerPid, "SIGKILL");
         if (providerPid)
-          await vi.waitFor(() => expect(dead(-providerPid!)).toBe(true));
+          await vi.waitFor(() => expect(dead(-providerPid!)).toBe(true), {
+            timeout: 10_000,
+            interval: 50,
+          });
         cleanupProven = true;
       } catch (error) {
         if (primaryError === undefined) throw error;
@@ -4558,7 +4625,7 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
       }
     }
   },
-  30_000,
+  60_000,
 );
 
 it.each([false, true])(
