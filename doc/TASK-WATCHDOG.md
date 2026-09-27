@@ -139,6 +139,17 @@ Every watchdog-originated mutation is gated by a server-side scope check derived
 
 The check is wired into the issue update, status change, blocker, assignment, and interaction routes. Any disallowed mutation is rejected at the route layer; the watchdog agent must take a different path (comment, in-subtree follow-up issue, leave a valid waiting state, escalate to a human owner).
 
+### The run's own writes move the fingerprint, so the run's baseline follows
+
+The stop fingerprint is a hash of the stopped leaves' material state, so **writing to the watched subtree changes it**. A run whose first legitimate write is filing a follow-up therefore invalidates its own baseline, and a guard that compared every write against a baseline pinned at wake time would refuse every write after that — including the comment that records the finding and the status change that sets the disposition. The run could not report its own review.
+
+The server resolves that by recording, on the run itself, that the run has been cleared to mutate the watched subtree. From that point on, a fingerprint that moves while the subtree is still stopped is rebased onto the live fingerprint instead of refused, so a run's write order does not decide whether it can finish. Two things are still refused, and they are the two that protect the subtree:
+
+- the subtree is `live`, `pending_first_run`, or `not_applicable` — another actor owns that work
+- the fingerprint moved **before** the run wrote anything — nothing in the run's own history caused it, so the run should record that as its finding and let a fresh run review the current fingerprint
+
+In practice a watchdog agent does not need to sequence its writes. Comment, transition, file the follow-up — in any order, all within the same run.
+
 ---
 
 ## Origin and badges

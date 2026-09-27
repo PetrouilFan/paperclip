@@ -23,11 +23,19 @@ export type TaskWatchdogMutationScope =
   | { kind: "invalid"; detail: string }
   | {
       kind: "watchdog";
+      runId: string;
       watchdogId: string;
       companyId: string;
       watchedIssueId: string;
       watchdogIssueId: string | null;
       stopFingerprint: string | null;
+      /**
+       * Set on the run's own context once this run has been cleared to mutate the
+       * watched subtree. From that point on the stop fingerprint is a baseline the
+       * run advances itself, so later drift is not by itself a reason to refuse —
+       * see `revalidateMutationScope`.
+       */
+      mutationAdmittedAt: string | null;
     };
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -45,6 +53,8 @@ function readTaskWatchdogContext(contextSnapshot: unknown) {
   return {
     watchedIssueId: readString(taskWatchdog?.watchedIssueId) ?? readString(context?.watchedIssueId),
     stopFingerprint: readString(taskWatchdog?.stopFingerprint) ?? readString(context?.stopFingerprint),
+    mutationAdmittedAt:
+      readString(taskWatchdog?.mutationAdmittedAt) ?? readString(context?.mutationAdmittedAt),
   };
 }
 
@@ -113,11 +123,13 @@ export async function resolveTaskWatchdogMutationScope(
 
   return {
     kind: "watchdog",
+    runId: run.id,
     watchdogId: watchdog.id,
     companyId: watchdog.companyId,
     watchedIssueId: watchdog.issueId,
     watchdogIssueId: watchdog.watchdogIssueId ?? null,
     stopFingerprint: taskWatchdog.stopFingerprint,
+    mutationAdmittedAt: taskWatchdog.mutationAdmittedAt,
   };
 }
 

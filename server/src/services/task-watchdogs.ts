@@ -547,8 +547,9 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
 // caller can take, instead of collapsing every cause into a single sentence that
 // ends in "refresh the source state" — which is not actionable in any of them.
 // A mutable state (`stopped` / `already_reviewed`) only reaches here when its
-// fingerprint drifted, so the fingerprint is the cause worth naming; the other
-// states are rejected on the state itself and never carry a fingerprint.
+// fingerprint drifted and this run has not yet been admitted to mutate the
+// subtree, so the drift is not the run's own; the other states are rejected on
+// the state itself and never carry a fingerprint.
 function staleWatchdogMutationReason(state: TaskWatchdogClassifierResult["state"]) {
   if (state === "live") {
     return "Task-watchdog review is stale because the watched subtree now has a live execution path; another run owns that work, so stop mutating the watched subtree and close the review with that finding.";
@@ -559,7 +560,7 @@ function staleWatchdogMutationReason(state: TaskWatchdogClassifierResult["state"
   if (state === "not_applicable") {
     return "Task-watchdog review is stale because the watched subtree no longer holds stopped work this review can act on; refresh the source state to see what is left in it.";
   }
-  return "Task-watchdog review is stale because the watched subtree stop fingerprint changed since this run was woken; re-read the watched subtree and finish the review against its current state instead of this run's snapshot.";
+  return "Task-watchdog review is stale because the watched subtree stop fingerprint changed before this run wrote to it; record that as the review's finding and close the review issue, and let a fresh watchdog run pick up the current fingerprint.";
 }
 
 async function assertWatchedIssue(dbOrTx: any, companyId: string, issueId: string) {
@@ -1630,12 +1631,43 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       ));
   }
 
+  // A run's own mutations change the very fingerprint this guard checks, so the
+  // run's baseline has to be able to follow the subtree it is repairing. Two facts
+  // are persisted on the run's own context, both under `taskWatchdog`:
+  //
+  // - `mutationAdmittedAt`: this run has been cleared to mutate the watched
+  //   subtree. Written the first time a write is admitted.
+  // - `stopFingerprint`: the fingerprint the run's baseline currently sits on.
+  //
+  // The write is a single jsonb merge so it cannot clobber a concurrent context
+  // merge from the wake queue or a queued comment.
+  async function syncRunMutationScopeBaseline(
+    runId: string,
+    companyId: string,
+    stopFingerprint: string,
+    opts: { admit: boolean },
+  ) {
+    const context = sql`COALESCE(${heartbeatRuns.contextSnapshot}, '{}'::jsonb)`;
+    const taskWatchdog = sql`COALESCE(${context}->'taskWatchdog', '{}'::jsonb)`;
+    const fields = opts.admit
+      ? sql`'stopFingerprint', ${stopFingerprint}::text, 'mutationAdmittedAt', ${new Date().toISOString()}::text`
+      : sql`'stopFingerprint', ${stopFingerprint}::text`;
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`${context} || jsonb_build_object('taskWatchdog', ${taskWatchdog} || jsonb_build_object(${fields}))`,
+      })
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)));
+  }
+
   async function revalidateMutationScope(scope: {
     kind: "watchdog";
+    runId?: string | null;
     watchdogId: string;
     companyId: string;
     watchedIssueId: string;
     stopFingerprint: string | null;
+    mutationAdmittedAt?: string | null;
   }) {
     if (!scope.stopFingerprint) {
       return {
@@ -1676,7 +1708,36 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       : null;
     const mutatable = classification.state === "stopped" || classification.state === "already_reviewed";
     if (currentFingerprint !== null && currentFingerprint === scope.stopFingerprint && mutatable) {
+      // First admission for this run. Record it so a later fingerprint drift can
+      // be attributed to the run's own write instead of refused.
+      if (scope.runId && !scope.mutationAdmittedAt) {
+        await syncRunMutationScopeBaseline(scope.runId, scope.companyId, currentFingerprint, { admit: true });
+      }
       return { allowed: true as const, classification };
+    }
+
+    // The fingerprint moved. If the subtree is still `stopped` or
+    // `already_reviewed`, the only thing that can have moved it is a write, and the
+    // only writes that shape the fingerprint are the ones this guard gates. Once
+    // this run has been admitted to mutate the subtree, its own writes are at
+    // least as likely to be the cause as an external change, so rebase the run's
+    // baseline onto the live fingerprint instead of refusing. Refusing locks the
+    // run out of the watched subtree for the rest of its life, which means it
+    // cannot record the finding it was woken to make nor set the disposition it
+    // was woken to set — the recovery the refusal names does not exist, because
+    // the run's baseline is only ever advanced here.
+    if (
+      currentFingerprint !== null
+      && mutatable
+      && scope.runId
+      && scope.mutationAdmittedAt
+    ) {
+      await syncRunMutationScopeBaseline(scope.runId, scope.companyId, currentFingerprint, { admit: false });
+      return {
+        allowed: true as const,
+        classification,
+        rebasedFromStopFingerprint: scope.stopFingerprint,
+      };
     }
 
     return {
