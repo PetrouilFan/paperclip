@@ -28,6 +28,19 @@ function distRootWith(files) {
   return root;
 }
 
+/**
+ * A dist root with the given `distPath` contents, so a sentinel that guards a
+ * file outside `services/` can be exercised.
+ */
+function distRootWithPaths(files) {
+  const root = mkdtempSync(path.join(os.tmpdir(), "drift-dist-"));
+  for (const [distPath, contents] of Object.entries(files)) {
+    mkdirSync(path.dirname(path.join(root, distPath)), { recursive: true });
+    writeFileSync(path.join(root, distPath), contents);
+  }
+  return root;
+}
+
 /** A `git show HEAD:<path>` stub that serves one file body. */
 function gitServing(sourcePath, body) {
   return (args) => {
@@ -209,6 +222,86 @@ test("the source-attribution sentinel is not satisfied by the superseded fallbac
   assert.ok(summarize(results).drifted.includes("run-bound-fallback-attributes-source"));
 });
 
+test("the reason string alone does not make the cross-issue guard look deployed", () => {
+  // The variant that shipped, reproduced from the running build: it names the
+  // reason and fails closed, and carries none of the payload the guard has
+  // since grown. `no_context_source_and_target_unbound` is a reason-code string
+  // literal, so it survives compilation on its own — which is exactly why it
+  // cannot be the only thing a sentinel requires.
+  const reasonStringOnly = [
+    "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+    "let boundSourceIssueId = null;",
+    "let targetIsBound = false;",
+    "if (!contextSourceIssueId) {",
+    "  if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status))",
+    "    throw crossIssueInfluenceRunContextError('terminal_status');",
+    "  targetIsBound = boundIssues.some((row) => row.id === input.targetIssueId);",
+    "}",
+    "if (targetIsBound) return null;",
+    "if (!contextSourceIssueId)",
+    "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+    "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
+  ].join("\n");
+
+  const source = [
+    "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
+    "let boundSourceIssueId = null;",
+    "let targetIsBound = false;",
+    "  throw crossIssueInfluenceRunContextError('terminal_status');",
+    "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+    "  targetAssignedToOtherActor: Boolean(targetAssignee?.assigneeAgentId),",
+    "  targetHeldByAnotherRun: Boolean(targetAssignee?.checkoutRunId),",
+    "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
+  ].join("\n");
+
+  const path = "server/src/services/cross-issue-influence-limit.ts";
+  const git = gitServingAllShippedSentinels({ [path]: source });
+  const root = distRootWith({
+    "cross-issue-influence-limit.js": reasonStringOnly,
+    "issues.js": "function assertCheckoutRunIsActive() {}\nasync function blockedByIdsMapForIssues() {}\n",
+  });
+  const results = evaluateSentinels(RUNNING_BUILD_SENTINELS, { distRoot: root, git });
+  const byId = Object.fromEntries(results.map((r) => [r.id, r]));
+
+  // The reason string is present, so the old single-marker requirement is
+  // satisfied; the payload key is what makes it drift.
+  assert.match(reasonStringOnly, /no_context_source_and_target_unbound/);
+  assert.equal(byId["cross-issue-403-names-the-gate"].state, "drifted");
+  assert.deepEqual(byId["cross-issue-403-names-the-gate"].missingFromDeployed, [
+    "targetAssignedToOtherActor",
+  ]);
+  assert.equal(byId["run-context-allows-self-assigned-target"].state, "drifted");
+  assert.deepEqual(
+    byId["run-context-allows-self-assigned-target"].missingFromDeployed,
+    ["targetAssignedToOtherActor", "targetHeldByAnotherRun"],
+  );
+  // The sentinel that only ever needed the reason's sibling is unaffected.
+  assert.equal(byId["run-bound-fallback-attributes-source"].state, "deployed");
+});
+
+test("a write-only blockedByIssueIds reads as drift, on both read paths", () => {
+  // `blockedByIssueIds` was accepted by PATCH and returned by no read, so an
+  // issue that had just been given a blocker read back as having none. Both
+  // read paths were fixed separately and drift independently, so a build that
+  // carried one and not the other is half-readable and still wrong.
+  const git = gitServingAllShippedSentinels();
+  const root = distRootWithPaths({
+    "services/issues.js": "function assertCheckoutRunIsActive() {}\n",
+    "routes/issues.js": "function sortedRelationIds(relations) { return relations.map(r => r.id) }\n",
+  });
+  const results = evaluateSentinels(RUNNING_BUILD_SENTINELS, { distRoot: root, git });
+  const byId = Object.fromEntries(results.map((r) => [r.id, r]));
+
+  // The single read is current, so it is not drift.
+  assert.equal(byId["blocked-issue-ids-readable-on-single-read"].state, "deployed");
+  // The list read never had the field, and that is the one a sweep reads.
+  assert.equal(byId["blocked-issue-ids-readable-on-list-read"].state, "drifted");
+  assert.deepEqual(
+    byId["blocked-issue-ids-readable-on-list-read"].missingFromDeployed,
+    ["blockedByIdsMapForIssues"],
+  );
+});
+
 test("an unreadable source tree is unevaluated, not drift", () => {
   // `git show HEAD:<file>` fails when the check runs outside a checkout. Node
   // exits an uncaught exception with status 1, which is the drift code, so a
@@ -284,9 +377,13 @@ function gitServingAllShippedSentinels(overrides = {}) {
       "let targetIsBound = false;",
       "  throw crossIssueInfluenceRunContextError('terminal_status');",
       "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+      "  targetAssignedToOtherActor: Boolean(targetAssignee?.assigneeAgentId),",
+      "  targetHeldByAnotherRun: Boolean(targetAssignee?.checkoutRunId),",
       "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
     ].join("\n"),
-    "server/src/services/issues.ts": "function assertCheckoutRunIsActive() {}\n",
+    "server/src/services/issues.ts":
+      "function assertCheckoutRunIsActive() {}\nasync function blockedByIdsMapForIssues() {}\n",
+    "server/src/routes/issues.ts": "function sortedRelationIds(relations) {}\n",
     "server/src/middleware/error-handler.ts": "res.status(400).json({ error: 'Invalid JSON body' });\n",
     "server/src/embedded-postgres-supervisor.ts":
       "const markShutdownIntent = () => {};\noptions.onRecoveryExhausted?.(lastError);\n",
@@ -307,13 +404,23 @@ function gitServingAllShippedSentinels(overrides = {}) {
 function distRootWithFallbackSentinels() {
   const root = mkdtempSync(path.join(os.tmpdir(), "drift-dist-"));
   mkdirSync(path.join(root, "services"), { recursive: true });
-  writeFileSync(path.join(root, "services", "issues.js"), "function assertCheckoutRunIsActive() {}\n");
+  mkdirSync(path.join(root, "routes"), { recursive: true });
+  writeFileSync(
+    path.join(root, "services", "issues.js"),
+    "function assertCheckoutRunIsActive() {}\nasync function blockedByIdsMapForIssues() {}\n",
+  );
+  writeFileSync(
+    path.join(root, "routes", "issues.js"),
+    "function sortedRelationIds(relations) { return relations.map((r) => r.id) }\n",
+  );
   writeFileSync(
     path.join(root, "services", "cross-issue-influence-limit.js"),
     [
       "const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(['succeeded', 'failed']);",
       "  throw crossIssueInfluenceRunContextError('terminal_status');",
       "  throw crossIssueInfluenceRunContextError('no_context_source_and_target_unbound');",
+      "  targetAssignedToOtherActor: Boolean(targetAssignee?.assigneeAgentId),",
+      "  targetHeldByAnotherRun: Boolean(targetAssignee?.checkoutRunId),",
       "const sourceIssueId = contextSourceIssueId ?? boundSourceIssueId;",
     ].join("\n"),
   );
@@ -338,7 +445,12 @@ test("the run shape of the live build still reports exactly the findings it has"
   const root = mkdtempSync(path.join(os.tmpdir(), "drift-dist-"));
   mkdirSync(path.join(root, "services"), { recursive: true });
   mkdirSync(path.join(root, "middleware"), { recursive: true });
+  mkdirSync(path.join(root, "routes"), { recursive: true });
   writeFileSync(path.join(root, "services", "issues.js"), "// build predates the checkout guard\n");
+  writeFileSync(
+    path.join(root, "routes", "issues.js"),
+    "// build predates the readable blockedByIssueIds\n",
+  );
   writeFileSync(
     path.join(root, "services", "cross-issue-influence-limit.js"),
     [
@@ -363,17 +475,26 @@ test("the run shape of the live build still reports exactly the findings it has"
   assert.equal(code, EXIT_DRIFT);
   assert.match(out, /DRIFT checkout-refuses-terminal-run/);
   assert.match(out, /DRIFT run-bound-fallback-attributes-source/);
-  // The two sentinels the superseded variant does satisfy stay green, which is
+  // `cross-issue-403-names-the-gate` used to be green here. This artifact
+  // names the reason and nothing else, and requiring a payload key alongside
+  // the reason is what stops that from reading as deployed.
+  assert.match(out, /DRIFT cross-issue-403-names-the-gate/);
+  assert.match(out, /DRIFT run-context-allows-self-assigned-target/);
+  assert.match(out, /DRIFT blocked-issue-ids-readable-on-single-read/);
+  assert.match(out, /DRIFT blocked-issue-ids-readable-on-list-read/);
+  // The one sentinel the superseded variant does satisfy stays green, which is
   // the discrimination the check exists to make.
   assert.match(out, /ok   run-bound-fallback-scoped/);
-  assert.match(out, /ok   cross-issue-403-names-the-gate/);
   // The shutdown latch is green only because the install was hand-patched, and
   // the report has to say so rather than let a green line read as "a reinstall
   // is safe".
   assert.match(out, /ok   embedded-postgres-shutdown-intent/);
   assert.match(out, /DRIFT malformed-json-is-a-400/);
   assert.doesNotMatch(out, /BUG  /);
-  assert.match(out, /3 fix\(es\) are committed/);
+  // 3 pre-existing plus the 4 the reason-string sentinel and the two fixes it
+  // could not see contribute. The per-id assertions above pin the set; this
+  // only keeps the headline count from drifting away from it.
+  assert.match(out, /7 fix\(es\) are committed/);
 });
 
 test("a fix held only by a hand-patch is reported as a reinstall hazard, not as a green line", () => {

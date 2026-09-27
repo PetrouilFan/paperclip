@@ -97,12 +97,62 @@ export const RUNNING_BUILD_SENTINELS = [
     summary: "the run-bound cross-issue fallback only trusts an active run",
   },
   {
+    // `no_context_source_and_target_unbound` is a reason-code string literal,
+    // so it survives compilation unconditionally — which means it also survives
+    // in builds that predate everything this guard has since grown. A build
+    // that names the reason and nothing else satisfied this sentinel on its
+    // own, so it read `ok` on a build missing the payload and the exemption
+    // below. Requiring a payload key as well keeps the reason string necessary
+    // without letting it be sufficient on its own.
     id: "cross-issue-403-names-the-gate",
     sinceCommit: "f80a08c00",
     sourcePath: "server/src/services/cross-issue-influence-limit.ts",
     distPath: "services/cross-issue-influence-limit.js",
-    markers: ["no_context_source_and_target_unbound"],
+    markers: ["no_context_source_and_target_unbound", "targetAssignedToOtherActor"],
     summary: "the 403 details carry the reason that fired",
+  },
+  {
+    // The self-assigned-target exemption. An agent writing to the issue it is
+    // assigned needs no run to attribute the write to, and the guard used to
+    // refuse it as `no_context_source_and_target_unbound` after the permission
+    // layer had already said yes. Every `blocked` issue was affected, because a
+    // blocked issue cannot check out and so can never reach a binding.
+    //
+    // Both payload keys are required: either alone is carried by builds that
+    // name the holder but not the binding, or the binding but not the
+    // assignee, and neither state is the fix.
+    id: "run-context-allows-self-assigned-target",
+    sinceCommit: "1220016a",
+    sourcePath: "server/src/services/cross-issue-influence-limit.ts",
+    distPath: "services/cross-issue-influence-limit.js",
+    markers: ["targetAssignedToOtherActor", "targetHeldByAnotherRun"],
+    summary: "the assignee may write the issue it is assigned without a run to attribute it to",
+  },
+  {
+    // `blockedByIssueIds` used to be write-only: PATCH accepted it, and no read
+    // path returned it. The write and the read were one field, so an issue that
+    // had just been given a blocker read back as having none — which is how a
+    // ticket with a legitimate first-class blocker gets reported as a blocked
+    // issue with nothing behind it.
+    //
+    // The single-issue read and the list read are separate code paths that were
+    // fixed separately, so each is guarded on its own marker: a build that
+    // carried one and not the other would still be half-readable, and the
+    // symptom is a false "no blockers" that a sweep acts on.
+    id: "blocked-issue-ids-readable-on-single-read",
+    sinceCommit: "725a8ed3",
+    sourcePath: "server/src/routes/issues.ts",
+    distPath: "routes/issues.js",
+    markers: ["sortedRelationIds"],
+    summary: "GET /issues/{id} returns the blockers it was given",
+  },
+  {
+    id: "blocked-issue-ids-readable-on-list-read",
+    sinceCommit: "725a8ed3",
+    sourcePath: "server/src/services/issues.ts",
+    distPath: "services/issues.js",
+    markers: ["blockedByIdsMapForIssues"],
+    summary: "the issue list returns the blockers each issue was given",
   },
   {
     // The sentinel above is satisfied by the *superseded* variant of the
