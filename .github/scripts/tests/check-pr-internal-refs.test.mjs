@@ -989,21 +989,75 @@ test('a commit body is authored text, so both halves of the rule apply to it', (
   assert.match(joined, /Edit the commit message/);
 });
 
-test('an address in a commit body is a leak too, and the body is not a diff line', () => {
-  // The gate's own stated principle: "Authored text is where the address is a
-  // leak; a diff line is where it is usually the subject matter." A commit
-  // body is authored text, so the address half applies even though the same
-  // string in a diff line is left alone.
+test('an address in a commit body is the change being described, so the body is not scanned for one', () => {
+  // The commit *is* the address. `b83e14ad` is "stop the readiness probe from
+  // stealing the guest exposure port" and its body is the `127.0.0.1:42000`
+  // that collided; the remedy this gate would ask for — write the endpoint as a
+  // shape — deletes the sentence that makes the commit worth having. Measured
+  // over the 4670 commits on `master`, the address half flags 31 bodies and
+  // every one is that case.
   const result = checkInternalRefs({
     ...CLEAN,
     commits: [
       { sha: 'bbb22222', commit: { message: 'fix(api): survive a restart\n\nReached at http://localhost:3100/api/health\n' } },
     ],
   });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('the identifier half still reads a commit body, so narrowing the address half did not take the surface with it', () => {
+  // The narrowing is the *half*, not the surface. A body that names an internal
+  // id is a finding, and if this ever passes the identifier half has silently
+  // inherited the address half's exemption.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'ccc33333', commit: { message: 'fix(api): survive a restart\n\nCarries on from PET-9001.\n' } },
+    ],
+  });
   assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
-  const joined = result.failures.join('\n');
-  assert.match(joined, /A commit message body carries/);
-  assert.match(joined, /localhost/);
+  assert.match(result.failures.join('\n'), /A commit message body carries/);
+  assert.match(result.failures.join('\n'), /PET-9001/);
+});
+
+test('narrowing the commit body did not take the address coverage off the other three surfaces', () => {
+  // The regression this change could plausibly introduce, and the one worth a
+  // test: the same address in a title, a description and a commit subject must
+  // all still fail. A body exemption implemented by dropping the surface rather
+  // than the half would pass the test above and quietly pass these three.
+  const address = 'http://localhost:3100/api/health';
+
+  const title = checkInternalRefs({ ...CLEAN, prTitle: `fix(api): ${address} returned 500` });
+  assert.equal(title.passed, false, 'the PR title must still carry the address half');
+  assert.match(title.failures.join('\n'), /an address that resolves to one machine/);
+
+  const description = checkInternalRefs({ ...CLEAN, prBody: `Reproduce with curl ${address}.` });
+  assert.equal(description.passed, false, 'the PR description must still carry the address half');
+  assert.match(description.failures.join('\n'), /an address that resolves to one machine/);
+
+  const subject = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ sha: 'ddd44444', commit: { message: `fix(api): ${address} returned 500 on boot` } }],
+  });
+  assert.equal(subject.passed, false, 'a commit subject must still carry the address half');
+  assert.match(subject.failures.join('\n'), /A commit subject carries/);
+  assert.match(subject.failures.join('\n'), /an address that resolves to one machine/);
+});
+
+test('a squash-merge subject is the PR title, so the string that becomes permanent history keeps the address half', () => {
+  // The coverage argument for exempting only the body. Under a squash merge the
+  // commit subject *is* the PR title, so a title that carries an address is
+  // covered on the surface it was written on and the surface it lands on. If
+  // this ever fails, the text that becomes permanent has lost its check.
+  const title = 'fix(api): http://localhost:3100/api/health returned 500 on boot';
+  const titleScan = checkInternalRefs({ ...CLEAN, prTitle: title });
+  const squashed = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ sha: 'eee55555', commit: { message: title } }],
+  });
+  assert.equal(titleScan.passed, false);
+  assert.equal(squashed.passed, false);
+  assert.match(squashed.failures.join('\n'), /A commit subject carries/);
 });
 
 test('the same string in a diff line is still left alone', () => {
