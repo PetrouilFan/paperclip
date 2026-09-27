@@ -5,6 +5,7 @@ import type { Command } from "commander";
 import { readConfig, resolveConfigPath } from "../config/store.js";
 import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "../config/home.js";
 import { detectServiceManager, type ServiceManager, type ServiceStatus } from "../services/service-manager.js";
+import type { ServiceRestartOutcome } from "../services/slow-restart.js";
 import { buildLocalHealthUrl } from "../utils/health-url.js";
 import { readProcessStartedAt } from "../utils/process-identity.js";
 
@@ -298,21 +299,28 @@ async function waitForRestartReport(instanceId: string, requestedAt: string, tim
   return null;
 }
 
-export async function restartManagedService(input: { instanceId?: string; expectedVersion?: string | null; waitForDrain?: boolean } = {}): Promise<{ status: ServiceStatus; health: HealthResult; report: unknown | null }> {
+export async function restartManagedService(input: { instanceId?: string; expectedVersion?: string | null; waitForDrain?: boolean } = {}): Promise<{ status: ServiceStatus; health: HealthResult; report: unknown | null; restart: ServiceRestartOutcome }> {
   const instanceId = resolvePaperclipInstanceId(input.instanceId);
   return withHotRestartLock(instanceId, async () => {
     const detection = await detectServiceManager({ instanceId });
     if (!detection.supported) throw new Error(detection.reason);
     const before = await detection.manager.status();
     const intent = await writeHotRestartIntent(before, instanceId, input.waitForDrain ?? false);
+    let restart: ServiceRestartOutcome;
     try {
-      await detection.manager.restart();
+      // The supervisor's own view of how long the service was down, carried
+      // through to the caller. `waitForHealth` below cannot supply it: on a
+      // systemd host `manager.restart()` has already blocked for the whole start
+      // job, so by the time the first health probe runs the server is up and
+      // the probe returns on its first attempt. A 520s restart and a 2s restart
+      // are identical from here, which is the ambiguity AC4 is about.
+      restart = await detection.manager.restart({ previousServerPid: before.pid });
     } catch (error) {
       if (before.pid) await rollbackStaleRestartIntent(instanceId, before.pid, () => detection.manager.status());
       throw error;
     }
     const health = await waitForHealth(instanceId, resolveRestartExpectedVersion(input.expectedVersion));
-    return { status: await detection.manager.status(), health, report: await waitForRestartReport(instanceId, intent.requestedAt) };
+    return { status: await detection.manager.status(), health, report: await waitForRestartReport(instanceId, intent.requestedAt), restart };
   });
 }
 
@@ -359,7 +367,13 @@ export function registerServiceCommands(program: Command): void {
   common(service.command("restart").description("Hot-restart the service while preserving active agent runs"))
     .option("--wait", "Wait for active runs to drain instead of adopting them", false)
     .option("--expected-version <version>", "Require the restarted server to report this version")
-    .action(async (opts) => output(await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, waitForDrain: opts.wait }), opts.json));
+    .action(async (opts) => {
+      const result = await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, waitForDrain: opts.wait });
+      // The measurement is in the payload, not only on stderr: `--json` is what
+      // a deploy reads, and a deploy that discards human prose still has to be
+      // able to see that the restart it triggered took eight minutes.
+      output({ ...result, slowRestart: result.restart.severity !== "ok" }, opts.json);
+    });
 
   common(service.command("status").description("Show supervisor and health status")).action(async (opts) => {
     const manager = await resolveManager(opts); if (!manager) return;
