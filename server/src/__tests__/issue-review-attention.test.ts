@@ -229,12 +229,95 @@ describeEmbeddedPostgres("issue review attention", () => {
         paths: expect.arrayContaining([expect.objectContaining({ kind })]),
       });
     }
+    // An interaction that names no addressee is board-addressed. It is not the
+    // assignee's card, so the assignee is not its responder.
     expect(byId.get(interactionIssueId)?.paths).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "interaction", responder: "Review Agent" }),
+      expect.objectContaining({ kind: "interaction", responder: "Board" }),
     ]));
     expect(byId.get(humanOnlyInteractionIssueId)?.paths).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "interaction", responder: "Board" }),
     ]));
+  });
+
+  it("names the addressee of an interaction, and the board when the card names nobody", async () => {
+    const { companyId, agentId } = await seed();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "Addressed Agent",
+      role: "engineer",
+      status: "idle",
+    });
+
+    // Every one of these is assigned to `agentId`. Only the addressee differs.
+    const unaddressedIssueId = await insertReview({ companyId, agentId, identifier: "RVA-A1" });
+    const selfAddressedIssueId = await insertReview({ companyId, agentId, identifier: "RVA-A2" });
+    const otherAddressedIssueId = await insertReview({ companyId, agentId, identifier: "RVA-A3" });
+    const humanOnlyUnaddressedIssueId = await insertReview({ companyId, agentId, identifier: "RVA-A4" });
+
+    // No resolver policy columns are set on this row, so it takes the schema
+    // defaults: effective `anyone`, provenance `inherited`. That is the
+    // default path for every card created without an explicit policy, and it
+    // is the configuration under which the assignee used to be reported.
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId: unaddressedIssueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, questions: [{ id: "q", prompt: "Which?" }] },
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId: selfAddressedIssueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      addresseeAgentId: agentId,
+      payload: { version: 1, questions: [{ id: "q", prompt: "Which?" }] },
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId: otherAddressedIssueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      addresseeAgentId: otherAgentId,
+      payload: { version: 1, prompt: "Approve?" },
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId: humanOnlyUnaddressedIssueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      payload: { version: 1, prompt: "Human review?" },
+    });
+
+    const rows = await svc.list(companyId, { status: "in_review" });
+    const responderFor = (issueId: string) =>
+      (rows.find((row) => row.id === issueId)?.reviewAttention?.paths ?? []).find(
+        (path) => path.kind === "interaction",
+      )?.responder;
+
+    // Nobody was addressed, so the card waits on the board. Naming the
+    // assignee here is the defect: it is the party blocked on the card, and
+    // the creation route never wakes it because it names no addressee.
+    expect(responderFor(unaddressedIssueId)).toBe("Board");
+    // The addressee branch is preserved for the case it was written for.
+    expect(responderFor(selfAddressedIssueId)).toBe("Review Agent");
+    // Negative control for both failure modes at once. This card DOES name an
+    // addressee, and it is not the assignee, so the projection must follow the
+    // card rather than the issue - a "always Board" fix and a "name the
+    // assignee" fix both fail here.
+    expect(responderFor(otherAddressedIssueId)).toBe("Addressed Agent");
+    // An explicit human-only card was already correct and must stay correct.
+    expect(responderFor(humanOnlyUnaddressedIssueId)).toBe("Board");
   });
 
   it("does not let a transiently skipped recovery consume its fingerprint", async () => {
