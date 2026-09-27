@@ -93,6 +93,14 @@ export const heartbeatRuns = pgTable(
     issueCommentStatus: text("issue_comment_status").notNull().default("not_applicable"),
     issueCommentSatisfiedByCommentId: uuid("issue_comment_satisfied_by_comment_id"),
     issueCommentRetryQueuedAt: timestamp("issue_comment_retry_queued_at", { withTimezone: true }),
+    // Dispatch decisions in which this run stayed queued while the same agent
+    // took a slot for a later-created run. A strand is a window, not a state: the
+    // run can release and self-heal, so a re-drive that only reads
+    // `status = 'queued'` both over-counts runs that were about to release and
+    // misses strands that released unseen. This counter is the durable dispatch
+    // history the wake payload reads to tell a woken agent how many fresher runs
+    // went ahead of it.
+    dispatchSkipCount: integer("dispatch_skip_count").notNull().default(0),
     livenessState: text("liveness_state"),
     livenessReason: text("liveness_reason"),
     continuationAttempt: integer("continuation_attempt").notNull().default(0),

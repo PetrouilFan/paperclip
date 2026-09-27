@@ -530,11 +530,14 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
+  WAKE_QUEUE_AGE_KEY,
   isNonAssigneeWorkspaceBusyRetry,
   extractWakeCommentIds,
   deriveCommentId,
   allowsIssueInteractionWake,
   isResolvedInteractionContinuationWakeContext,
+  buildWakeQueueAge,
+  readWakeQueueAge,
 } from "../modules/run-dispatch/index.js";
 import {
   createWakeQueue,
@@ -7667,6 +7670,8 @@ export async function buildPaperclipWakePayload(input: {
     workMode: string;
     projectId?: string | null;
     executionPolicy?: unknown;
+    /** `issues.updatedAt`: lets the wake payload state how stale the bound issue was. */
+    updatedAt?: Date | null;
   } | null;
   exposeLowTrustRaw?: boolean;
   // Experimental: agents write user-interaction content in ASD-STE100
@@ -7697,6 +7702,7 @@ export async function buildPaperclipWakePayload(input: {
             status: issues.status,
             priority: issues.priority,
             workMode: issues.workMode,
+            updatedAt: issues.updatedAt,
           })
           .from(issues)
           .where(
@@ -8061,6 +8067,14 @@ export async function buildPaperclipWakePayload(input: {
     : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    // Server-owned queue facts, read from the stamped context snapshot and
+    // completed with the bound issue's own staleness. An agent that wakes onto
+    // a task that has been dead for hours must be able to see that from the wake
+    // payload alone.
+    queueAge: readWakeQueueAge(
+      input.contextSnapshot,
+      issueSummary?.id === issueId ? issueSummary.updatedAt : null,
+    ),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     attachmentOmissions,
     externalChatProvider,
@@ -17785,14 +17799,58 @@ export function heartbeatService(
       }
       return { ownsIssue, blocked: false };
     }
+    /**
+     * Binds a just-claimed run to its issue, and records the issue's own
+     * last-change time as it stood *before* that binding.
+     *
+     * The binding stamps `issues.updatedAt`, so any read taken after it reports
+     * the claim's own clock as the issue's last change: a post-claim read can
+     * never show that the issue sat untouched for hours while this run waited in
+     * the queue, and would report zero staleness for every run. Inside this
+     * transaction, before the update, the pre-binding state still exists - and
+     * binding a run to an issue is execution bookkeeping, not a change to the
+     * task.
+     *
+     * The capture is skipped when the binding did not apply, so a wake payload
+     * never advertises a staleness the issue did not actually have.
+     */
     async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined) {
       if (!claimedRun || !issueId || !ownsIssue) return;
-      await tx.update(issues).set({
+      const [preBindIssue] = await tx
+        .select({ updatedAt: issues.updatedAt })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .limit(1);
+      const bound = await tx.update(issues).set({
         executionRunId: claimedRun.id,
         executionAgentNameKey: normalizeAgentNameKey(agent.name),
         executionLockedAt: claimedAt,
         updatedAt: claimedAt,
-      }).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+      }).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .returning({ id: issues.id });
+      if (bound.length === 0 || !preBindIssue) return;
+      // The run row was written by the caller in this same transaction, so
+      // `claimedRun.contextSnapshot` is already the post-update value and is the
+      // right base to extend.
+      const runContext = parseObject(claimedRun.contextSnapshot);
+      await tx
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: {
+            ...runContext,
+            [WAKE_QUEUE_AGE_KEY]: {
+              ...parseObject(runContext[WAKE_QUEUE_AGE_KEY]),
+              issueUpdatedAt: preBindIssue.updatedAt.toISOString(),
+            },
+          },
+          updatedAt: claimedAt,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, claimedRun.id),
+            eq(heartbeatRuns.companyId, run.companyId),
+          ),
+        );
     }
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const queuedCommentIds = queuedCommentIdsFromRunContext(context);
@@ -20241,6 +20299,61 @@ export function heartbeatService(
     }
   }
 
+  /**
+   * Records the dispatch history a woken agent cannot otherwise see.
+   *
+   * A strand is a window, not a state: the run can release and self-heal with
+   * no change to any field a `status = 'queued'` read looks at. So this counts
+   * the decisions themselves, on the row, while the row is still queued — a
+   * run that was cancelled instead of skipped reaches a terminal outcome and is
+   * excluded by the `queued` predicate rather than being counted as a wait.
+   *
+   * The predicate is deliberately narrow, because the number has to mean one
+   * thing: this run stayed queued while the same agent took a slot for a
+   * later-created run. A plain "lost the sort" or a capacity wait leaves no
+   * such evidence, and neither is a dispatch fault.
+   */
+  async function recordDispatchStrands(
+    candidates: Array<typeof heartbeatRuns.$inferSelect>,
+    claimed: Array<typeof heartbeatRuns.$inferSelect>,
+  ) {
+    if (claimed.length === 0 || candidates.length === 0) return;
+    const claimedIds = new Set(claimed.map((run) => run.id));
+    const newestClaimedCreatedAtMs = Math.max(
+      ...claimed.map((run) => run.createdAt.getTime()),
+    );
+    const strandedIds = candidates
+      .filter(
+        (run) =>
+          !claimedIds.has(run.id) &&
+          run.createdAt.getTime() <= newestClaimedCreatedAtMs,
+      )
+      .map((run) => run.id);
+    if (strandedIds.length === 0) return;
+    try {
+      await db
+        .update(heartbeatRuns)
+        .set({
+          dispatchSkipCount: sql`${heartbeatRuns.dispatchSkipCount} + 1`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, claimed[0].agentId),
+            inArray(heartbeatRuns.id, strandedIds),
+            eq(heartbeatRuns.status, "queued"),
+          ),
+        );
+    } catch (err) {
+      // Dispatch history is evidence, never a dispatch gate. A write that
+      // fails here must not strand the runs that were just released.
+      logger.warn(
+        { err, agentId: claimed[0].agentId, strandedRunCount: strandedIds.length },
+        "failed to record dispatch strands for queued runs",
+      );
+    }
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
@@ -20359,6 +20472,7 @@ export function heartbeatService(
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
+      await recordDispatchStrands(prioritizedRuns, claimedRuns);
 
       for (const claimedRun of claimedRuns) {
         const execution = executeRun(claimedRun.id).catch((err) => {
@@ -20673,6 +20787,29 @@ export function heartbeatService(
       }
       const runtime = await ensureRuntimeState(agent);
       const context = parseObject(run.contextSnapshot);
+      // Stamp the queue age before anything reads the context, so the wake
+      // envelope, the continuation trigger, and the persisted snapshot all
+      // carry one server-derived answer to "how long has this been waiting, and
+      // how many fresher runs went first?". Without it a 7-hour-stale dispatch
+      // is byte-identical to a fresh one at every point the agent can act on.
+      if (run.startedAt) {
+        // The claim path captured the issue's pre-claim `updatedAt` into this
+        // key; keep it, because the dispatch-time issue row has since been
+        // stamped with the claim's own execution binding.
+        const capturedIssueUpdatedAt = readNonEmptyString(
+          parseObject(context[WAKE_QUEUE_AGE_KEY]).issueUpdatedAt,
+        );
+        context[WAKE_QUEUE_AGE_KEY] = {
+          ...buildWakeQueueAge({
+            enqueuedAt: run.createdAt,
+            startedAt: run.startedAt,
+            skippedByDispatchCount: run.dispatchSkipCount,
+          }),
+          ...(capturedIssueUpdatedAt ? { issueUpdatedAt: capturedIssueUpdatedAt } : {}),
+        };
+      } else {
+        delete context[WAKE_QUEUE_AGE_KEY];
+      }
       const authorizeFailedChatRetryExecution = () =>
         db.transaction((tx) =>
           authorizeFailedChatRunRetryWake(db, tx as unknown as Db, {
@@ -21142,6 +21279,7 @@ export function heartbeatService(
             executionWorkspaceId: issueContext.executionWorkspaceId,
             executionWorkspacePreference:
               issueContext.executionWorkspacePreference,
+            updatedAt: issueContext.updatedAt,
           }
         : null;
       const continuationSummary = issueRef && !isConversation(issueContext)
@@ -21216,6 +21354,7 @@ export function heartbeatService(
               workMode: issueRef.workMode,
               projectId: issueRef.projectId,
               executionPolicy: issueContext?.executionPolicy ?? null,
+              updatedAt: issueRef.updatedAt,
             }
           : null,
         exposeLowTrustRaw,

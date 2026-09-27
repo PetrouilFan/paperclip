@@ -498,7 +498,7 @@ describe("follow-up context size", () => {
     const answerText = "No budget. Wait for my approval.";
     const continuation: ExecutionContinuationEnvelope = {
       version: 1, companyId: "company", issueId: "issue", objective: "Welcome",
-      trigger: { reason: "issue_commented", interactionId: "answer-id", sourceRunId: null },
+      trigger: { reason: "issue_commented", interactionId: "answer-id", sourceRunId: null, queueAge: null },
       originCommentIds: ["new"], messages: [message("old", oldBody), message("new", newBody)],
       resumeDelta: { baseRunId: "previous-run", messages: [message("new", newBody)] },
       humanResponses: [{ id: "answer-id", kind: "ask_user_questions", status: "answered",

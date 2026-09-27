@@ -14,6 +14,7 @@ import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
+import { readWakeQueueAge } from "../modules/run-dispatch/index.js";
 
 const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v)
@@ -447,6 +448,10 @@ export async function buildExecutionContinuation(input: {
       reason: string(input.context.wakeReason) ?? "task_execution",
       interactionId: triggerInteraction?.id ?? null,
       sourceRunId,
+      // The only place a woken agent can learn that its task waited. Without it
+      // the trigger is byte-identical for a run dispatched on time and one that
+      // sat at the head of the queue for hours.
+      queueAge: readWakeQueueAge(input.context, issue.updatedAt),
     },
     originCommentIds,
     objective: latestRequest?.body ?? issue.description ?? issue.title,

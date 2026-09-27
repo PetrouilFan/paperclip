@@ -1110,6 +1110,38 @@ Legacy CLI paths that put prompts in command-line arguments (Gemini, Grok, Kimi,
 Pi, and Hermes) still have argument-size limits. ACP turns, SDK requests, and
 CLI paths that use stdin avoid that separate limit for the wake prompt.
 
+### Queue age in the wake payload
+
+The wake payload carries a top-level `queueAge` object, and the same object rides
+on `executionContinuation.trigger.queueAge`, so a woken agent can answer *how long
+has this been waiting, and how many fresher runs went first?* from the wake
+payload alone:
+
+| Field | Source | Meaning |
+| --- | --- | --- |
+| `enqueuedAt` | `heartbeat_runs.createdAt` | When the run entered the dispatch queue. |
+| `startedAt` | `heartbeat_runs.startedAt` | When the dispatcher claimed the run. |
+| `queueAgeSeconds` | derived | `startedAt - enqueuedAt`, floored at 0. |
+| `skippedByDispatchCount` | `heartbeat_runs.dispatchSkipCount` | Dispatch decisions that left this run queued while a later-created run took the same agent's slot. |
+| `issueUpdatedAt` / `issueStaleSeconds` | pre-claim `issues.updatedAt` | How long the bound issue had been untouched when this run started. |
+
+The wait is measured enqueue to start, not enqueue to read time, so it does not keep
+growing after dispatch. The issue's `updatedAt` is read inside the claim transaction
+*before* the claim's execution-binding write stamps that column: the binding stamps it
+with the claim's own clock, so a read taken after the claim would report zero staleness
+for every run. `queueAge` is `null` for a run
+that predates the field or whose snapshot is malformed — an unstamped run still
+wakes, it just carries no age. See `server/src/modules/run-dispatch/domain/wake-context.ts`
+for the derive and read-back helpers: the derive throws rather than stamp a partial
+age, and the read-back returns `null` rather than invent one.
+
+`dispatchSkipCount` is durable dispatch history rather than a derived state,
+because a strand is a window, not a state: a run can be passed over for hours and
+then release and self-heal with no change to any field a `status = 'queued'` read
+looks at. The counter is incremented only on the `queued` rows that a real
+dispatch decision passed over, and a write failure is logged and ignored — it is
+evidence, never a dispatch gate.
+
 ## Issue List Description Preview
 
 The issue index routes (`GET /api/companies/{companyId}/issues` and the blocked

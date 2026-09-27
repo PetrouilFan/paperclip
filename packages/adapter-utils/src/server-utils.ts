@@ -1,4 +1,7 @@
-import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import type {
+  ExecutionContinuationEnvelope,
+  ExecutionContinuationQueueAge,
+} from "@paperclipai/shared";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
@@ -825,6 +828,8 @@ export type PaperclipExternalChatProvider =
 type PaperclipWakePayload = {
   executionContinuation: ExecutionContinuationEnvelope | null;
   reason: string | null;
+  /** How long this run waited for a slot, and how many fresher runs went first. */
+  queueAge: ExecutionContinuationQueueAge | null;
   recovery: PaperclipWakeRecovery | null;
   issue: PaperclipWakeIssue | null;
   checkedOutByHarness: boolean;
@@ -954,6 +959,56 @@ function normalizePaperclipWakeIssue(
     workMode,
     priority,
   };
+}
+
+function normalizePaperclipWakeQueueAge(
+  value: unknown,
+): ExecutionContinuationQueueAge | null {
+  const queueAge = parseObject(value);
+  const enqueuedAt = asString(queueAge.enqueuedAt, "").trim();
+  const startedAt = asString(queueAge.startedAt, "").trim();
+  // Both ends of the wait, or nothing. A half-stamped payload would advertise
+  // an age it cannot support, and a malformed one must not read as a fresh run.
+  if (!enqueuedAt || !startedAt) return null;
+  return {
+    enqueuedAt,
+    startedAt,
+    queueAgeSeconds: Math.max(
+      0,
+      Math.round(asNumber(queueAge.queueAgeSeconds, 0)),
+    ),
+    skippedByDispatchCount: Math.max(
+      0,
+      Math.round(asNumber(queueAge.skippedByDispatchCount, 0)),
+    ),
+    ...(asString(queueAge.issueUpdatedAt, "").trim()
+      ? {
+          issueUpdatedAt: asString(queueAge.issueUpdatedAt, "").trim(),
+          issueStaleSeconds: Math.max(
+            0,
+            Math.round(asNumber(queueAge.issueStaleSeconds, 0)),
+          ),
+        }
+      : { issueUpdatedAt: null, issueStaleSeconds: null }),
+  };
+}
+
+/**
+ * A wait long enough that the task behind it may already be answered, cancelled,
+ * or superseded. Below this the queue age is reported and nothing more: routine
+ * slot contention is not a reason to doubt the work.
+ */
+const STALE_WAKE_QUEUE_AGE_SECONDS = 900;
+
+function formatWakeDuration(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.round(totalSeconds));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
 }
 
 function normalizePaperclipWakeComment(
@@ -1856,6 +1911,7 @@ export function normalizePaperclipWakePayload(
   );
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
   const issue = normalizePaperclipWakeIssue(payload.issue);
+  const queueAge = normalizePaperclipWakeQueueAge(payload.queueAge);
   const skillTest =
     issue?.workMode === "skill_test" ||
     payload.skillTest === true ||
@@ -1880,13 +1936,15 @@ export function normalizePaperclipWakePayload(
     !executionWorkspace &&
     !agentMessage &&
     !recovery &&
-    !issue
+    !issue &&
+    !queueAge
   ) {
     return null;
   }
 
   return {
     reason: asString(payload.reason, "").trim() || null,
+    queueAge,
     executionContinuation: parseObject(payload.executionContinuation).version === 1 ? payload.executionContinuation as ExecutionContinuationEnvelope : null,
     recovery,
     issue,
@@ -2399,6 +2457,18 @@ function renderPaperclipWakePromptBody(
           `- latest comment id: ${normalized.latestCommentId ?? "unknown"}`,
         ]
       : []),
+    ...(normalized.queueAge
+      ? [
+          `- queue age: ${formatWakeDuration(normalized.queueAge.queueAgeSeconds)} waiting for a dispatch slot (enqueued ${normalized.queueAge.enqueuedAt})`,
+          `- fresher runs dispatched ahead of this one: ${normalized.queueAge.skippedByDispatchCount}`,
+          ...(normalized.queueAge.issueStaleSeconds === null ||
+          normalized.queueAge.issueStaleSeconds === undefined
+            ? []
+            : [
+                `- bound issue unchanged for: ${formatWakeDuration(normalized.queueAge.issueStaleSeconds)} before this run started`,
+              ]),
+        ]
+      : []),
     `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
     ...(recoveryScoped
       ? [
@@ -2433,6 +2503,27 @@ function renderPaperclipWakePromptBody(
           "",
         ]
       : [];
+  // A stale dispatch is otherwise indistinguishable from a live one: nothing in
+  // the objective or the comment batch says the task behind it may already be
+  // dead. Say so once, and name the cheap check, instead of letting the agent
+  // burn the slot redoing cancelled work.
+  const staleQueueAgeLines = (() => {
+    const queueAge = normalized.queueAge;
+    if (!queueAge) return [];
+    const stale = queueAge.queueAgeSeconds >= STALE_WAKE_QUEUE_AGE_SECONDS;
+    const outOfOrder = queueAge.skippedByDispatchCount > 0;
+    if (!stale && !outOfOrder) return [];
+    return [
+      "",
+      `Stale-wake check: this run waited ${formatWakeDuration(queueAge.queueAgeSeconds)} for a dispatch slot${
+        outOfOrder
+          ? `, and ${queueAge.skippedByDispatchCount} fresher run${
+              queueAge.skippedByDispatchCount === 1 ? "" : "s"
+            } for the same agent started ahead of it`
+          : ""
+      }. The task may have been answered, cancelled, or superseded while it waited. Before doing the work, read the issue's current status and latest comments; if the work is already done or cancelled, record that and stop instead of redoing it.`,
+    ];
+  })();
   const lines = resumedSession
     ? [
         "## Paperclip Resume Delta",
@@ -2449,6 +2540,7 @@ function renderPaperclipWakePromptBody(
         ...externalInteractionContinuationLines,
         ...executionContractLines,
         ...wakeSummaryLines,
+        ...staleQueueAgeLines,
       ]
     : [
         "## Paperclip Wake Payload",
@@ -2479,6 +2571,7 @@ function renderPaperclipWakePromptBody(
         ...externalInteractionContinuationLines,
         ...executionContractLines,
         ...wakeSummaryLines,
+        ...staleQueueAgeLines,
       ];
 
   if (normalized.executionContinuation) {

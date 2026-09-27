@@ -1,0 +1,1 @@
+ALTER TABLE "heartbeat_runs" ADD COLUMN "dispatch_skip_count" integer DEFAULT 0 NOT NULL;
