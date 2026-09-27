@@ -6857,16 +6857,27 @@ export function issueRoutes(
     )
       return false;
 
-    // Structured resume intent is the sole comment surface that may revive a
-    // cancelled issue. Bare status transitions and `reopen` keep using the
-    // dedicated restore-flow guard.
+    // Structured resume intent is the only way to move an issue out of
+    // `cancelled`. A bare status transition, `reopen: true`, or a plain comment
+    // is refused.
+    //
+    // There is no separate restore endpoint to point anyone at: the only
+    // `/issues/:id/...restore` route in this file restores a *document*
+    // revision. The sanctioned path back out of `cancelled` is this same PATCH
+    // carrying `resume: true` together with a comment body (a bare `resume`
+    // without one is refused separately as "Follow-up intent requires a
+    // comment"). So the error has to spell that out rather than name a flow
+    // that does not exist — an operator who follows this message needs an
+    // instruction they can actually execute.
     if (issue.status === "cancelled" && options.resumeIntent !== true) {
       res.status(409).json({
         error:
-          "Cancelled issues must be restored through the dedicated restore flow",
+          'Cancelled issues can only be reopened by explicit resume intent: PATCH with { "resume": true, "comment": "<reason>" }. The comment is required.',
         details: {
           issueId: issue.id,
           status: issue.status,
+          remedy:
+            'PATCH /api/issues/{issueId} with { "resume": true, "comment": "<reason>" }',
         },
       });
       return false;
