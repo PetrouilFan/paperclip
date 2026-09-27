@@ -15,6 +15,7 @@ import {
   isGateComment,
   maskInlineCodeSpans,
   patchIsComplete,
+  redactMatches,
   resolvePrefixes,
   resolveProductOwnedPrefixes,
 } from '../check-pr-internal-refs.mjs';
@@ -61,6 +62,7 @@ const DECLARED_FIXTURE_IDS = new Set([
   'PET-9005',
   'PET9005',
   'PET-9006',
+  'PET9006',
 ]);
 
 /**
@@ -74,6 +76,33 @@ const DECLARED_FIXTURE_IDS = new Set([
  */
 const MIN_SYNTHETIC_ID = 9000;
 
+/**
+ * Assert the report never reproduces what it matched, and hand back the joined
+ * findings so the caller can go on asserting about them.
+ *
+ * This is the assertion whose absence let the amplification loop ship: the
+ * suite checked *that* a rule fired and, where it went further, checked that the
+ * finding named the identifier — so the one behaviour that had to be wrong was
+ * the one behaviour the tests pinned. Every site that used to assert a literal
+ * in the output now asserts its absence through here, and the property test
+ * further down runs it over all seven surfaces at once.
+ *
+ * @param {{passed: boolean, failures: string[]}} result
+ * @param {string[]} secrets  every string the run was expected to match
+ * @returns {string} the joined findings
+ */
+const assertNoEcho = (result, secrets) => {
+  const joined = result.failures.join('\n');
+  for (const secret of secrets) {
+    assert.equal(
+      joined.includes(secret),
+      false,
+      `the finding reproduces "${secret}" verbatim, so posting it makes it a new finding:\n${joined}`
+    );
+  }
+  return joined;
+};
+
 test('the clean PR passes', () => {
   const result = checkInternalRefs(CLEAN);
   assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
@@ -83,9 +112,11 @@ test('the clean PR passes', () => {
 test('NEGATIVE CONTROL: an id in the PR title fails the gate', () => {
   const result = checkInternalRefs({ ...CLEAN, prTitle: throwawayTitle });
   assert.equal(result.passed, false);
-  const joined = result.failures.join('\n');
+  const joined = assertNoEcho(result, ['PET-9000']);
   assert.match(joined, /The PR title/);
-  assert.match(joined, /PET-9000/);
+  // The count replaces the enumeration: the author needs to know how many to go
+  // and find, not which, because naming which is what made this a new finding.
+  assert.match(joined, /carries 1 internal issue identifier/);
   // The failure has to say why it matters, or it is just noise a reviewer learns to skip.
   assert.match(joined, /commit subject/);
 });
@@ -103,7 +134,9 @@ test('the compact branch form is caught even though it carries no hyphen', () =>
   // `PET-\d+` cannot see `pet9002-...`: there is no hyphen after the prefix.
   const result = checkInternalRefs({ ...CLEAN, prBranch: 'fix/pet9002-blocker-edge-one-way-door' });
   assert.equal(result.passed, false);
-  assert.match(result.failures.join('\n'), /pet9002/);
+  // The surface label quotes the branch name it is naming, so the branch name is
+  // itself a leak site and not only the identifier list is masked.
+  assertNoEcho(result, ['pet9002']);
 });
 
 test('an id in a changed file name fails, because the name is part of the change', () => {
@@ -154,8 +187,11 @@ test('the compact form is caught on an added diff line, not only on a branch nam
     }],
   });
   assert.equal(result.passed, false, 'a compact id on an added line must fail');
-  assert.match(result.failures.join('\n'), /pet9002/);
-  assert.match(result.failures.join('\n'), /listening-port-owner\.test\.ts/);
+  // The `↳ found in` preview is a slice of the added line, and that slice is
+  // where the identifier usually sits, so the preview is masked and the file
+  // name still identifies the line to open.
+  const joined = assertNoEcho(result, ['pet9002']);
+  assert.match(joined, /listening-port-owner\.test\.ts/);
 });
 
 test('FLOOR: every leak shape the compact scan was measured against is caught', () => {
@@ -266,7 +302,11 @@ test('a bare agent:// mention is not a link, but agent:// with the instance pref
 test('an instance route link is caught', () => {
   const result = checkInternalRefs({ ...CLEAN, prBody: 'Context lives at /PET/issues/PET-9002.' });
   assert.equal(result.passed, false);
-  assert.match(result.failures.join('\n'), /\/PET\/issues/);
+  // The route is the matched text: `findAll(..., link)` returns the whole
+  // `/PET/issues/PET-9002` span, and an enumeration of it would have put the
+  // route back into the very comment the finding is about.
+  const joined = assertNoEcho(result, ['/PET/issues/PET-9002', 'PET-9002']);
+  assert.match(joined, /The PR description/);
 });
 
 test('FAIL CLOSED: an empty prefix list is a failure, not a pass', () => {
@@ -446,9 +486,8 @@ test('the merged #85 body fails the gate it passed', () => {
   // stopped seeing references and the finding is unrepeatable.
   const result = checkInternalRefs({ ...CLEAN, prBody: `**Steps to reproduce**\n\n${PR85_REPRO}` });
   assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
-  const joined = result.failures.join('\n');
+  const joined = assertNoEcho(result, ['TASK-482']);
   assert.match(joined, /The PR description/);
-  assert.match(joined, /TASK-482/);
   // The failure has to name the fix. An author who reads "add TASK to the prefix
   // list" has closed this instance's hole and left the next tool's open.
   assert.match(joined, /Restate what the issue was in plain English/);
@@ -508,7 +547,7 @@ test('a commit subject is de-duplicated like every other surface', () => {
     commits: [{ commit: { message: 'fix: TASK-482 edge case' } }],
   });
   assert.equal(past.passed, false);
-  assert.match(past.failures.join('\n'), /TASK-482/);
+  assertNoEcho(past, ['TASK-482']);
   // ...and a commit that carries no configured id is still visited, which is
   // what a shared subject list has to get right.
   assert.equal(
@@ -547,8 +586,11 @@ test('a commit message body is de-duplicated like every other surface', () => {
     commits: [{ sha: 'a1b2c3d4', commit: { message: 'chore(shared): tidy\n\ncarries on from fix: TASK-482' } }],
   });
   assert.equal(past.passed, false);
-  assert.match(past.failures.join('\n'), /A commit message body/);
-  assert.match(past.failures.join('\n'), /TASK-482/);
+  const joined = assertNoEcho(past, ['TASK-482']);
+  assert.match(joined, /A commit message body/);
+  // The short sha is the locator that survives redaction: it is not the matched
+  // text, and it is what a maintainer pastes into `git show`.
+  assert.match(joined, /a1b2c3d4/);
 });
 
 test('two commits carrying the same text are one finding, not two', () => {
@@ -594,8 +636,8 @@ test('two commits carrying the same text are one finding, not two', () => {
     ],
   });
   assert.equal(oneOf.passed, false);
-  assert.match(oneOf.failures.join('\n'), /PET-9004/);
-  assert.match(oneOf.failures.join('\n'), /bbbbbbbb/);
+  const joined = assertNoEcho(oneOf, ['PET-9004']);
+  assert.match(joined, /bbbbbbbb/);
 });
 
 test('every reference position fires, and each is one an id is written into', () => {
@@ -613,7 +655,7 @@ test('every reference position fires, and each is one an id is written into', ()
   for (const [body, why] of cases) {
     const result = checkInternalRefs({ ...CLEAN, prBody: body });
     assert.equal(result.passed, false, `expected failure (${why}) for: ${body}\n${JSON.stringify(result.failures)}`);
-    assert.match(result.failures.join('\n'), /TASK-482/, `expected the id itself in the report for: ${body}`);
+    assertNoEcho(result, ['TASK-482']);
   }
 });
 
@@ -727,15 +769,19 @@ test('the branch surface takes the bare shape, because a branch name is the refe
   // request head on this fork, the bare separated shape flags none of them.
   const separated = checkInternalRefs({ ...CLEAN, prBranch: 'fix/TASK-482-unbound-target' });
   assert.equal(separated.passed, false);
-  assert.match(separated.failures.join('\n'), /TASK-482/);
-  assert.match(separated.failures.join('\n'), /branch name/);
+  const joined = assertNoEcho(separated, ['TASK-482']);
+  assert.match(joined, /branch name/);
 
   // ...and the cost of that choice, stated rather than hidden: a standards-named
   // branch does fail. The remedy is a rename, which costs nothing before the
   // branch is pushed and nothing after.
   const standards = checkInternalRefs({ ...CLEAN, prBranch: 'fix/UTF-8-normalization' });
   assert.equal(standards.passed, false);
-  assert.match(standards.failures.join('\n'), /UTF-8/);
+  // On this surface the branch name *is* the match, so masking it costs
+  // nothing: the gate comment is attached to the pull request, whose head
+  // branch is one click away and is the only thing a reader needs to rename.
+  const standardsJoined = assertNoEcho(standards, ['UTF-8']);
+  assert.match(standardsJoined, /branch name/);
 
   // The product's own namespace stays exempt on this surface too.
   const product = checkInternalRefs({ ...CLEAN, prBranch: 'fix/PAP-1-child-mention' });
@@ -797,8 +843,13 @@ test('NEGATIVE CONTROL: masking a quoted shape does not become a general escape 
 test('the three real leaks the quoted-shape rule was measured against all still fail', () => {
   // A narrowing that drops false positives by dropping coverage is not a fix.
   // These are the three bodies that the same replay showed to be genuine, and
-  // each is named with the rule that carries it: a Markdown link destination,
-  // and two verb positions that the masking never touched.
+  // each exercises a different rule: a Markdown link destination, and two verb
+  // positions that the masking never touched.
+  //
+  // The assertion is that each is still caught and that no finding echoes the
+  // identifier. `result.passed === false` is the coverage half; the echo check is
+  // what keeps the finding safe to post as a comment, which is the whole point
+  // of redacting it.
   const mustFail = [
     ['5320a440', 'Paperclip work item: [ZOL-5477](/ZOL/issues/ZOL-5477).'],
     ['bb6e7215', 'Closes RUS-56'],
@@ -807,7 +858,8 @@ test('the three real leaks the quoted-shape rule was measured against all still 
   for (const [sha, body] of mustFail) {
     const result = checkInternalRefs({ ...CLEAN, commits: [{ sha, commit: { message: `fix: x\n\n${body}` } }] });
     assert.equal(result.passed, false, `expected ${sha} to still fail: ${JSON.stringify(result.failures)}`);
-    assert.match(result.failures.join('\n'), /ZOL-5477|RUS-56|LAS-101/);
+    const joined = assertNoEcho(result, ['ZOL-5477', 'RUS-56', 'LAS-101']);
+    assert.match(joined, /A commit message body refers to 1 issue identifier/);
   }
 });
 
@@ -823,7 +875,8 @@ test('the fourth body, kept deliberately, and the cost of keeping it', () => {
     commits: [{ commit: { message: 'fix: x\n\nAfter onboarding the wizard navigated to the newly created issue\n(e.g. /JAR/issues/JAR-1). useCompanyPageMemory then saved this path,' } }],
   });
   assert.equal(result.passed, false);
-  assert.match(result.failures.join('\n'), /JAR-1/);
+  const joined = assertNoEcho(result, ['JAR-1']);
+  assert.match(joined, /A commit message body refers to 1 issue identifier/);
 });
 
 test('only the commit body masks: every other authored surface still reads a quoted path', () => {
@@ -840,7 +893,8 @@ test('only the commit body masks: every other authored surface still reads a quo
   for (const [surface, override] of bodies) {
     const result = checkInternalRefs({ ...CLEAN, ...override });
     assert.equal(result.passed, false, `expected the ${surface} surface to still fail`);
-    assert.match(result.failures.join('\n'), /TASK-482/);
+    const joined = assertNoEcho(result, ['TASK-482']);
+    assert.match(joined, /refers to 1 issue identifier/);
   }
 });
 
@@ -1115,9 +1169,8 @@ test('a commit body is authored text, so both halves of the rule apply to it', (
     ],
   });
   assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
-  const joined = result.failures.join('\n');
+  const joined = assertNoEcho(result, ['PET-9005']);
   assert.match(joined, /A commit message body carries/);
-  assert.match(joined, /PET-9005/);
   // The subject was clean, so the subject surface must not be blamed.
   assert.doesNotMatch(joined, /A commit subject carries/);
   // And the remedy has to be the one that fits a body.
@@ -1151,8 +1204,8 @@ test('the identifier half still reads a commit body, so narrowing the address ha
     ],
   });
   assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
-  assert.match(result.failures.join('\n'), /A commit message body carries/);
-  assert.match(result.failures.join('\n'), /PET-9001/);
+  const joined = assertNoEcho(result, ['PET-9001']);
+  assert.match(joined, /A commit message body carries/);
 });
 
 test('narrowing the commit body did not take the address coverage off the other three surfaces', () => {
@@ -1164,11 +1217,11 @@ test('narrowing the commit body did not take the address coverage off the other 
 
   const title = checkInternalRefs({ ...CLEAN, prTitle: `fix(api): ${address} returned 500` });
   assert.equal(title.passed, false, 'the PR title must still carry the address half');
-  assert.match(title.failures.join('\n'), /an address that resolves to one machine/);
+  assert.match(title.failures.join('\n'), /instance-local address/);
 
   const description = checkInternalRefs({ ...CLEAN, prBody: `Reproduce with curl ${address}.` });
   assert.equal(description.passed, false, 'the PR description must still carry the address half');
-  assert.match(description.failures.join('\n'), /an address that resolves to one machine/);
+  assert.match(description.failures.join('\n'), /instance-local address/);
 
   const subject = checkInternalRefs({
     ...CLEAN,
@@ -1176,7 +1229,7 @@ test('narrowing the commit body did not take the address coverage off the other 
   });
   assert.equal(subject.passed, false, 'a commit subject must still carry the address half');
   assert.match(subject.failures.join('\n'), /A commit subject carries/);
-  assert.match(subject.failures.join('\n'), /an address that resolves to one machine/);
+  assert.match(subject.failures.join('\n'), /instance-local address/);
 });
 
 test('a squash-merge subject is the PR title, so the string that becomes permanent history keeps the address half', () => {
@@ -1263,9 +1316,8 @@ test('an id in a pull request comment fails the gate', () => {
     comments: [{ ...CLEAN_COMMENT, body: 'Carried on from PET-9006 — see the plan in /PET/issues/PET-9006.' }],
   });
   assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
-  const joined = result.failures.join('\n');
+  const joined = assertNoEcho(result, ['PET-9006']);
   assert.match(joined, /A pull request comment carries/);
-  assert.match(joined, /PET-9006/);
 });
 
 test('an address in a comment is a leak, and a comment is not a diff line', () => {
@@ -1276,7 +1328,8 @@ test('an address in a comment is a leak, and a comment is not a diff line', () =
     comments: [{ ...CLEAN_COMMENT, body: 'Reproduced at http://localhost:3100/api/health' }],
   });
   assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
-  assert.match(result.failures.join('\n'), /A pull request comment carries `http:\/\/localhost`/);
+  const joined = assertNoEcho(result, ['http://localhost']);
+  assert.match(joined, /A pull request comment carries 1 instance-local address/);
 });
 
 test('a comment that names the loopback interface is not a leak; one that links to it is', () => {
@@ -1316,7 +1369,8 @@ test('an unconfigured namespace in a comment is reported by the open matcher', (
     comments: [{ ...CLEAN_COMMENT, body: 'Same shape as the one in /issues/TASK-482.' }],
   });
   assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
-  assert.match(result.failures.join('\n'), /A pull request comment refers to `TASK-482`/);
+  const joined = assertNoEcho(result, ['TASK-482']);
+  assert.match(joined, /A pull request comment refers to 1 issue identifier/);
 });
 
 test('prose that names a shape is still not a reference, in a comment either', () => {
@@ -1493,8 +1547,8 @@ test('an unavailable comment list still scans the surfaces it can read', () => {
     commentsUnavailable: true,
   });
   assert.equal(result.passed, false);
-  const joined = result.failures.join('\n');
-  assert.match(joined, /The PR title carries `PET-9006`/);
+  const joined = assertNoEcho(result, ['PET-9006']);
+  assert.match(joined, /The PR title carries 1 internal issue identifier/);
   assert.match(joined, /comment list could not be read/);
 });
 
@@ -1582,21 +1636,25 @@ test('an unavailable commit list still scans the surfaces it can read', () => {
     commitsUnavailable: true,
   });
   assert.equal(result.passed, false);
-  const joined = result.failures.join('\n');
-  assert.match(joined, /The PR title carries `PET-9005`/);
+  const joined = assertNoEcho(result, ['PET-9005']);
+  assert.match(joined, /The PR title carries 1 internal issue identifier/);
   assert.match(joined, /commit list could not be read/);
 });
 
-test('the address rule reports the address, and one finding once per surface', () => {
+test('the address rule reports how many addresses, and one finding once per surface', () => {
   const result = checkInternalRefs({
     ...CLEAN,
     prBody: 'Try http://localhost:3101 then http://localhost:3101 again, or 10.0.0.1:5432.',
   });
   assert.equal(result.passed, false);
-  const joined = result.failures.join('\n');
-  assert.match(joined, /10\.0\.0\.1:5432/);
+  // The address half was the same amplification loop as the identifier half: an
+  // `http://localhost` in the remediation is a comment carrying the address, so
+  // the count replaces the enumeration here too. Two distinct addresses, not one
+  // finding per occurrence.
+  const joined = assertNoEcho(result, ['http://localhost', '10.0.0.1:5432']);
+  assert.match(joined, /carries 2 instance-local addresses/);
   assert.match(joined, /scheme:\/\/<host>:<port>/);
-  assert.equal(result.failures.filter((f) => f.includes('an address that resolves to one machine')).length, 1);
+  assert.equal(result.failures.filter((f) => f.includes('addresses that resolve to one machine')).length, 1);
 });
 
 test('findInstanceHosts is the whole rule, and it explains its own boundaries', () => {
@@ -1658,3 +1716,228 @@ test('a declared identifier may not be a number the instance could have issued',
       + 'Pick a synthetic number above the floor instead.',
   );
 });
+
+test('PROPERTY: no finding on any surface may contain the text it matched', () => {
+  // The invariant, over every surface at once rather than as a case per rule.
+  //
+  // The suite above already checks that each rule fires. What it did not check
+  // — for three release cycles — is that the finding is safe to post, and the
+  // two are different properties. A finding that quotes its own match is a new
+  // comment carrying the reference, so the next gate run finds it and posts
+  // again: the comment surface is scanned *and written*, which makes the gate
+  // its own worst finding and pins the gate red on any pull request it has ever
+  // fired on. Measured on pull request 131 across four runs, the matched-string
+  // count went 3, 4, 6, 8 while an author cleaning their own comments never
+  // moved it.
+  //
+  // One case per surface is not enough on its own, because a leak is a property
+  // of a *reporting site*, and a new site appears whenever a report starts
+  // interpolating something — the branch-name surface quotes the branch name,
+  // which is not an identifier and so is invisible to a per-rule eyeball. So:
+  // one payload per surface, each carrying a distinct declared synthetic id, and
+  // every finding string checked against every id.
+  const surfaces = [
+    ['the PR title', { prTitle: 'fix(issues): a blocker edge (PET-9000)' }, ['PET-9000']],
+    ['the PR description', { prBody: 'Carries on from PET-9001 step 2.' }, ['PET-9001']],
+    ['the branch name', { prBranch: 'fix/pet9002-blocker-edge' }, ['pet9002']],
+    [
+      'a commit subject',
+      { commits: [{ sha: 'd0d0d0d0', commit: { message: 'fix(issues): a one-way door (PET-9003)' } }] },
+      ['PET-9003'],
+    ],
+    [
+      'a commit body',
+      { commits: [{ sha: 'e0e0e0e0', commit: { message: 'fix(issues): a one-way door\n\nCarried on from PET-9004.' } }] },
+      ['PET-9004'],
+    ],
+    [
+      'a pull request comment',
+      { comments: [{ ...CLEAN_COMMENT, body: 'Same shape as the one in /issues/PET-9005.' }] },
+      ['PET-9005'],
+    ],
+    [
+      'the diff',
+      {
+        files: [{
+          filename: 'server/src/__tests__/pet9006-blocker-edge.test.ts',
+          status: 'modified',
+          changes: 1,
+          patch: '@@ -1,1 +1,2 @@\n a\n+// (PET-9006 step 2), the edge this suite is about.\n',
+        }],
+      },
+      ['PET-9006', 'pet9006'],
+    ],
+  ];
+
+  for (const [name, payload, secrets] of surfaces) {
+    const result = checkInternalRefs({ ...CLEAN, ...payload });
+    assert.equal(result.passed, false, `expected a finding on ${name}`);
+    assertNoEcho(result, secrets);
+  }
+
+  // The control that keeps the property from passing vacuously: a gate that
+  // matched nothing and printed nothing satisfies "no finding contains its
+  // match" trivially. Every surface above asserted `passed === false`, and this
+  // asserts the mask is actually *in* the output, so a redaction that silently
+  // deleted the whole finding would fail here rather than pass.
+  //
+  // The comment surface is the one that proves the mask is doing work rather
+  // than that the count merely replaced an enumeration. The title finding has
+  // no locator line, so it would satisfy this control with the mask absent.
+  const masked = checkInternalRefs({
+    ...CLEAN,
+    comments: [{ ...CLEAN_COMMENT, body: 'Same shape as the one in /issues/PET-9005.' }],
+  });
+  assert.match(masked.failures.join('\n'), /███████/, 'the mask is visible in the report, so it is a mask and not a deletion');
+});
+
+test('redaction preserves length, so a preview still lines up with the comment', () => {
+  // The reason the mask is a run of same-width characters and not `[REDACTED]`:
+  // the `↳ found in` line quotes a 72-character slice of the offending comment
+  // and is the only thing that tells a maintainer where inside it the match is.
+  // A fixed-width marker shorter than the match it replaced would shift every
+  // character after the match, so the preview would stop lining up and the
+  // locator would become a lie — strictly worse than the leak for anyone
+  // actually debugging one.
+  const body = `Carried on from PET-9005 — the comment is deliberately padded past the seventy-two character preview window so the match sits early and the tail is what would shift.`;
+  const result = checkInternalRefs({ ...CLEAN, comments: [{ ...CLEAN_COMMENT, body }] });
+  assert.equal(result.passed, false, JSON.stringify(result.failures, null, 2));
+  const joined = assertNoEcho(result, ['PET-9005']);
+
+  const preview = joined.split('\n').find((f) => f.includes('found in'));
+  assert.ok(preview, `expected a locator line in:\n${joined}`);
+
+  // The quoted body slice is 72 characters, whitespace-collapsed. Redaction
+  // changes none of that: the masked preview is the same length as the slice it
+  // replaced, so the same characters sit under the same columns.
+  const quoted = body.trim().slice(0, 72).replace(/\s+/g, ' ');
+  const open = preview.indexOf(': "') + 3;
+  const shown = preview.slice(open, preview.lastIndexOf('"'));
+  assert.equal(shown.length, quoted.length, `preview drifted: ${shown.length} vs ${quoted.length}`);
+  // Same columns, not just the same count. Stated without pinning the mask
+  // glyph, because the glyph is an implementation choice and the property is
+  // not: the run that replaced the match is the *only* difference between the
+  // preview and the comment slice it quotes, and it is exactly as long as what
+  // it replaced. A fixed-width `[REDACTED]` marker fails this on both counts,
+  // which is why the mask is a run of the match's own width.
+  const at = [...quoted].findIndex((ch, i) => shown[i] !== ch);
+  assert.notEqual(at, -1, 'expected the match to be replaced, not copied through');
+  assert.equal(shown.slice(0, at), quoted.slice(0, at), 'the preview matches the slice up to the first redacted character');
+  const runEnd = [...shown].findIndex((ch, i) => i >= at && ch === quoted[i]);
+  assert.ok(runEnd > at, 'expected a redacted run, and the slice to resume after it');
+  assert.equal(
+    shown.slice(runEnd),
+    quoted.slice(runEnd),
+    'the preview must resume at the same offset, so a maintainer can line it up with the comment'
+  );
+  assert.equal(
+    shown.slice(at, runEnd).length,
+    quoted.slice(at, runEnd).length,
+    'the mask is exactly as wide as the match it replaced'
+  );
+});
+
+test('redactMatches masks nested hits, is length preserving, and is total', () => {
+  // The three properties the report layer depends on, tested directly rather
+  // than only through a finding, because a report-level test cannot reach a
+  // branch that only fires for an unconfigured prefix or for a nested hit.
+  const out = redactMatches('seen TASK-1 and TASK-12 and http://localhost:3101', [
+    'TASK-1',
+    'TASK-12',
+    'http://localhost',
+    '',
+    null,
+  ]);
+  assert.equal(out.includes('TASK-1'), false, 'the short hit is masked');
+  assert.equal(out.includes('TASK-12'), false, 'the long hit is masked');
+  assert.equal(out.includes('http://localhost'), false, 'the address is masked');
+  // Longest first, so masking the short hit does not leave a stray `2` behind.
+  assert.equal(out.includes('2 and'), false, 'no character of a nested hit survives: ' + JSON.stringify(out));
+  assert.equal(out.length, 'seen TASK-1 and TASK-12 and http://localhost:3101'.length, 'length is preserved');
+
+  // Total, because it runs over whatever a fetch returned and `undefined` must
+  // not turn a finding into a thrown gate.
+  assert.equal(redactMatches(undefined, ['TASK-1']), undefined);
+  assert.equal(redactMatches('', ['TASK-1']), '');
+  assert.equal(redactMatches('nothing matched', []), 'nothing matched');
+  assert.equal(redactMatches('nothing matched', undefined), 'nothing matched');
+});
+
+/**
+ * The comment URLs a report blames, in order, taken from the `↳ found in` lines.
+ *
+ * The offender count is the number the loop moved, and the report is the only
+ * place it is observable — the gate returns prose, not a structured offender
+ * list. One line per blamed comment, so a report that blamed two comments on
+ * one surface is counted twice and cannot quietly pass as one.
+ */
+function reportLocators(failures) {
+  return failures
+    .filter((f) => f.includes('found in'))
+    .map((f) => (f.match(/\((https?:\/\/[^)]+)\)/) ?? [])[1] ?? f.trim());
+}
+
+test('CONVERGES: posting the finding does not create a new finding', () => {
+  // The loop, closed and asserted as arithmetic rather than as a shape.
+  //
+  // This gate reads pull request comments and writes its findings onto pull
+  // request comments. While the finding quoted what it matched, the remediation
+  // was itself a comment carrying the reference, so each run added an offender
+  // and removed none: the offender set grew 3, 4, 6, 8 across four measured
+  // runs on pull request 131, and the gate could never return to green. This
+  // simulates the whole cycle — run the gate, post what it said, run it again —
+  // and asserts the count is a fixed point rather than a fixed number.
+  const author = { kind: 'issue comment', user: { login: 'an-author' }, html_url: 'https://github.com/o/r/pull/1#issuecomment-1' };
+  const comments = [{ ...author, body: 'Same shape as the one in /issues/PET-9005.' }];
+  const runOnce = (list) => checkInternalRefs({ ...CLEAN, comments: list }).failures;
+
+  const first = runOnce(comments);
+  // The control: the seeded comment really is a finding, so an empty second run
+  // is convergence and not a gate that stopped looking. Asserted as a non-empty
+  // report rather than as one naming the identifier — the report not naming it
+  // is the whole change, and the assertion below depends on this one holding.
+  assert.ok(first.length > 0, 'the control: the seeded comment is a real finding');
+  assertNoEcho({ passed: false, failures: first }, ['PET-9005']);
+
+  // Post the report the way the *fallback* path does, which is the one that
+  // actually loops on this fork: `COMMITPERCLIP_KEY` is absent here, so the
+  // workflow runs under `GITHUB_TOKEN`, the comment is attributed to
+  // `github-actions[bot]`, and `isGateComment` does not recognise it. So the
+  // report is scanned as an ordinary comment — which is why masking it is the
+  // fix and the self-exemption is not. Modelled with no gate signature and a
+  // login outside `GATE_COMMENT_LOGINS`, so the test would pass only if the
+  // report is genuinely clean.
+  const fallback = (body, i) => ({
+    kind: 'issue comment',
+    user: { login: 'github-actions[bot]' },
+    html_url: `https://github.com/o/r/pull/1#issuecomment-${100 + i}`,
+    body,
+  });
+
+  // Run the gate, post what it said, run it again.
+  //
+  // The seeded comment stays in the thread, so the honest property is not "the
+  // gate goes quiet" — it is that the offender count is a *fixed point*. One
+  // hand-written offender remains one hand-written offender however many times
+  // the gate runs, and no remediation comment ever joins it. That is the whole
+  // difference: the measured failure grew 3, 4, 6, 8 across four runs.
+  const offendersOf = (list) => reportLocators(runOnce(list));
+
+  let previous = offendersOf([...comments]);
+  assert.deepEqual(
+    previous,
+    [author.html_url],
+    'the control: exactly the seeded comment is an offender, once'
+  );
+
+  for (let i = 1; i <= 4; i++) {
+    const posted = first.map((body, k) => fallback(body, i * 10 + k));
+    const now = offendersOf([...comments, ...posted]);
+    assert.deepEqual(
+      now,
+      previous,
+      `run ${i + 1} changed the offender set, so posting the report re-armed the gate:\n${now.join(', ')}`
+    );
+  }
+});
+

@@ -1039,6 +1039,61 @@ export function patchIsComplete(patch) {
 }
 
 /**
+ * The one character a match is replaced with in anything this gate prints.
+ *
+ * U+2588 is a single UTF-16 code unit, which is what makes a mask of
+ * `REDACTION_CHAR.repeat(n)` the same length as the `n`-character hit it
+ * replaces. Every offset, every column and every "the preview is 72 characters
+ * wide" claim in the report survives redaction. A fixed-width marker like
+ * `[REDACTED]` would have been shorter than the text it replaced and silently
+ * shifted every offset after the match, which is the whole reason the finding
+ * quotes a preview at all.
+ */
+const REDACTION_CHAR = '█';
+
+/**
+ * Replace every occurrence of every matched string with an equal-length mask.
+ *
+ * This gate scans pull request comments — a surface it then writes findings
+ * onto. When the finding text reproduced the match, the remediation comment was
+ * itself a comment carrying the reference, so the next run found it and posted
+ * again: a self-amplifying loop that pins the gate red on any pull request it
+ * has ever fired on, and trains reviewers to expect a false positive here.
+ * Measured on pull request 131 during one review: 3, then 4, then 6, then 8
+ * matched strings across four runs, with every increment coming from a
+ * remediation comment and none from an author edit.
+ *
+ * The mask is applied to the whole assembled finding rather than to each
+ * interpolations site, so a leak is closed wherever it arises: the `↳ found in`
+ * preview, a surface label that quotes its own text (the branch-name finding
+ * interpolates the branch), and any remedy text added later. A per-site fix
+ * closes the three sites known today and leaves the fourth open.
+ *
+ * Longest hit first, because hits can nest — `TASK-1` is a prefix of `TASK-12`
+ * — and masking the short one first would leave a stray digit where the long one
+ * used to be. The example is spelled in a prefix the fixture floor below does
+ * not scan, for the same reason every other fixture in this file is: a literal
+ * in this instance's own namespace is a real coordinate the moment somebody
+ * copies it, and this file is deliberately exempt from the gate that would
+ * catch that.
+ *
+ * @param {string} text  the assembled finding
+ * @param {Iterable<string>} hits  every string this finding matched
+ * @returns {string} `text` with each match masked, same length
+ */
+export function redactMatches(text, hits) {
+  if (typeof text !== 'string' || text === '') return text;
+  const ordered = [...new Set(hits)]
+    .filter((h) => typeof h === 'string' && h.length > 0)
+    .sort((a, b) => b.length - a.length);
+  let out = text;
+  for (const hit of ordered) {
+    out = out.split(hit).join(REDACTION_CHAR.repeat(hit.length));
+  }
+  return out;
+}
+
+/**
  * @param {object} input
  * @param {string} input.prTitle
  * @param {string} input.prBody
@@ -1074,6 +1129,32 @@ export function checkInternalRefs({
   const prefixLabel = resolved.map((p) => `${p}-<number>`).join(', ');
   const failures = [];
 
+  /**
+   * The only way this gate is allowed to put a finding into `failures`.
+   *
+   * Every rule below reports through this, so the "a finding never prints what
+   * it matched" property is enforced once instead of at each call site — see
+   * `redactMatches` for why the loop that makes this necessary is not a style
+   * problem. The findings pushed directly (unscannable surfaces, the comment
+   * cap, the prefix-config error) are not routed here: they are not matches
+   * and there is nothing of theirs to redact.
+   */
+  const finding = (text, hits) => {
+    failures.push(redactMatches(text, hits));
+  };
+
+  /**
+   * How many distinct strings a finding matched, phrased without naming any of
+   * them. This replaces an enumeration of the matched strings: the count is
+   * what the author acts on, and the shape is recoverable from
+   * `prefixLabel`, which is genericised to `PET-<number>` at the point it is
+   * built.
+   */
+  const countOf = (hits) => {
+    const n = new Set(hits).size;
+    return `${n} internal issue identifier${n === 1 ? '' : 's'}`;
+  };
+
   // A surface the run could not read is not a surface that is clean. The
   // commit list is fetched separately from the pull payload and is allowed to
   // fail, so an empty list is ambiguous: it means either "this pull request
@@ -1093,16 +1174,17 @@ export function checkInternalRefs({
   }
 
   const report = (surface, location, hits, extra = '') => {
-    const listed = [...new Set(hits)].slice(0, 8).map((h) => `\`${h}\``).join(', ');
-    failures.push(
-      `${surface} carries ${listed}${hits.length > 8 ? ` (and ${hits.length - 8} more)` : ''} — ` +
-      `internal issue identifier${hits.length > 1 ? 's' : ''} from this instance's namespace. ` +
-      `CONTRIBUTING.md ("No Internal Issue References") bans \`{PREFIX}-{NUMBER}\` that is not a public GitHub issue number, ` +
-      `because a reviewer on github.com cannot open it. Restate the context in plain English instead.` +
-      (extra ? ` ${extra}` : '')
+    finding(
+      `${surface} carries ${countOf(hits)}` +
+      `${prefixLabel ? ` (prefixes: ${prefixLabel})` : ''} — ` +
+      'internal issue identifiers from this instance\'s namespace. ' +
+      'CONTRIBUTING.md ("No Internal Issue References") bans \`{PREFIX}-{NUMBER}\` that is not a public GitHub issue number, ' +
+      'because a reviewer on github.com cannot open it. Restate the context in plain English instead.' +
+      (extra ? ` ${extra}` : ''),
+      hits
     );
     if (location) {
-      failures.push(`  ↳ found in ${location}`);
+      finding(`  ↳ found in ${location}`, hits);
     }
   };
 
@@ -1118,17 +1200,18 @@ export function checkInternalRefs({
   const hostReport = (surface, location, text, extra = '') => {
     const hits = findInstanceHosts(text);
     if (hits.length === 0) return;
-    const listed = [...hits].slice(0, 8).map((h) => `\`${h}\``).join(', ');
-    failures.push(
-      `${surface} carries ${listed}${hits.length > 8 ? ` (and ${hits.length - 8} more)` : ''} — ` +
-      'an address that resolves to one machine, not to a repository. ' +
+    const n = new Set(hits).size;
+    finding(
+      `${surface} carries ${n} instance-local address${n === 1 ? '' : 'es'} — ` +
+      'addresses that resolve to one machine, not to a repository. ' +
       'CONTRIBUTING.md ("No Internal Issue References") bans `localhost`, private-IP and tailnet URLs ' +
       'pointing at your own instance, because a reviewer on github.com has no route to them. ' +
       'Write the endpoint as a shape — `scheme://<host>:<port>` — and say what it is, not where it happened to run.' +
-      (extra ? ` ${extra}` : '')
+      (extra ? ` ${extra}` : ''),
+      hits
     );
     if (location) {
-      failures.push(`  ↳ found in ${location}`);
+      finding(`  ↳ found in ${location}`, hits);
     }
   };
 
@@ -1146,17 +1229,17 @@ export function checkInternalRefs({
   const unknownReport = (surface, location, text, owned, alreadyFound, extra = '', options = {}) => {
     const hits = findUnknownInternalRefs(text, owned, alreadyFound, options);
     if (hits.length === 0) return;
-    const listed = [...hits].slice(0, 8).map((h) => `\`${h}\``).join(', ');
-    failures.push(
-      `${surface} refers to ${listed}${hits.length > 8 ? ` (and ${hits.length - 8} more)` : ''} — ` +
-      'an issue identifier in a namespace this repository has no exemption for. ' +
+    const n = new Set(hits).size;
+    finding(
+      `${surface} refers to ${n} issue identifier${n === 1 ? '' : 's'} in a namespace this repository has no exemption for. ` +
       'CONTRIBUTING.md ("No Internal Issue References") bans `{PREFIX}-{NUMBER}` that is not a public GitHub ' +
       'issue number, because a reviewer on github.com cannot open it. Restate what the issue was in plain ' +
       'English and delete the reference.' +
-      (extra ? ` ${extra}` : '')
+      (extra ? ` ${extra}` : ''),
+      hits
     );
     if (location) {
-      failures.push(`  ↳ found in ${location}`);
+      finding(`  ↳ found in ${location}`, hits);
     }
   };
 
