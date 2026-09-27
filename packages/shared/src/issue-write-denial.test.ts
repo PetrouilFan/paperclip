@@ -168,12 +168,50 @@ describe("describeIssueWriteDenial", () => {
     }
   });
 
-  it("treats a terminal run's stale binding as a source problem, not a missing run", () => {
+  it("does not tell a finished run to check out, which it can never use", () => {
+    // `terminal_status` means the run's checkout stamp is on the issue and is
+    // deliberately not honoured. "Check one out and the write counts against
+    // the cap" is advice that cannot work, and "bound to none" is false — the
+    // stale binding is the very thing being refused.
     const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
       runContextReason: "terminal_status",
     });
-    expect(copy.sanctionedPath).toContain("checkout");
+    expect(copy.title).toContain("already finished");
+    expect(copy.sanctionedPath).toContain("next heartbeat run");
+    expect(copy.sanctionedPath).not.toContain("POST /api/issues");
     expect(copy.sanctionedPath).not.toContain("with your current run");
+    // The header advice is still wrong for a finished run, for the same reason.
+    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id` header with your current run");
+  });
+
+  it("does not name a checkout that a live holder would refuse with a 409", () => {
+    // The assignee flag misses this case: the actor *is* the assignee, and
+    // another run still holds the binding. Checkout is just as much a 409 here,
+    // and the copy has to say so before the agent spends the attempt.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "no_context_source_and_target_unbound",
+      targetHeldByAnotherRun: true,
+    });
+    expect(copy.title).toContain("Another run is holding this task");
+    expect(copy.sanctionedPath).toContain("409");
+    expect(copy.sanctionedPath).toContain("later heartbeat");
+    // Still the two routes that work, and still not a resend of the run header.
+    expect(copy.sanctionedPath).toContain("child issue");
+    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id` header with your current run");
+  });
+
+  it("keeps a live holder from displacing the other-actor branch", () => {
+    // Precedence, stated so a future reorder is caught. The two labels describe
+    // different dead ends and both are followable advice, but ownership is the
+    // one that decides: if the ticket is not the actor's, reassignment and a
+    // child issue are the routes, and a live holder does not change that.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextReason: "no_context_source_and_target_unbound",
+      targetHeldByAnotherRun: true,
+      targetAssignedToOtherActor: true,
+    });
+    expect(copy.title).toContain("someone else holds");
+    expect(copy.sanctionedPath).toContain("reassignment");
   });
 
   it("tells a spoof attempt that the write itself was fine", () => {

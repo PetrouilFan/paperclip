@@ -27,6 +27,12 @@ function counterDb(
    * read uses to name the holder in the 403 copy.
    */
   assigneeNameByIssueId: Record<string, string | null> = {},
+  /**
+   * The `checkout_run_id` left on each issue by some *other* run, so the
+   * target-assignee read can report that a checkout now is a 409. Absent ids
+   * resolve to `null`, which is the ordinary unbound case.
+   */
+  targetCheckoutRunIdByIssueId: Record<string, string | null> = {},
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -64,6 +70,8 @@ function counterDb(
               id,
               assigneeAgentId,
               assigneeName: assigneeNameByIssueId[id] ?? null,
+              checkoutRunId: targetCheckoutRunIdByIssueId[id] ?? null,
+              executionRunId: null,
             }));
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve(rows),
@@ -474,6 +482,45 @@ describe("cross-issue influence: the target's own assignee is not cross-issue in
         reason: "no_context_source_and_target_unbound",
       },
     });
+  });
+
+  it("tells the copy when a live run holds the target, so checkout is not offered", async () => {
+    // The assignee exemption above covers the actor's own ticket, so a refusal
+    // here means the target is not the actor's to bind. The case that leaves
+    // checkout unfollowable is an unassigned target a *live* run still holds:
+    // nobody owns it, and `POST /api/issues/<id>/checkout` is a 409 for anyone
+    // but the holder. The guard already has the target's row in hand here, so
+    // it reports the fact instead of leaving the copy to guess.
+    const fake = counterDb(0, contextless, [], { [TARGET]: null }, null, {}, {
+      [TARGET]: "99999999-9999-4999-8999-999999999999",
+    });
+
+    const err = await observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" })
+      .then(() => null, (e: unknown) => e as { details: Record<string, unknown> });
+    expect(err).toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_run_context_required", reason: "no_context_source_and_target_unbound" },
+    });
+    // The refusal names the real obstacle and the two routes that work. A copy
+    // that offered checkout here is the report: one correct refusal turned into
+    // a 409.
+    expect(String(err?.details.sanctionedPath)).toContain("409");
+    expect(String(err?.details.sanctionedPath)).not.toContain("POST /api/issues");
+  });
+
+  it("still offers checkout on an ordinary unbound target", async () => {
+    // The negative case, so the flag cannot become a standing assumption that
+    // makes every refusal claim a live run is holding the issue. An unassigned,
+    // unheld target is genuinely checkout-able, and must keep saying so.
+    const fake = counterDb(0, contextless, [], { [TARGET]: null });
+
+    const err = await observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" })
+      .then(() => null, (e: unknown) => e as { details: Record<string, unknown> });
+    expect(err).toMatchObject({
+      status: 403,
+      details: { reason: "no_context_source_and_target_unbound" },
+    });
+    expect(String(err?.details.sanctionedPath)).toContain("POST /api/issues");
   });
 
   it("keeps the cap authoritative once the run does have a source", async () => {
