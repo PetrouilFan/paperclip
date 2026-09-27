@@ -1526,11 +1526,12 @@ function buildIssueBlockerDiagnosticsResponse(input: {
     input.readiness.pendingFinalizeBlockerIssueIds,
   );
 
-  // The aggregate counts every hold the server enforces; the list above
+  // The walk counts every hold it can see in the tree; the list above
   // projects first-class dependency edges only. The difference is the number of
   // holds a reader would otherwise be told do not exist. Clamped at zero
-  // because the two are computed by different walks and the aggregate is the
-  // one that has seen a hold this projection cannot name — never the other way.
+  // because the two are computed by different walks and the walk is the one
+  // that has seen a hold this projection cannot name — never the other way.
+  // Neither walk is a gate; see the readiness comment below.
   const unprojectedHoldCount = input.attention
     ? Math.max(
         0,
@@ -1582,11 +1583,21 @@ function buildIssueBlockerDiagnosticsResponse(input: {
   );
 
   // An unprojected hold makes the readiness answer partial, exactly as a
-  // truncated set or an authorization boundary does. Reporting
-  // `isDependencyReady: true` here is the specific defect: the write path
-  // refuses the move on the strength of a hold this object says does not
-  // exist, so the route is telling a reader to attempt something the server
-  // will reject.
+  // truncated set or an authorization boundary does: with a hold the
+  // projection cannot name, this route cannot claim the visible edges are the
+  // whole story, so it withholds rather than answers a different question.
+  //
+  // The hold is an attention walk's finding, not a gate. Nothing in the write
+  // path reads it — both blocker gates call
+  // `listIssueDependencyReadinessMap`, whose only edge query is
+  // `eq(issueRelations.type, "blocks")` (services/issues.ts:2610), and the one
+  // tree hold that does gate a write, the operator pause hold
+  // (`getActivePauseHoldGate`, services/issues.ts:11409), gates checkout only.
+  // A tree-held issue with no dependency edge transitions to `in_progress` with
+  // HTTP 200. So this is not a case of the route telling a reader to attempt
+  // something the server rejects; it is a case of the route declining to
+  // present an edge-only answer as a complete one, and the finding it withholds
+  // is a different fact from the transition answer.
   const readiness: IssueBlockerDiagnosticsReadiness | null =
     completeVisibleSet && !hasUnprojectedHold
       ? {
