@@ -7569,12 +7569,21 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Create an issue thread interaction",
   description:
-    "Resolver policy defaults to canonical `anyone` for every interaction kind. `not_creator` and `human_only` are opt-in restrictions; deprecated `board_or_agents` and `board_only` inputs are accepted as compatibility aliases.",
+    "Resolver policy defaults to canonical `anyone` for every interaction kind. `not_creator` and `human_only` are opt-in restrictions; deprecated `board_or_agents` and `board_only` inputs are accepted as compatibility aliases. " +
+    "The write field is `resolverPolicy`, at the top level of the body alongside `kind`; the resulting row then reports it as `requestedResolverPolicy` and `effectiveResolverPolicy`. " +
+    "`requestedResolverPolicy` and `effectiveResolverPolicy` are response-only names, so sending either in a create body is a 400 that names the field rather than a silently dropped key: a caller that asked for `human_only` and got a 201 with `anyone` back would have a decision addressed to the board answered by whichever agent raised it. " +
+    "Success is 201 with the created interaction.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(createIssueThreadInteractionSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: {
+    201: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({
