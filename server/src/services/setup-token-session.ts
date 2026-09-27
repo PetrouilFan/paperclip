@@ -335,7 +335,18 @@ export async function reapSetupTokenLeases(
   let failed = 0;
   for (const record of records) {
     try {
-      await deps.leases.releaseById(record.leaseId);
+      // A record with no lease id has no lease to release. `toCleanupRecord`
+      // maps a null `provider_lease_id` onto "", so a session that never
+      // acquired a lease reaches the sweeper with a blank id. Releasing it
+      // anyway is a hard error, not a retryable one: the lease store looks the
+      // id up in a uuid-keyed table, so an empty id raises a database cast
+      // error on every sweep. Because the release gates the removal below, that
+      // permanent error pinned the terminal row in the reap set and the
+      // scheduler re-reported it forever. A record with nothing to release goes
+      // straight to the row removal, which is the only work it needs.
+      if (record.leaseId.trim()) {
+        await deps.leases.releaseById(record.leaseId);
+      }
       await deps.store.remove({
         sessionId: record.sessionId,
         companyId: record.companyId,
@@ -343,12 +354,34 @@ export async function reapSetupTokenLeases(
         adapterType: record.adapterType,
       });
       released += 1;
-    } catch {
+    } catch (error) {
       failed += 1;
-      log("[paperclip] Setup-token reaper: a lease release failed; it stays retryable.");
+      // Name the record and the failure. The bare catch made a permanently
+      // failing sweep undiagnosable from the log, which is what left a stuck
+      // pair of leases unreported for a full journal window. The line carries
+      // only non-secret identifiers and the error message; the record holds no
+      // URL, code, or token.
+      log(
+        `[paperclip] Setup-token reaper: a lease release failed; it stays retryable. ` +
+          `session=${record.sessionId} lease=${record.leaseId || "<none>"} ` +
+          `state=${record.state} reason=${describeReapError(error)}`,
+      );
     }
   }
   return { released, failed };
+}
+
+/**
+ * Renders a caught reap error as a short, non-secret reason. An error with a
+ * message reports that message; anything else reports its constructor name, so
+ * a non-Error throw still leaves a trace in the log.
+ */
+function describeReapError(error: unknown): string {
+  if (error instanceof Error) {
+    const message = error.message.replace(/\s+/g, " ").trim();
+    return message ? `${error.name}: ${message}` : error.name;
+  }
+  return typeof error;
 }
 
 /** A per-key start rate limiter. It matches the invite-rate-limit shape. */
