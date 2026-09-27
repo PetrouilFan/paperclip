@@ -385,6 +385,127 @@ test('an id the configured list already caught is not reported twice', () => {
   assert.match(result.failures.join('\n'), /internal issue identifier/);
 });
 
+test('a commit subject is de-duplicated like every other surface', () => {
+  // The same collision, on the surface most likely to produce it. `fix:` is a
+  // reference verb, and a conventional-commit subject is the form an author
+  // writes without thinking — so this is where the two tiers meet most often.
+  // Before the handoff this reported twice, and the second paragraph claimed a
+  // namespace the repository has an exemption for was one it has none for.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ commit: { message: 'fix: PET-9003 edge case' } }],
+  });
+  assert.equal(result.passed, false);
+  assert.equal(
+    result.failures.filter((f) => f.includes('A commit subject')).length,
+    1,
+    `one id is one finding on every surface, including this one:\n${result.failures.join('\n')}`,
+  );
+  assert.match(result.failures.join('\n'), /internal issue identifier/);
+  // The false second copy is the specific thing worth asserting: it named the
+  // configured prefix as unconfigured.
+  assert.doesNotMatch(
+    result.failures.join('\n'),
+    /namespace this repository has no exemption/,
+    `a configured prefix must never be reported as unconfigured:\n${result.failures.join('\n')}`,
+  );
+  // An id past the configured list is still reported on this surface — the
+  // handoff de-duplicates, it does not mute the surface.
+  const past = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ commit: { message: 'fix: TASK-482 edge case' } }],
+  });
+  assert.equal(past.passed, false);
+  assert.match(past.failures.join('\n'), /TASK-482/);
+  // ...and a commit that carries no configured id is still visited, which is
+  // what a shared subject list has to get right.
+  assert.equal(
+    checkInternalRefs({ ...CLEAN, commits: [{ commit: { message: 'fix: TASK-482 edge' } }] }).failures
+      .filter((f) => f.includes('A commit subject')).length,
+    1,
+  );
+});
+
+test('a commit message body is de-duplicated like every other surface', () => {
+  // The subject/author that split the body off to give it its own remedy also
+  // left it handing the open tier an empty `alreadyFound`, so the same
+  // collision that was fixed on the subject was still live one line below it.
+  // A body is authored text on exactly the terms a subject is, so `fix:` — both
+  // a conventional-commit type and a reference verb — reaches both matchers here
+  // too, and the second paragraph is the same false one.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ sha: 'a1b2c3d4', commit: { message: 'chore(shared): tidy\n\ncarries on from fix: PET-9003' } }],
+  });
+  assert.equal(result.passed, false);
+  assert.equal(
+    result.failures.filter((f) => f.includes('A commit message body')).length,
+    1,
+    `one id is one finding on every surface, the body included:\n${result.failures.join('\n')}`,
+  );
+  assert.doesNotMatch(
+    result.failures.join('\n'),
+    /namespace this repository has no exemption/,
+    `a configured prefix must never be reported as unconfigured:\n${result.failures.join('\n')}`,
+  );
+  // The handoff subtracts; it does not mute the surface. An id past the
+  // configured list is still reported from a body.
+  const past = checkInternalRefs({
+    ...CLEAN,
+    commits: [{ sha: 'a1b2c3d4', commit: { message: 'chore(shared): tidy\n\ncarries on from fix: TASK-482' } }],
+  });
+  assert.equal(past.passed, false);
+  assert.match(past.failures.join('\n'), /A commit message body/);
+  assert.match(past.failures.join('\n'), /TASK-482/);
+});
+
+test('two commits carrying the same text are one finding, not two', () => {
+  // The subject list is keyed by the subject text, so a rebase that replays
+  // `fix: <same subject>` across a series — the common shape for a fix-up
+  // series, not an exotic one — does not produce one paragraph per commit. The
+  // same holds for the body. Before the key was the text, each commit in the
+  // series reported separately and the author was told the same thing N times.
+  const shared = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'aaaaaaaa', commit: { message: 'fix: PET-9003 edge case' } },
+      { sha: 'bbbbbbbb', commit: { message: 'fix: PET-9003 edge case' } },
+      { sha: 'cccccccc', commit: { message: 'fix: PET-9003 edge case' } },
+    ],
+  });
+  assert.equal(shared.passed, false);
+  assert.equal(
+    shared.failures.filter((f) => f.includes('A commit subject')).length,
+    1,
+    `a repeated subject is one finding:\n${shared.failures.join('\n')}`,
+  );
+  const sharedBody = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'aaaaaaaa', commit: { message: 'chore: tidy\n\ncarries on from PET-9003' } },
+      { sha: 'bbbbbbbb', commit: { message: 'chore: tidy\n\ncarries on from PET-9003' } },
+    ],
+  });
+  assert.equal(sharedBody.passed, false);
+  assert.equal(
+    sharedBody.failures.filter((f) => f.includes('A commit message body')).length,
+    1,
+    `a repeated body is one finding:\n${sharedBody.failures.join('\n')}`,
+  );
+  // Collapsing is not muting: an id that appears on only one of the two
+  // commits is still found, and it is still attributed to that commit.
+  const oneOf = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'aaaaaaaa', commit: { message: 'chore: tidy\n\nnothing here' } },
+      { sha: 'bbbbbbbb', commit: { message: 'chore: tidy\n\ncarries on from PET-9004' } },
+    ],
+  });
+  assert.equal(oneOf.passed, false);
+  assert.match(oneOf.failures.join('\n'), /PET-9004/);
+  assert.match(oneOf.failures.join('\n'), /bbbbbbbb/);
+});
+
 test('every reference position fires, and each is one an id is written into', () => {
   const cases = [
     ['#TASK-482', 'a `#` reference'],
@@ -394,6 +515,8 @@ test('every reference position fires, and each is one an id is written into', ()
     ['give agent B a task `TASK-482`', 'a reference verb, backtick-quoted'],
     ['see "TASK-482" for context', 'a reference verb, quote-wrapped'],
     ['Ref TASK-482', 'a reference verb, abbreviated'],
+    ['fix(shared): TASK-482', 'a reference verb behind a conventional-commit scope'],
+    ['fix(ui): TASK-482', 'the same, on a one-word scope'],
   ];
   for (const [body, why] of cases) {
     const result = checkInternalRefs({ ...CLEAN, prBody: body });
@@ -573,6 +696,12 @@ test('findUnknownInternalRefs states its own boundaries', () => {
   assert.deepEqual(findUnknownInternalRefs('a public ref like #123 stays'), []);
   assert.deepEqual(findUnknownInternalRefs('a heading ## Checklist'), []);
   assert.deepEqual(findUnknownInternalRefs('the route /PAP/issues/PAP-224'), []);
+  // The conventional-commit scope is a single unspaced token, so a prose aside
+  // in parentheses is not a reference position. `see TASK-482` inside it fires
+  // on `see` alone, which is the verb list doing its job, not the scope group.
+  assert.deepEqual(findUnknownInternalRefs('the fix (with TASK-482) is gone'), []);
+  assert.deepEqual(findUnknownInternalRefs('chore(shared): TASK-482'), []);
+  assert.deepEqual(findUnknownInternalRefs('bump the thing (TASK-482)'), []);
   assert.deepEqual(findUnknownInternalRefs(''), []);
   assert.deepEqual(findUnknownInternalRefs(undefined), []);
   // What the configured tier already reported is not reported again.
