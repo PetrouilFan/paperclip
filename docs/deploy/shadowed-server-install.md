@@ -127,6 +127,16 @@ The two `no` columns under "run-bound fallback" and "shutdown latch" are not an 
 
 `node scripts/check-running-build-drift.mjs` reports all three columns for a given dist, and additionally prints the retained-original files, so "present" and "durably present" are never conflated. Its exit code covers the first column only, on purpose: a hand-edited install is a fact about the plane, not a deploy finding.
 
+### The manifest only knows about fixes that were built
+
+A gap in this document's own tooling, found on `default` on 2026-09-27 and worth stating before someone reads a green line as coverage. Every sentinel in `RUNNING_BUILD_SENTINELS` describes a fix that is on the plane *somehow* — as a hand-patch, or as a released build the plane is behind. None of them described a fix that is on the plane **not at all**.
+
+The stranded-run age-out (`b97043008`) was that case. It is merged on `master`, no published channel ever carried it, and the running build therefore has no `services/never-dispatched-run.js` whatsoever. That is not an older build of the fix; it is the absence of the fix. The drift check had no predicate for it, so the report covered the fixes it knew about and said nothing about the hole, while issues waited on the sweep with no report naming it.
+
+So the sentinel manifest is not a census of what is deployed, and a green run of this check is not evidence that the plane is current. It is evidence that every fix *in the manifest* is deployed. When a merged fix is what is missing, only adding a sentinel makes the check able to say so — which is why the fix carries a sentinel rather than only a build.
+
+The practical consequence for a deploy decision: the manifest answers "would reinstalling revert what is holding the plane together", and it does not answer "is the plane current". For the second question, diff the installed dist against a build of the commit you mean to run, as in "What replaced the hand-patch" above.
+
 ```bash
 # What the server is actually running, fix by fix, plus whether a reinstall would undo it.
 node scripts/check-running-build-drift.mjs
