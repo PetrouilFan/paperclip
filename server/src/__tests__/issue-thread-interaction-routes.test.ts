@@ -757,6 +757,83 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.create).not.toHaveBeenCalled();
   });
 
+  // A policy nested in `payload` used to be stripped by zod's default object
+  // behaviour: the request came back 201 with `effectiveResolverPolicy:
+  // "anyone"`, so a decision the author routed to the board was in fact
+  // answerable by any agent, including the one that raised it.
+  it("returns 400 when a resolver or continuation policy is nested inside the payload", async () => {
+    const app = await createApp();
+    const misplaced = [
+      { resolverPolicy: "human_only" },
+      { continuationPolicy: "wake_assignee_on_accept" },
+      { resolverPolicy: "human_only", continuationPolicy: "wake_assignee_on_accept" },
+      { addresseeAgentId: ASSIGNEE_AGENT_ID },
+    ];
+
+    for (const nested of misplaced) {
+      const res = await request(app)
+        .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+        .send({
+          kind: "request_confirmation",
+          payload: { version: 1, prompt: "Proceed?", ...nested },
+        });
+
+      expect(res.status, JSON.stringify(nested)).toBe(400);
+      // The 400 must name the misplaced key, otherwise the author cannot tell
+      // which field was read and discarded.
+      for (const key of Object.keys(nested)) {
+        expect(JSON.stringify(res.body)).toContain(key);
+      }
+    }
+    // The strictness must not cost the create path its valid minimum.
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  it("still accepts a resolver and continuation policy at the top level", async () => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-top-level-policy",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee_on_accept",
+      addresseeAgentId: null,
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      createdByAgentId: null,
+      payload: { version: 1, prompt: "Proceed?" },
+      result: null,
+      createdAt: "2026-07-25T12:00:00.000Z",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        resolverPolicy: "human_only",
+        continuationPolicy: "wake_assignee_on_accept",
+        payload: { version: 1, prompt: "Proceed?" },
+      });
+
+    expect(res.status).toBe(201);
+    // create(issue, input, actor): the policy must survive the top-level route.
+    expect(mockInteractionService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      expect.objectContaining({
+        resolverPolicy: "human_only",
+        continuationPolicy: "wake_assignee_on_accept",
+      }),
+      expect.anything(),
+    );
+  });
+
   it("accepts suggested tasks and wakes created assignees plus the current assignee", async () => {
     const app = await createApp();
 

@@ -710,6 +710,49 @@ describe("openapi routes", () => {
     ).toBeUndefined();
   });
 
+  // A resolver policy nested in `payload` used to be accepted with 201 and
+  // silently discarded, so a board-only decision came back answerable by any
+  // agent. The create schemas are now strict; this pins the published
+  // consequence, because `/api/openapi.json` is the only machine-readable
+  // statement an author has of what the route accepts.
+  it("publishes the interaction create body as strict at the root and in the payload", () => {
+    const spec: any = buildOpenApiSpec();
+    const body =
+      spec.paths["/api/issues/{id}/interactions"].post.requestBody.content[
+        "application/json"
+      ].schema;
+
+    const variants = body.oneOf as Array<Record<string, any>>;
+    expect(variants.length).toBeGreaterThan(0);
+    const kinds = new Set<string>();
+    for (const variant of variants) {
+      const kind = variant.properties?.kind?.enum?.[0];
+      expect(kind, "each variant is one interaction kind").toBeTypeOf("string");
+      kinds.add(kind);
+      expect(variant.additionalProperties, `${kind} request is strict`).toBe(
+        false,
+      );
+      expect(
+        variant.properties.payload.additionalProperties,
+        `${kind} payload is strict`,
+      ).toBe(false);
+      // The policy belongs at the root. If a future edit ever moved it into the
+      // payload, this is the assertion that says so.
+      expect(variant.properties.resolverPolicy, `${kind} documents the root policy`).toBeDefined();
+      expect(
+        variant.properties.payload.properties?.resolverPolicy,
+        `${kind} payload does not document a policy`,
+      ).toBeUndefined();
+    }
+    expect([...kinds].sort()).toEqual([
+      "ask_user_questions",
+      "request_checkbox_confirmation",
+      "request_confirmation",
+      "request_item_verdicts",
+      "suggest_tasks",
+    ]);
+  });
+
   it("covers the mounted server routes exactly", () => {
     const {
       routes: actualRoutes,

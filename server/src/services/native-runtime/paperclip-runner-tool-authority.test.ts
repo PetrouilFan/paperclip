@@ -749,6 +749,125 @@ describe("PaperclipRunnerToolAuthority", () => {
     ).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
   });
 
+  // The composer in `#requestHumanInput` used to inject `prompt` into the
+  // payload of every kind. `ask_user_questions` and `suggest_tasks` have no such
+  // payload field, and zod's default object behaviour dropped the key without a
+  // word, so the stored row never carried it. Making the create payload schemas
+  // strict turned that silent strip into a `400` for those two kinds — the
+  // composer and the schema had been disagreeing, and only the strictness
+  // exposed it. This walks every kind so the next added kind cannot repeat it.
+  it("builds an accepted payload for every interaction kind", async () => {
+    const kinds = {
+      confirmation: {
+        kind: "request_confirmation",
+        declaresPrompt: true,
+        payload: {},
+      },
+      checkbox: {
+        kind: "request_checkbox_confirmation",
+        declaresPrompt: true,
+        payload: { options: [{ id: "giraffes", label: "Giraffes" }] },
+      },
+      item_verdicts: {
+        kind: "request_item_verdicts",
+        declaresPrompt: true,
+        payload: { items: [{ id: "first", label: "The first item" }] },
+      },
+      questions: {
+        kind: "ask_user_questions",
+        declaresPrompt: false,
+        payload: {
+          questions: [
+            {
+              id: "color",
+              prompt: "Choose one color",
+              selectionMode: "single",
+              options: [{ id: "amber", label: "Amber" }],
+            },
+          ],
+        },
+      },
+      suggest_tasks: {
+        kind: "suggest_tasks",
+        declaresPrompt: false,
+        payload: {
+          tasks: [{ clientKey: "a", title: "Do the thing" }],
+        },
+      },
+    } as const;
+
+    for (const [index, [interactionKind, expected]] of Object.entries(kinds).entries()) {
+      const ordinal = String(index + 1).padStart(2, "0");
+      const scopedIssueId = `00000000-0000-4000-8000-0000000003${ordinal}`;
+      const scopedRunId = `00000000-0000-4000-8000-0000000004${ordinal}`;
+      const issueNumber = 100 + index;
+      await db.insert(issues).values({
+        id: scopedIssueId,
+        companyId,
+        issueNumber,
+        identifier: `RNT-${issueNumber}`,
+        title: `Every-kind payload ${interactionKind}`,
+        status: "in_progress",
+        workMode: "standard",
+        assigneeAgentId: agentId,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: scopedRunId,
+        companyId,
+        agentId,
+        status: "running",
+        runtimeMode: "native",
+        nativeIssueId: scopedIssueId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        contextSnapshot: { issueId: scopedIssueId },
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: scopedRunId })
+        .where(eq(issues.id, scopedIssueId));
+      const authority = new PaperclipRunnerToolAuthority(db, {
+        companyId,
+        agentId,
+        issueId: scopedIssueId,
+        runId: scopedRunId,
+      });
+
+      const result = await authority.execute({
+        tool: "request_human_input",
+        callId: `every-kind-${interactionKind}`,
+        arguments: {
+          idempotencyKey: `every-kind-${interactionKind}`,
+          interactionKind,
+          title: `Every kind ${interactionKind}`,
+          prompt: "A prompt the schema may or may not accept.",
+          continuationPolicy: "wake_assignee",
+          payload: expected.payload,
+        },
+      });
+
+      expect(result, interactionKind).toMatchObject({
+        disposition: "applied",
+        interaction: { kind: expected.kind, status: "pending" },
+      });
+      // The prompt is carried by the interaction's `summary` for every kind, so
+      // dropping it from these two payloads loses nothing.
+      expect(
+        (result as { interaction: { summary: string } }).interaction.summary,
+      ).toBe("A prompt the schema may or may not accept.");
+      const stored = (
+        result as { interaction: { payload: Record<string, unknown> } }
+      ).interaction.payload;
+      if (expected.declaresPrompt) {
+        expect(stored.prompt, interactionKind).toBe(
+          "A prompt the schema may or may not accept.",
+        );
+      } else {
+        expect(stored, interactionKind).not.toHaveProperty("prompt");
+      }
+    }
+  });
+
   it("writes a real revisioned document and replays the mutation receipt", async () => {
     const authority = new PaperclipRunnerToolAuthority(db, {
       companyId,

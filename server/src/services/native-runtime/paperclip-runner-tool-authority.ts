@@ -91,6 +91,19 @@ const NATIVE_REVIEW_READ_TOOLS = new Set([
   "get_task_context", "get_task_history", "list_documents", "read_document", "list_document_revisions",
 ]);
 
+/**
+ * The interaction kinds whose payload schema declares a `prompt` field.
+ *
+ * Kept as an explicit set rather than a "try and see" so adding a kind forces a
+ * decision about whether its payload carries a prompt, instead of quietly
+ * relying on a schema to strip the field.
+ */
+const interactionKindsDeclaringPrompt = new Set([
+  "request_confirmation",
+  "request_checkbox_confirmation",
+  "request_item_verdicts",
+]);
+
 type Binding = {
   /** Server-derived scope for one addressed native completion review. */
   nativeReview?: NativeReviewAssignmentContext;
@@ -1551,6 +1564,7 @@ export class PaperclipRunnerToolAuthority {
       interactionKind as keyof typeof interactionKinds
     ];
     if (!kind) throw new Error("paperclip_runner_interaction_kind_invalid");
+    const declaresPrompt = interactionKindsDeclaringPrompt.has(kind);
     const prompt = requiredString(input.prompt);
     const idempotencyKey = requiredString(input.idempotencyKey);
     let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
@@ -1598,7 +1612,14 @@ export class PaperclipRunnerToolAuthority {
           payload: {
             ...normalizedPayload,
             version: 1,
-            prompt,
+            // `prompt` belongs to the payload of the three kinds whose payload
+            // schema declares it. `ask_user_questions` and `suggest_tasks` have
+            // no such field, and this call used to send it anyway: zod's default
+            // object behaviour dropped the key without a word, so the stored row
+            // never had it. Inject it only where the schema accepts it — the
+            // prompt is already persisted as the interaction's `summary` — and
+            // never send a field the payload will only reject.
+            ...(declaresPrompt ? { prompt } : {}),
             ...(kind === "request_confirmation" ? {
               detailsMarkdown: normalizedPayload.detailsMarkdown ?? "",
               acceptLabel: normalizedPayload.acceptLabel ?? "Confirm",
