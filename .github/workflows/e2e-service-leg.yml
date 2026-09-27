@@ -25,7 +25,7 @@ name: E2E Service Leg
 on:
   push:
     branches:
-      - pet-259-service-leg
+      - e2e-service-leg
   workflow_dispatch:
     inputs:
       e2e_ref:
@@ -46,7 +46,7 @@ env:
   # The upstream default (paperclipai/paperclip) does not carry this fork's
   # e2e scripts, so the legs have to install from the fork.
   E2E_REPO: PetrouilFan/paperclip
-  E2E_REF: ${{ inputs.e2e_ref || 'pet-259-service-leg' }}
+  E2E_REF: ${{ inputs.e2e_ref || 'e2e-service-leg' }}
   # Poll budget for step 8b. The default is 300s; the runner is slower than a
   # laptop so give it room rather than report a false 8b failure.
   E2E_SERVICE_TIMEOUT_SECS: "600"
