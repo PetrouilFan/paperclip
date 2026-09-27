@@ -15497,6 +15497,10 @@ export function issueRoutes(
           req.body.agentId,
           req.body.expectedStatuses,
           checkoutRunId,
+          // Deliberately no `inReviewResumeAuthorized`. Only a server-derived
+          // caller (the heartbeat service, for a run continuing a resolved
+          // interaction) may cross the in_review -> in_progress edge; a request
+          // body naming "in_review" in expectedStatuses cannot authorize it.
         );
       } catch (error) {
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {

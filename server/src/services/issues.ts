@@ -305,6 +305,28 @@ function assertTransition(from: string, to: string) {
   }
 }
 
+/**
+ * Machine-readable marker for the in_review checkout refusal. `code` and
+ * `remediation` are the two detail fields the shared error handler forwards
+ * for any denial, so the refusal reaches the caller without widening that
+ * allowlist — and without changing the 409 message, which the heartbeat
+ * service string-matches to recognise a checkout conflict.
+ */
+const IN_REVIEW_NOT_CLAIMABLE_CODE = "in_review_not_claimable";
+
+function inReviewNotClaimableRemediation() {
+  return (
+    `in_review is a review-path disposition -- a real reviewer, a pending ` +
+    `confirmation card, a monitor -- and a binding call may not be the thing ` +
+    `that takes the issue off it, so naming "in_review" in expectedStatuses ` +
+    `does not buy the claim. Only a run the server has cleared to continue a ` +
+    `resolved interaction crosses in_review -> in_progress. If this task is ` +
+    `genuinely being picked up for execution, PATCH the status to in_progress ` +
+    `first: that keeps the disposition change visible instead of a side effect ` +
+    `of claiming, and it leaves the pending review artifacts in place.`
+  );
+}
+
 function applyStatusSideEffects(
   status: string | undefined,
   patch: Partial<typeof issues.$inferInsert>,
@@ -11398,6 +11420,7 @@ export function issueService(db: Db) {
       agentId: string,
       expectedStatuses: string[],
       checkoutRunId: string | null,
+      options?: { inReviewResumeAuthorized?: boolean },
     ) => {
       const issueCompany = await db
         .select({ companyId: issues.companyId })
@@ -11466,6 +11489,30 @@ export function issueService(db: Db) {
         });
       }
 
+      // `in_review` is a disposition, not a work-start state, so the
+      // in_review -> in_progress edge may not be self-authorized by the
+      // caller's own `expectedStatuses` list. That list is an
+      // optimistic-concurrency predicate, and the documented agent default
+      // includes "in_review" precisely so agents can claim a parked task --
+      // which made the platform's own recovery advice for a denied cross-issue
+      // write (`POST /checkout`) silently destroy the review path it was
+      // pointing at. The edge stays reachable, but only for a caller that has
+      // authoritatively established why the review state is over: today, the
+      // heartbeat service, for a run continuing a *resolved* interaction. Any
+      // request that arrives over HTTP routes to the service with this false,
+      // because the request body cannot carry the authorization.
+      const claimableStatuses = options?.inReviewResumeAuthorized
+        ? expectedStatuses
+        : expectedStatuses.filter((status) => status !== "in_review");
+      if (claimableStatuses.length === 0) {
+        throw conflict("Issue checkout conflict", {
+          issueId: id,
+          status: "in_review",
+          code: IN_REVIEW_NOT_CLAIMABLE_CODE,
+          remediation: inReviewNotClaimableRemediation(),
+        });
+      }
+
       const sameRunAssigneeCondition = checkoutRunId
         ? and(
             eq(issues.assigneeAgentId, agentId),
@@ -11511,7 +11558,7 @@ export function issueService(db: Db) {
         .where(
           and(
             eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
+            inArray(issues.status, claimableStatuses),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
           ),
@@ -11633,7 +11680,7 @@ export function issueService(db: Db) {
             .where(
               and(
                 eq(issues.id, id),
-                inArray(issues.status, expectedStatuses),
+                inArray(issues.status, claimableStatuses),
                 eq(issues.executionRunId, current.executionRunId),
                 or(
                   isNull(issues.assigneeAgentId),
@@ -11672,6 +11719,16 @@ export function issueService(db: Db) {
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        // Name the in_review refusal explicitly. Without this the caller sees
+        // the same opaque conflict it gets for a live lock, and the natural
+        // next move -- retry, or drop in_review from the list and try again --
+        // is what turns a legible refusal into a guess.
+        ...(current.status === "in_review" && !options?.inReviewResumeAuthorized
+          ? {
+              code: IN_REVIEW_NOT_CLAIMABLE_CODE,
+              remediation: inReviewNotClaimableRemediation(),
+            }
+          : {}),
       });
     },
 

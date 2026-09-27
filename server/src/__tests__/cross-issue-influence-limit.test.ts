@@ -508,10 +508,22 @@ describe("cross-issue influence: the target's own assignee is not cross-issue in
     expect(String(err?.details.sanctionedPath)).not.toContain("POST /api/issues");
   });
 
-  it("still offers checkout on an ordinary unbound target", async () => {
-    // The negative case, so the flag cannot become a standing assumption that
-    // makes every refusal claim a live run is holding the issue. An unassigned,
-    // unheld target is genuinely checkout-able, and must keep saying so.
+  it("does not claim a live run holds an ordinary unbound target", async () => {
+    // The negative case for the live-run flag, so it cannot become a standing
+    // assumption that makes every refusal claim a live run is holding the
+    // issue. Nothing holds this target, so the copy must not tell the caller to
+    // wait for a holder that does not exist.
+    //
+    // It used to assert the opposite of what it now asserts: that an unassigned
+    // target "is genuinely checkout-able, and must keep saying so". That was
+    // correct while the 403 offered `POST /checkout` as the sanctioned path, and
+    // it is the defect this branch fixes. This 403 cannot see the target's
+    // status, so it cannot know whether claiming the target is the safe act its
+    // copy used to recommend — an unbound `in_review` issue is a reviewer or a
+    // pending card, and claiming it is a wrong state change. So the honest
+    // recovery names no state-changing call, and the branch is distinguished
+    // from the live-run case by the absence of the holder claim rather than by
+    // the presence of a checkout recommendation.
     const fake = counterDb(0, contextless, [], { [TARGET]: null });
 
     const err = await observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" })
@@ -520,7 +532,17 @@ describe("cross-issue influence: the target's own assignee is not cross-issue in
       status: 403,
       details: { reason: "no_context_source_and_target_unbound" },
     });
-    expect(String(err?.details.sanctionedPath)).toContain("POST /api/issues");
+    const sanctionedPath = String(err?.details.sanctionedPath);
+    // The live-run branch's marker: it tells the caller the target is a 409 and
+    // to come back on a later heartbeat. Neither is true here.
+    expect(sanctionedPath).not.toContain("409");
+    // And no state-changing call is named, because the status that would decide
+    // whether one is safe is exactly what this 403 cannot read.
+    expect(sanctionedPath).not.toContain("POST /api/issues");
+    // The recovery that needs no state change, and the reason it is offered
+    // rather than a claim.
+    expect(sanctionedPath).toContain("run's own output");
+    expect(sanctionedPath).toContain("in_review");
   });
 
   it("keeps the cap authoritative once the run does have a source", async () => {

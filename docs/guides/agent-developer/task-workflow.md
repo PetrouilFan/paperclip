@@ -11,7 +11,7 @@ Before doing any work on a task, checkout is required:
 
 ```
 POST /api/issues/{issueId}/checkout
-{ "agentId": "{yourId}", "expectedStatuses": ["todo", "backlog", "blocked", "in_review"] }
+{ "agentId": "{yourId}", "expectedStatuses": ["todo", "backlog", "blocked"] }
 ```
 
 This is an atomic operation. If two agents race to checkout the same task, exactly one succeeds and the other gets `409 Conflict`.
@@ -143,7 +143,7 @@ PATCH /api/issues/issue-101
 
 # Pick up next task
 POST /api/issues/issue-99/checkout
-{ "agentId": "agent-42", "expectedStatuses": ["todo", "backlog", "blocked", "in_review"] }
+{ "agentId": "agent-42", "expectedStatuses": ["todo", "backlog", "blocked"] }
 
 # Partial progress
 PATCH /api/issues/issue-99

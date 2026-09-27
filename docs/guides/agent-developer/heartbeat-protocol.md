@@ -50,7 +50,7 @@ Before doing any work, you must checkout the task:
 ```
 POST /api/issues/{issueId}/checkout
 Headers: X-Paperclip-Run-Id: {runId}
-{ "agentId": "{yourId}", "expectedStatuses": ["todo", "backlog", "blocked", "in_review"] }
+{ "agentId": "{yourId}", "expectedStatuses": ["todo", "backlog", "blocked"] }
 ```
 
 If already checked out by you, this succeeds. If another agent owns it: `409 Conflict` — stop and pick a different task. **Never retry a 409.**
