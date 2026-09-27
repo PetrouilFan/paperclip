@@ -47,13 +47,16 @@ const throwawayTitle = 'chore: add a PET-9000 sentinel so the gate has something
  */
 const DECLARED_FIXTURE_IDS = new Set([
   'PET-9000',
+  'PET9000',
   'PET-9001',
   'PET-9002',
   'PET9002',
   'PET-9003',
   'PET9003',
   'PET-9004',
+  'PET9004',
   'PET-9005',
+  'PET9005',
 ]);
 
 /**
@@ -131,6 +134,91 @@ test('an id in an added diff line fails, and a removed one does not count', () =
     }],
   });
   assert.equal(removed.passed, true, JSON.stringify(removed.failures, null, 2));
+});
+
+test('the compact form is caught on an added diff line, not only on a branch name', () => {
+  // The hole this closes: `separated` + `link` over added lines could not see a
+  // bare compact identifier, which is the shape a temp-directory prefix and a
+  // systemd unit name both arrive as.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{
+      filename: 'server/src/listening-port-owner.test.ts',
+      status: 'modified',
+      changes: 1,
+      patch: '@@ -1,1 +1,2 @@\n a\n+  const root = fsSync.mkdtempSync(path.join(os.tmpdir(), "pet9002-proc-"));\n',
+    }],
+  });
+  assert.equal(result.passed, false, 'a compact id on an added line must fail');
+  assert.match(result.failures.join('\n'), /pet9002/);
+  assert.match(result.failures.join('\n'), /listening-port-owner\.test\.ts/);
+});
+
+test('FLOOR: every leak shape the compact scan was measured against is caught', () => {
+  // Non-vacuous by construction: each line below reproduces a real added line
+  // from this repository's own history, one per shape the measurement found.
+  // The *identifiers* are synthetic stand-ins, not the live coordinates the
+  // shapes came from: SELF_EXEMPT_PATHS covers this file, so the floor above
+  // refuses any id the instance could have issued. The shape is what the
+  // matcher keys on and it is preserved exactly; the number is not load-bearing
+  // for any assertion. A refactor that quietly narrows the matcher again fails
+  // here, rather than passing because the suite never used the compact form on
+  // a diff line.
+  const shapes = [
+    ['server/src/listening-port-owner.test.ts', '+const root = mkdtempSync(join(tmpdir(), "pet9002-proc-"));'],
+    ['server/src/embedded-postgres-ownership.test.ts', '+  const dataDir = await makeTempDir("pet9002-orphan-db-");'],
+    ['cli/src/__tests__/install-store-shim-location.test.ts', '+  root = fs.mkdtempSync(path.join(os.tmpdir(), "pet9003-"));'],
+    ['scripts/e2e-install-lifecycle-isolation.test.mjs', '+  const directory = mkdtempSync(join(tmpdir(), "pet9000-template-"));'],
+    ['scripts/paperclip-unit-guardian-freeze-proof.sh', '+U2=pet9005-heal.service'],
+    ['scripts/paperclip-unit-guardian.test.mjs', '+  const dir = mkdtempSync(join(tmpdir(), "pet9005-"));'],
+    ['docs/deploy/shadowed-server-install.md', '+Eight `.pre-pet9004-20260925T171750Z` files are left behind.'],
+  ];
+  for (const [filename, added] of shapes) {
+    const result = checkInternalRefs({
+      ...CLEAN,
+      files: [{ filename, status: 'modified', changes: 1, patch: `@@ -1,1 +1,2 @@\n ctx\n${added}\n` }],
+    });
+    assert.equal(result.passed, false, `expected a failure for ${filename}: ${added}`);
+  }
+  // And the floor is a floor: the same scan set over a clean diff passes, so the
+  // test above is proving the matcher fires and not that the gate fails always.
+  const clean = checkInternalRefs({
+    ...CLEAN,
+    files: [{ filename: 'scripts/paperclip-unit-guardian.test.mjs', status: 'modified', changes: 1, patch: '@@ -1,1 +1,2 @@\n ctx\n+  const dir = mkdtempSync(join(tmpdir(), "unit-guardian-"));\n' }],
+  });
+  assert.equal(clean.passed, true, JSON.stringify(clean.failures, null, 2));
+});
+
+test('NEGATIVE CONTROL: the compact scan needs a token start and two digits', () => {
+  // The two constraints that make the measurement's zero-false-positive result
+  // a property of the matcher rather than of luck. `petrichor12` must not fire
+  // because the match has to begin the token, and `pet1` must not fire because
+  // the floor is two digits.
+  for (const line of [
+    '+const label = "petrichor12";',
+    '+const digest = "a3f9c1b2deadbeef00pet12cafe";',
+    '+const threshold = "pet1";',
+    '+const vintage = "pet99s";',
+  ]) {
+    const result = checkInternalRefs({
+      ...CLEAN,
+      files: [{ filename: 'server/src/routes/issues.ts', status: 'modified', changes: 1, patch: `@@ -1,1 +1,2 @@\n ctx\n${line}\n` }],
+    });
+    assert.equal(result.passed, true, `expected a pass for ${line}: ${JSON.stringify(result.failures, null, 2)}`);
+  }
+});
+
+test('a removed compact identifier does not count, exactly as a removed separated one does not', () => {
+  const result = checkInternalRefs({
+    ...CLEAN,
+    files: [{
+      filename: 'server/src/listening-port-owner.test.ts',
+      status: 'modified',
+      changes: 1,
+      patch: '@@ -1,2 +1,1 @@\n-  const root = mkdtempSync(join(tmpdir(), "pet9002-proc-"));\n ctx\n',
+    }],
+  });
+  assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
 });
 
 test('the canonical product\'s own namespace is left alone', () => {
