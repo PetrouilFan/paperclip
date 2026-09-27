@@ -4102,6 +4102,8 @@ registry.registerPath({
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Get an issue",
+  description:
+    "Returns three spellings of the same first-class blocker edge set, so the write name and the read name never disagree: `blockedByIssueIds` (the array PATCH accepts, returned here sorted and deduped) and `blockedBy` / `blocks` (the resolved summary rows). `blockedByIssueIds` is derived from the committed edge rows rather than echoed from the last request, so a present array is a committed blocker set and `[]` is a confirmed-empty one. The compact list view (`GET /api/companies/{companyId}/issues?view=compact`) carries the same three fields per row.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
@@ -4112,6 +4114,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
+    "`blockedByIssueIds` replaces the whole first-class blocker set rather than appending to it, so pass the complete intended set. It is deduped, refuses the issue's own id, refuses a cycle, and refuses ids outside the same company. The response reports the committed set, which can differ from the request when the write normalises the list. " +
     "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads.",
   request: {
     params: z.object({ id: z.string() }),
