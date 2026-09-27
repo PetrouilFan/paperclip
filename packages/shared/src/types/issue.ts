@@ -352,6 +352,24 @@ export interface IssueSubtreeDiagnosticNode {
   diagnosis: string | null;
   likelyReason: string | null;
   blockers: IssueBlockerDiagnosticNode[];
+  /**
+   * Whether this route consulted the per-issue blocker aggregate, which counts
+   * holds that are not first-class dependency edges. It is `false` for every
+   * node here: the aggregate is a per-issue walk and this is a bulk read over
+   * a whole subtree, so the node has no hold answer at all.
+   *
+   * This is what makes a `null` `blockerReadiness` readable. The node says
+   * the question is open here rather than answering "no hold", which is a
+   * claim the aggregate could contradict. No `unprojectedHold` key appears on
+   * the node for the same reason — on the single-issue routes
+   * `unprojectedHold: null` means the count was truncated, and absence is the
+   * only rendering a consumer can tell apart from that.
+   *
+   * `blockerReadiness` is non-null even so, when a projected dependency edge
+   * is genuinely unresolved: the server enforces that edge, so the answer is
+   * safe even though it may understate what else holds the issue.
+   */
+  blockerHoldReported: boolean;
   blockerReadiness: IssueBlockerDiagnosticsReadiness | null;
   omittedUnauthorizedBlockerCount: number | null;
   wakeEvents: IssueWakeDiagnosticEvent[];

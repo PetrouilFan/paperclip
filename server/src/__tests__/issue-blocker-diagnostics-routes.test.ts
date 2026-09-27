@@ -452,6 +452,40 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.unprojectedHold.count).toBe(0);
   });
 
+  it("consults the hold aggregate on the wakes route, so it names a tree hold instead of going silent", async () => {
+    // The audit PET-516 asked for on the wakes path. This route does pass
+    // `attention`, so it does not carry the subtree route's gap — but the
+    // withholding of `readiness` for an unprojected hold used to leave it with
+    // nothing to say, which is the same blind spot one step softer. It has the
+    // answer, so it should give it.
+    const company = await seedCompany(db, "WakesTreeHold");
+    const project = await seedProject(db, company.id, "Wakes tree hold project");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Root held by its child",
+      status: "blocked",
+    });
+    await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live child",
+      status: "in_progress",
+      parentId: root.id,
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // No wake rows are visible, so the cause has to come from the aggregate.
+    expect(res.body.wakeRequestCount).toBe(0);
+    expect(res.body.activityRecordCount).toBe(0);
+    expect(res.body.diagnosis).toContain("not first-class dependency edges");
+    // And it does not fall back to the unsupported negative.
+    expect(res.body.diagnosis).not.toContain("stale blocker hold");
+  });
+
   it("never names an unprojected hold the actor cannot see", async () => {
     // The aggregate's sample identifier has not been authorized by this route.
     // Echoing it would put a coordinate in a response that simultaneously

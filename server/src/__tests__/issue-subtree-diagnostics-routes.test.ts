@@ -403,6 +403,126 @@ describeEmbeddedPostgres("issue subtree diagnostics route", () => {
     expect(serialized).not.toContain("\"error\"");
   });
 
+  it("never reports a subtree node as ready when the hold aggregate is not consulted", async () => {
+    // The measured defect, one route over from #96. A root held by a live
+    // child, with no first-class dependency edge, came back from this bulk
+    // route as `blockerReadiness: { isDependencyReady: true }` and the sentence
+    // "is blocked but has no first-class blocker relations" — while the write
+    // path refused the move on the strength of the tree hold the aggregate
+    // counts. `blockers` is empty here precisely because the hold is not a
+    // first-class edge, so the negative sentence is the thing that makes it
+    // false, and the readiness is the thing that invites the refused write.
+    //
+    // The aggregate is deliberately not run per node — that cost call stands —
+    // so the node must report the question as open rather than answer it.
+    const company = await seedCompany(db, "SubtreeTreeHold");
+    const project = await seedProject(db, company.id, "Tree hold project");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Root held by its child",
+      status: "blocked",
+    });
+    await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Live child",
+      status: "in_progress",
+      parentId: root.id,
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/subtree`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const rootNode = res.body.nodes.find(
+      (node: { issue: { id: string } }) => node.issue.id === root.id,
+    );
+    expect(rootNode).toBeDefined();
+    expect(rootNode.blockers).toEqual([]);
+    // And it withholds the answer that invited the refused write.
+    expect(rootNode.blockerReadiness).toBeNull();
+    // The negative sentence is the case that makes it false, so it is gone.
+    expect(rootNode.diagnosis).not.toContain("no first-class blocker relations");
+    expect(rootNode.diagnosis).toContain("not a first-class dependency edge");
+    // The route says it did not ask, instead of answering "no hold".
+    expect(rootNode.blockerHoldReported).toBe(false);
+  });
+
+  it("keeps subtree readiness for a node whose projected blocker is genuinely unresolved", async () => {
+    // The negative control. Without this, "withhold readiness when the hold is
+    // unreported" would be indistinguishable from "never report readiness",
+    // and the bulk route would have thrown away the projected-edge answer it
+    // can actually give. A projected unresolved hold is safe to report: the
+    // server enforces it, so the answer is not merely incomplete but right.
+    const company = await seedCompany(db, "SubtreeProjectedHold");
+    const project = await seedProject(db, company.id, "Projected project");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Root held by a dependency edge",
+      status: "blocked",
+    });
+    const blocker = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Real blocker",
+      status: "in_progress",
+    });
+    await blockIssue(db, company.id, blocker.id, root.id);
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/subtree`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const rootNode = res.body.nodes.find(
+      (node: { issue: { id: string } }) => node.issue.id === root.id,
+    );
+    expect(rootNode.blockers).toHaveLength(1);
+    expect(rootNode.blockerReadiness).not.toBeNull();
+    expect(rootNode.blockerReadiness.isDependencyReady).toBe(false);
+    expect(rootNode.blockerReadiness.unresolvedBlockerCount).toBe(1);
+    // The hold question is still open even where the projected answer stands.
+    expect(rootNode.blockerHoldReported).toBe(false);
+  });
+
+  it("omits unprojectedHold from every subtree node rather than reporting it as null", async () => {
+    // A field that is structurally absent on one route and meaningful on
+    // another is a trap, and `null` is not the fix: on the single-issue routes
+    // `unprojectedHold: null` means the count was truncated. Absence is the
+    // only rendering a consumer can tell apart from "truncated", so the
+    // omission is locked here against a regression back to a misleading null.
+    const company = await seedCompany(db, "SubtreeHoldOmission");
+    const project = await seedProject(db, company.id, "Omission project");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Root",
+      status: "blocked",
+    });
+    const child = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Child",
+      status: "in_progress",
+      parentId: root.id,
+    });
+    await blockIssue(db, company.id, child.id, root.id);
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/subtree`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.nodes.length).toBeGreaterThan(0);
+    for (const node of res.body.nodes) {
+      expect(Object.prototype.hasOwnProperty.call(node, "unprojectedHold")).toBe(false);
+      expect(node.blockerHoldReported).toBe(false);
+    }
+    // Not just the nodes: nothing in the subtree response answers the hold
+    // question, so the key must not appear anywhere in it.
+    expect(JSON.stringify(res.body)).not.toContain("unprojectedHold");
+  });
+
   it("denies cross-company issue reads", async () => {
     const companyA = await seedCompany(db, "Company A");
     const companyB = await seedCompany(db, "Company B");

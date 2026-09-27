@@ -337,6 +337,7 @@ Use this read-only diagnostic when an issue has child work and you need the comb
       "blockers": [
         { "id": "issue-80", "identifier": "PAP-80", "title": "Finish dependency", "status": "in_progress", "priority": "medium", "assigneeAgentId": "agent-2", "assigneeUserId": null, "isUnresolved": true, "isDependencyReady": false, "isPendingFinalize": false, "flags": [] }
       ],
+      "blockerHoldReported": false,
       "blockerReadiness": { "allBlockersDone": false, "isDependencyReady": false, "unresolvedBlockerCount": 1, "pendingFinalizeBlockerCount": 0 },
       "omittedUnauthorizedBlockerCount": 0,
       "wakeEvents": [],
@@ -365,6 +366,9 @@ Security and bounds:
 - Raw wake `payload`, activity `details`, raw `error`, and `triggerDetail` are never returned. Wake fields use the same coarse projections as wake diagnostics.
 - Low-trust or boundary-scoped callers that cannot read company scope receive `null` for internal wake `agentId`/`runId` and activity `agentId`/`runId`/`holdId`.
 - The subtree walk is capped to depth 8 and 100 nodes with a cycle guard. Per-node blockers, wake requests, and activity records are also capped. Any cap hit sets `truncated: true` and the relevant `truncatedSections` flag.
+- This route does not run the per-issue blocker aggregate, which counts holds that are not first-class dependency edges — tree holds and attention relations among them. It is a per-issue walk and this is a bulk read over a whole subtree, so every node reports `"blockerHoldReported": false` and no node carries an `unprojectedHold` key at all. Absence is the point: on the single-issue blockers route `unprojectedHold: null` means the count was truncated, and a `null` here would be indistinguishable from that.
+- Consequently, a node that is held by a non-dependency edge comes back with an empty `blockers` array, `blockerReadiness: null`, and a `diagnosis` that says the route does not report holds that are not first-class dependency edges. It will not claim the node is ready. To get the hold answer for one issue, read `GET /api/issues/:issueId/diagnostics/blockers` or `GET /api/issues/:issueId/diagnostics/wakes`; both run the aggregate.
+- `blockerReadiness` is still reported when a projected dependency edge is genuinely unresolved (`isDependencyReady: false`). The server enforces that edge, so the answer may understate what else holds the issue but is never wrong in the way that invites a refused write.
 
 ### Execution Policy Fields On An Issue
 

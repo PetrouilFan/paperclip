@@ -1401,8 +1401,14 @@ function buildIssueBlockerDiagnosticsResponse(input: {
   truncated: boolean;
   /**
    * The blocker aggregate, which counts more edge kinds than `blockers` does.
-   * `null` when it is unavailable, in which case no unprojected hold is
-   * claimed and the route behaves as it did before.
+   *
+   * Omitted or `null` when this route did not consult it. That is not the same
+   * as a consulted aggregate reporting zero, and it is not the same as the
+   * truncated case either: it means the hold question is open here. The
+   * subtree route leaves it out on purpose — the aggregate is a per-issue walk
+   * and that route is a bulk read over a whole subtree — so it reports the
+   * question as unanswered rather than answering it with a `null` a consumer
+   * cannot tell apart from "truncated".
    */
   attention?: {
     unresolvedBlockerCount: number;
@@ -1457,6 +1463,16 @@ function buildIssueBlockerDiagnosticsResponse(input: {
           sampleBlockerIdentifier,
         };
   const hasUnprojectedHold = unprojectedHold !== null && unprojectedHold.count > 0;
+  // A route that never asked the aggregate cannot rule out a hold it did not
+  // project, so it cannot claim the issue is movable. The dangerous direction
+  // is the only one that gets withheld: `isDependencyReady: true` is the answer
+  // the write path would contradict, which is the defect class this whole
+  // field exists to eliminate. A projected unresolved hold is reported either
+  // way, because the server enforces that edge — the answer may understate
+  // what else holds the issue, but it is never wrong in the way that invites a
+  // refused write.
+  const readinessWithheldForUnreportedHold =
+    !input.attention && input.readiness.isDependencyReady;
 
   const blockers: IssueBlockerDiagnosticNode[] = input.visibleBlockers.map(
     (blockerRow) => {
@@ -1485,9 +1501,9 @@ function buildIssueBlockerDiagnosticsResponse(input: {
   // `isDependencyReady: true` here is the specific defect: the write path
   // refuses the move on the strength of a hold this object says does not
   // exist, so the route is telling a reader to attempt something the server
-  // will reject.
+  // will reject. The same holds apply when the aggregate was never consulted.
   const readiness: IssueBlockerDiagnosticsReadiness | null =
-    completeVisibleSet && !hasUnprojectedHold
+    completeVisibleSet && !hasUnprojectedHold && !readinessWithheldForUnreportedHold
       ? {
           allBlockersDone: input.readiness.allBlockersDone,
           isDependencyReady: input.readiness.isDependencyReady,
@@ -1510,6 +1526,7 @@ function buildIssueBlockerDiagnosticsResponse(input: {
       omittedUnauthorizedBlockerCount: reportedOmittedUnauthorizedBlockerCount,
       unprojectedHold,
       truncated: input.truncated,
+      readinessWithheldForUnreportedHold,
       maxBlockers: input.maxBlockers ?? ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
     }),
     readiness,
@@ -1530,6 +1547,7 @@ function buildIssueBlockerDiagnosis(input: {
   omittedUnauthorizedBlockerCount: number | null;
   unprojectedHold: IssueBlockerDiagnosticsUnprojectedHold | null;
   truncated: boolean;
+  readinessWithheldForUnreportedHold: boolean;
   maxBlockers: number;
 }) {
   if (input.truncated) {
@@ -1558,6 +1576,23 @@ function buildIssueBlockerDiagnosis(input: {
     } that ${
       input.unprojectedHold.count === 1 ? "is" : "are"
     } not first-class dependency edges, so they do not appear in the blocker list and readiness is not reported.${sample}`;
+  }
+  // The aggregate was never consulted, so there is no basis here for either
+  // remaining conclusion that would report the issue as clear: the empty-list
+  // negative below, and the "all blockers are resolved" one further down. Both
+  // are the wrong answer for a node held by a tree relation, so the route says
+  // what it did not check instead. This is the scope statement in the response
+  // body, not a source comment: a reader of the API gets it, not just a
+  // maintainer reading the call site.
+  //
+  // Gated on the issue actually being blocked, because that is the only state
+  // in which either negative would have fired. An unblocked issue with no
+  // projected edges makes no claim to contradict, and claiming otherwise would
+  // invent a hold that may not exist.
+  if (input.readinessWithheldForUnreportedHold && input.issue.status === "blocked") {
+    return `${blockerDiagnosticLabel(
+      input.issue,
+    )} is blocked, but this route does not report holds that are not a first-class dependency edge, so it reports no hold count and no readiness. The single-issue blocker diagnostics answer the hold question.`;
   }
   if (input.blockers.length === 0) {
     return input.issue.status === "blocked"
@@ -1844,11 +1879,27 @@ function buildIssueWakeDiagnosis(input: {
       input.issue,
     )} in the bounded window, and one or more blockers are outside this actor's authorization boundary.`;
   }
-  if (
-    input.issue.status !== "blocked" ||
-    blockerDiagnostics.blockers.length === 0
-  )
+  if (input.issue.status !== "blocked") return null;
+  if (blockerDiagnostics.blockers.length === 0) {
+    // The aggregate is consulted on this route, so an empty projected edge set
+    // is not evidence that nothing holds the issue — it is exactly what a tree
+    // hold produces. Naming the hold beats returning no cause at all, which is
+    // what this branch used to do once `readiness` started being withheld for
+    // an unprojected hold.
+    const hold = blockerDiagnostics.unprojectedHold;
+    if (hold && hold.count > 0) {
+      return `No wake row exists for ${blockerDiagnosticLabel(
+        input.issue,
+      )} in the bounded window. ${blockerDiagnosticLabel(
+        input.issue,
+      )} is blocked by ${hold.count} hold${
+        hold.count === 1 ? "" : "s"
+      } that are not first-class dependency edges, so no wake has fired for ${
+        hold.count === 1 ? "it" : "them"
+      }.`;
+    }
     return null;
+  }
 
   const pendingFinalize = blockerDiagnostics.blockers.find(
     (blocker) => blocker.isPendingFinalize,
@@ -2108,9 +2159,13 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
     // `attention` is deliberately absent here. This is the bulk path over a
     // whole subtree, and the aggregate is a per-issue walk; running it for
     // every node would make a list endpoint cost what a single-issue read
-    // costs. The consequence is that a node held by a non-dependency edge is
-    // still reported here as having no first-class blocker relations. The
-    // single-issue blockers and wakes routes do not have that gap.
+    // costs. The cost call stands. What it must not do is leave the node
+    // claiming it is clear: with the aggregate unconsulted, the builder
+    // withholds `readiness` and replaces the "no first-class blocker
+    // relations" negative with a scope statement, and the node carries
+    // `blockerHoldReported: false` so a consumer can tell an open question from
+    // a truncated count. The single-issue blockers and wakes routes do consult
+    // the aggregate and do not have that gap.
     const blockerResponse = buildIssueBlockerDiagnosticsResponse({
       issue: node,
       blockers: rawBlockers,
@@ -2184,6 +2239,7 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
       diagnosis: nodeDiagnosis,
       likelyReason: nodeDiagnosis,
       blockers: blockerResponse.blockers,
+      blockerHoldReported: false,
       blockerReadiness: blockerResponse.readiness,
       omittedUnauthorizedBlockerCount:
         blockerResponse.omittedUnauthorizedBlockerCount,
