@@ -1131,6 +1131,27 @@ test('an address in a commit body is the change being described, so the body is 
   // shape — deletes the sentence that makes the commit worth having. Measured
   // over the 4670 commits on `master`, the address half flags 31 bodies and
   // every one is that case.
+  //
+  // THE OPPOSITE ASSERTION WAS INVERTED HERE, NOT DROPPED, AND THIS IS THE
+  // RECORD OF THE DECISION.
+  //
+  // The pull request that added the masking also carried a test named "an
+  // address in a commit body is a leak too, and the body is not a diff line",
+  // over this exact input, expecting `passed === false`. #123 landed the
+  // opposite expectation over the same input. Those are one disagreement, not
+  // two, and it was decided in #123's favour by merge 60f3a15a3.
+  //
+  // The losing assertion is written back out below in its inverted form
+  // because rebasing it onto #123 deleted it without saying so. Git's
+  // three-way merge read #123's rewrite of this block and the other version of
+  // it as the same lines, kept #123's, and reported the test file as applying
+  // *cleanly*. It is not a resolve that would have shown a conflict to argue
+  // with; the assertion simply was not there any more, on either a rebase or a
+  // `git apply -3`, and a plain merge of the two pull requests would have
+  // dropped one half of a live disagreement with no commit recording which way
+  // it went. That is the outcome the board issue ordering these two pull
+  // requests was opened to prevent, and it is why this is a commit of its own
+  // rather than a note in a resolve.
   const result = checkInternalRefs({
     ...CLEAN,
     commits: [
@@ -1138,6 +1159,52 @@ test('an address in a commit body is the change being described, so the body is 
     ],
   });
   assert.equal(result.passed, true, JSON.stringify(result.failures, null, 2));
+});
+
+test('the address half stays off the commit body, and the masking in this change did not switch it back on', () => {
+  // The discriminating guard for the resolve above, and the assertion that was
+  // lost with it.
+  //
+  // The lost test argued from the file's own header, that "authored text is
+  // where the address is a leak; a diff line is where it is usually the
+  // subject matter." That principle is the thing under review: it classes every
+  // authored surface as one where the address is not the subject, and a commit
+  // body is the authored surface where the address is frequently the exact
+  // subject. The diff surface was already exempted on the opposite reasoning,
+  // and a commit body sits closer to a diff than to a pull request title,
+  // because the author is writing down what the code does.
+  //
+  // So the masking stands and the host scan does not. This test fails if either
+  // half of that flips. Re-adding `findInstanceHosts` to this loop reds it on
+  // `passed`, and stripping the mask leaves it green, which is what makes the
+  // two concerns independent rather than one standing on the other.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'eee55555', commit: { message: 'fix(api): survive a restart\n\nReached at http://localhost:3100/api/health\n' } },
+    ],
+  });
+  assert.equal(result.passed, true, 'the address half must not reach the commit body');
+  const joined = result.failures.join('\n');
+  assert.doesNotMatch(joined, /an address that resolves to one machine/);
+  assert.doesNotMatch(joined, /localhost/);
+});
+
+test('masking the commit body does not mask the identifier half, so this instance ids are still findings', () => {
+  // The masking is the open tier's path rule and nothing else. If it ever
+  // reached the configured tier then a commit body could name this instance's
+  // own identifiers freely, which is a real leak and not a judgement call.
+  const result = checkInternalRefs({
+    ...CLEAN,
+    commits: [
+      { sha: 'fff66666', commit: { message: 'fix(api): survive a restart\n\nCarries on from `PET-9001` and PET-9002.\n' } },
+    ],
+  });
+  assert.equal(result.passed, false, 'a configured identifier in a code span is still a finding');
+  const joined = result.failures.join('\n');
+  assert.match(joined, /A commit message body carries/);
+  assert.match(joined, /PET-9001/);
+  assert.match(joined, /PET-9002/);
 });
 
 test('the identifier half still reads a commit body, so narrowing the address half did not take the surface with it', () => {
